@@ -1,0 +1,43 @@
+What we actually build:
+
+The system has four components. All of it runs on n8n with Claude.
+
+Component 1: The catchers
+
+You connect each inbound channel to n8n via a trigger:
+
+Website forms → webhook (almost every form builder — Typeform, Gravity Forms, WPForms, or even a native Mindbody form — can fire a webhook on submission)
+
+Facebook/Meta Lead Ads → n8n has a native Facebook Lead Ads trigger node, connects directly
+
+Instagram DMs → via the Meta Graph API (requires the studio's Facebook page to be connected; more setup but doable)
+
+SMS → Twilio number configured to fire an n8n webhook on inbound message
+
+For a first client, start with whichever 2 channels are biggest for them — almost always Instagram DMs and Facebook Lead Ads. Don't over-engineer the first build.
+
+Component 2: The brain (Claude)
+
+When a lead comes in, n8n passes the following to Claude via API call:
+
+Studio name, location, what type of studio it is
+
+The lead's name and what they said / which offer they responded to
+
+Time of day and day of week
+
+Which channel they came from
+
+Claude writes a response that sounds like the owner wrote it. Not "Hi [FIRST NAME], thanks for your interest in [STUDIO NAME]!" — actual human language: "Hey Sarah! So glad you reached out — our intro offer is a 2-week unlimited pass for $35, honestly one of the best ways to see if Pilates clicks for you. We have spots Tuesday morning at 9am and Thursday evening at 6:30pm this week — either of those work?"
+
+The response asks one question that moves toward a booking. That's it. No walls of text.
+
+Component 3: The conversation handler
+
+When Sarah replies — "Thursday works!" or "Actually do you have anything on Wednesdays?" — that reply comes back into n8n, gets passed back to Claude with the conversation history, and Claude responds again. This loop continues until one of two things happens: a booking is confirmed, or the person goes completely cold after 2 follow-up attempts.
+
+This is the part their software cannot do at all. It's not a template; it's a real back-and-forth that adapts to what the person says.
+
+Component 4: Owner notification
+
+The owner gets a simple SMS or Slack message when something happens that needs them. Two triggers only: (1) a booking is confirmed — "New trial booked: Sarah Chen, Thursday 6:30pm, came from Instagram DM" — and (2) a lead says something the AI can't handle, like a medical question or a pricing negotiation. Everything else runs silently. The owner's job is to teach a great class on Thursday. The system handled everything before that.

@@ -1,0 +1,14 @@
+# Secrets / credentials — never commit
+.env
+*.env
+secrets/
+credentials*.json
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Node (if any tooling is added later)
+node_modules/

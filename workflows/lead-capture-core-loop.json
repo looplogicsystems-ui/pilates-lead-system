@@ -1,0 +1,294 @@
+{
+  "name": "Lead Capture & Booking — Core Loop",
+  "nodes": [
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const b = $json.body ?? $json;\nconst pick = (...keys) => { for (const k of keys) { const v = b[k]; if (v !== undefined && v !== null && v !== '') return v; } return undefined; };\nreturn { json: {\n  external_id: String(pick('external_id','from','Email or Instagram handle','email') ?? 'unknown'),\n  channel: String(pick('channel') ?? 'form'),\n  name: (pick('name','Name') ?? null),\n  message: String(pick('message','text','Your message') ?? ''),\n  studio_id: Number(pick('studio_id') ?? 1)\n} };"
+      },
+      "id": "normalize",
+      "name": "Normalize Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [224, 304]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO leads (external_id, channel, name, studio_id, status, created_at, updated_at)\nVALUES ($1, $2, $3, $4, 'engaged', now(), now())\nON CONFLICT (channel, external_id)\nDO UPDATE SET name = COALESCE(EXCLUDED.name, leads.name), updated_at = now()\nRETURNING id;",
+        "options": { "queryReplacement": "={{ [$json.external_id, $json.channel, $json.name, $json.studio_id] }}" }
+      },
+      "id": "upsertLead",
+      "name": "Upsert Lead",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [448, 304],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (lead_id, direction, channel, body, created_at)\nVALUES ($1, 'inbound', $2, $3, now());",
+        "options": { "queryReplacement": "={{ [$json.id, $('Normalize Lead').item.json.channel, $('Normalize Lead').item.json.message] }}" }
+      },
+      "id": "logInbound",
+      "name": "Log Inbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [672, 304],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $('Normalize Lead').item.json.message }}",
+        "options": {
+          "systemMessage": "You are the voice of {{STUDIO_NAME}}, a boutique {{STUDIO_TYPE}} studio in {{LOCATION}}. You reply to inbound leads as if you ARE the owner — warm, casual, human.\n\nStudio facts you may use:\n- Intro offer: {{OFFER e.g. 2-week unlimited pass for $35}}\n- Class schedule / open slots: {{SCHEDULE}}\n\nRules:\n- Sound like a real person texting. NEVER a template. No 'Hi [NAME], thanks for your interest!'.\n- Keep it short. No walls of text. Ask exactly ONE question that moves toward booking a class.\n- Use the conversation history to adapt to what the lead says.\n- If the lead accepts a specific class date/time, treat it as a booking.\n- ESCALATE (do not attempt to answer) if the lead asks a medical question or tries to negotiate price.\n\nYou MUST respond with ONLY a JSON object — no prose, no code fences:\n{\n  \"reply\": \"<message to send the lead>\",\n  \"intent\": \"continue\" | \"booking\" | \"escalate\",\n  \"booking\": { \"class_type\": \"...\", \"start_time\": \"YYYY-MM-DDTHH:MM:SS\", \"end_time\": \"YYYY-MM-DDTHH:MM:SS\" } | null,\n  \"escalate\": { \"reason\": \"...\" } | null\n}\nSet intent to 'booking' ONLY when a specific date/time is agreed, and include the booking object. Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. Set intent to 'escalate' for medical/pricing-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null."
+        }
+      },
+      "id": "agent",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [912, 304]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": { "__rl": true, "value": "CALENDAR_EMAIL", "mode": "list", "cachedResultName": "CALENDAR_EMAIL" },
+        "limit": 20,
+        "options": {}
+      },
+      "id": "gcalTool",
+      "name": "Google Calendar (read availability)",
+      "type": "n8n-nodes-base.googleCalendarTool",
+      "typeVersion": 1.3,
+      "position": [1120, 544]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const raw = $json.output ?? $json.text ?? '';\nlet data;\ntry {\n  const m = String(raw).match(/\\{[\\s\\S]*\\}/);\n  data = JSON.parse(m ? m[0] : raw);\n} catch (e) {\n  data = { reply: String(raw), intent: 'continue' };\n}\nconst ZONE = 'America/New_York'; // studio timezone — change per studio\nconst toZoned = (s) => {\n  try {\n    if (typeof s !== 'string' || !s) return s;\n    const naive = s.replace(/(?:Z|[+-]\\d{2}:?\\d{2})$/, '');\n    const dt = DateTime.fromISO(naive, { zone: ZONE });\n    return dt.isValid ? dt.toISO() : naive;\n  } catch (e) { return s; }\n};\nlet booking = data.booking ?? null;\nif (booking && typeof booking === 'object') {\n  booking = { ...booking, start_time: toZoned(booking.start_time), end_time: toZoned(booking.end_time) };\n}\nreturn { json: {\n  reply: data.reply ?? '',\n  intent: data.intent ?? 'continue',\n  booking: booking,\n  escalate: data.escalate ?? null\n} };"
+      },
+      "id": "parse",
+      "name": "Parse Agent JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1184, 304]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (lead_id, direction, channel, body, created_at)\nVALUES ($1, 'outbound', $2, $3, now());",
+        "options": { "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Normalize Lead').first().json.channel, $('Parse Agent JSON').first().json.reply] }}" }
+      },
+      "id": "logOutbound",
+      "name": "Log Outbound Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1408, 304],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 }, "conditions": [ { "leftValue": "={{ $json.intent }}", "rightValue": "booking", "operator": { "type": "string", "operation": "equals" } } ], "combinator": "and" }, "renameOutput": true, "outputKey": "booking" },
+            { "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 }, "conditions": [ { "leftValue": "={{ $json.intent }}", "rightValue": "escalate", "operator": { "type": "string", "operation": "equals" } } ], "combinator": "and" }, "renameOutput": true, "outputKey": "escalate" }
+          ]
+        },
+        "options": { "fallbackOutput": "extra" }
+      },
+      "id": "routeByIntent",
+      "name": "Route by Intent",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [1408, 544]
+    },
+    {
+      "parameters": {
+        "calendar": { "__rl": true, "value": "CALENDAR_EMAIL", "mode": "list", "cachedResultName": "CALENDAR_EMAIL" },
+        "start": "={{ $('Parse Agent JSON').item.json.booking.start_time }}",
+        "end": "={{ $('Parse Agent JSON').item.json.booking.end_time }}",
+        "additionalFields": {
+          "description": "=Booked via AI for lead {{ $('Normalize Lead').item.json.external_id }}",
+          "summary": "={{ 'Trial: ' + ($('Parse Agent JSON').item.json.booking.class_type || 'Class') }}"
+        }
+      },
+      "id": "createCalendarEvent",
+      "name": "Create Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [1632, 448],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO bookings (lead_id, class_type, start_time, end_time, gcal_event_id, status, created_at)\nVALUES ($1, $2, $3, $4, $5, 'confirmed', now());",
+        "options": { "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Parse Agent JSON').first().json.booking.class_type, $('Parse Agent JSON').first().json.booking.start_time, $('Parse Agent JSON').first().json.booking.end_time, $json.id] }}" }
+      },
+      "id": "insertBooking",
+      "name": "Insert Booking",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1840, 448],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads SET status = 'booked', updated_at = now() WHERE id = $1;",
+        "options": { "queryReplacement": "={{ [$('Upsert Lead').first().json.id] }}" }
+      },
+      "id": "markLeadBooked",
+      "name": "Mark Lead Booked",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [2064, 448],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "SLACK_CHANNEL_ID", "mode": "list", "cachedResultName": "new-leads" },
+        "text": "=:tada: New trial booked: {{ $('Parse Agent JSON').first().json.booking.class_type }} at {{ $('Parse Agent JSON').first().json.booking.start_time }} (lead {{ $('Normalize Lead').first().json.external_id }})",
+        "otherOptions": {}
+      },
+      "id": "notifyBooking",
+      "name": "Notify Owner - Booking",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [2288, 448],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO escalations (lead_id, reason, resolved, created_at)\nVALUES ($1, $2, false, now());",
+        "options": { "queryReplacement": "={{ [$('Upsert Lead').first().json.id, ($('Parse Agent JSON').first().json.escalate && $('Parse Agent JSON').first().json.escalate.reason) || 'unspecified'] }}" }
+      },
+      "id": "insertEscalation",
+      "name": "Insert Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [1632, 672],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "SLACK_CHANNEL_ID", "mode": "list", "cachedResultName": "new-leads" },
+        "text": "=:rotating_light: Lead needs you ({{ $('Normalize Lead').first().json.external_id }}): {{ ($('Parse Agent JSON').first().json.escalate && $('Parse Agent JSON').first().json.escalate.reason) || 'unspecified' }}",
+        "otherOptions": {}
+      },
+      "id": "notifyEscalation",
+      "name": "Notify Owner - Escalation",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [1840, 672],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "id": "continueNoOp",
+      "name": "Continue (no action)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1632, 832]
+    },
+    {
+      "parameters": {
+        "model": { "__rl": true, "value": "gpt-4o-mini", "mode": "list", "cachedResultName": "gpt-4o-mini" },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [768, 560],
+      "id": "openAiModel",
+      "name": "OpenAI Chat Model"
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('Normalize Lead').first().json.channel + ':' + $('Normalize Lead').first().json.external_id }}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.3,
+      "position": [928, 544],
+      "id": "pgMemory",
+      "name": "Postgres Chat Memory"
+    },
+    {
+      "parameters": {
+        "formTitle": "Book your intro class",
+        "formDescription": "Leave your details and a quick note — we'll reply right here.",
+        "formFields": {
+          "values": [
+            { "fieldLabel": "Name" },
+            { "fieldLabel": "Email or Instagram handle", "requiredField": true },
+            { "fieldLabel": "Your message", "fieldType": "textarea", "requiredField": true }
+          ]
+        },
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "leadForm",
+      "name": "Lead Form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [0, 304],
+      "webhookId": "f1a2b3c4-d5e6-47f8-9a0b-1c2d3e4f5a6b"
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "text",
+        "completionTitle": "Thanks — here's our reply 👋",
+        "completionMessage": "={{ $('Parse Agent JSON').first().json.reply }}"
+      },
+      "id": "showReply",
+      "name": "Show Reply",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.2,
+      "position": [1632, 304],
+      "webhookId": "a9b8c7d6-e5f4-4321-8765-0a1b2c3d4e5f"
+    }
+  ],
+  "connections": {
+    "Lead Form": { "main": [[{ "node": "Normalize Lead", "type": "main", "index": 0 }]] },
+    "Normalize Lead": { "main": [[{ "node": "Upsert Lead", "type": "main", "index": 0 }]] },
+    "Upsert Lead": { "main": [[{ "node": "Log Inbound Message", "type": "main", "index": 0 }]] },
+    "Log Inbound Message": { "main": [[{ "node": "AI Agent", "type": "main", "index": 0 }]] },
+    "AI Agent": { "main": [[{ "node": "Parse Agent JSON", "type": "main", "index": 0 }]] },
+    "Parse Agent JSON": { "main": [[{ "node": "Route by Intent", "type": "main", "index": 0 }]] },
+    "Route by Intent": {
+      "main": [
+        [{ "node": "Create Calendar Event", "type": "main", "index": 0 }],
+        [{ "node": "Insert Escalation", "type": "main", "index": 0 }],
+        [{ "node": "Continue (no action)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Calendar Event": { "main": [[{ "node": "Insert Booking", "type": "main", "index": 0 }]] },
+    "Insert Booking": { "main": [[{ "node": "Mark Lead Booked", "type": "main", "index": 0 }]] },
+    "Mark Lead Booked": { "main": [[{ "node": "Notify Owner - Booking", "type": "main", "index": 0 }]] },
+    "Notify Owner - Booking": { "main": [[{ "node": "Log Outbound Message", "type": "main", "index": 0 }]] },
+    "Insert Escalation": { "main": [[{ "node": "Notify Owner - Escalation", "type": "main", "index": 0 }]] },
+    "Notify Owner - Escalation": { "main": [[{ "node": "Log Outbound Message", "type": "main", "index": 0 }]] },
+    "Continue (no action)": { "main": [[{ "node": "Log Outbound Message", "type": "main", "index": 0 }]] },
+    "Log Outbound Message": { "main": [[{ "node": "Show Reply", "type": "main", "index": 0 }]] },
+    "Google Calendar (read availability)": { "ai_tool": [[{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]] },
+    "OpenAI Chat Model": { "ai_languageModel": [[{ "node": "AI Agent", "type": "ai_languageModel", "index": 0 }]] },
+    "Postgres Chat Memory": { "ai_memory": [[{ "node": "AI Agent", "type": "ai_memory", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}
