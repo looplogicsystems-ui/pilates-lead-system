@@ -66,10 +66,10 @@ CREATE TABLE IF NOT EXISTS escalations (
 -- Seed the first studio (edit values to match the real client)
 INSERT INTO studios (name, location, studio_type, offers, class_schedule)
 VALUES (
-    'Your Studio Name',
-    'City, State',
+    'Reform Collective Pilates',
+    'Gulberg, Lahore',
     'Pilates',
-    '2-week unlimited intro pass for $35',
-    'Tue 9:00am, Thu 6:30pm, Sat 10:00am (reformer); Mon/Wed 7:00am (mat)'
+    '2-week unlimited intro pass for PKR 3,500',
+    'Mon/Wed/Fri 7:00am & 6:30pm, Tue/Thu 9:00am & 5:30pm, Sat 10:00am (reformer & mat)'
 )
 ON CONFLICT DO NOTHING;

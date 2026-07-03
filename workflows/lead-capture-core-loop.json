@@ -1,221 +1,392 @@
 {
-  "name": "Lead Capture & Booking — Core Loop",
+  "name": "Lead Capture & Booking — Core Loop v.1.5",
   "nodes": [
     {
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "const b = $json.body ?? $json;\nconst pick = (...keys) => { for (const k of keys) { const v = b[k]; if (v !== undefined && v !== null && v !== '') return v; } return undefined; };\nreturn { json: {\n  external_id: String(pick('external_id','from','Email or Instagram handle','email') ?? 'unknown'),\n  channel: String(pick('channel') ?? 'form'),\n  name: (pick('name','Name') ?? null),\n  message: String(pick('message','text','Your message') ?? ''),\n  studio_id: Number(pick('studio_id') ?? 1)\n} };"
+        "jsCode": "const b = $json.body ?? $json;\nconst pick = (...keys) => { for (const k of keys) { const v = b[k]; if (v !== undefined && v !== null && v !== '') return v; } return undefined; };\nconst isSlack = b.slack_user !== undefined || b.slack_ts !== undefined;\nconst isChat = b.chatInput !== undefined || (b.sessionId !== undefined && b.action !== undefined);\nif (isSlack) {\n  return { json: {\n    external_id: String(b.slack_user ?? 'slack-unknown'),\n    channel: 'slack',\n    name: null,\n    message: String(b.text ?? ''),\n    studio_id: 1\n  } };\n}\nif (isChat) {\n  return { json: {\n    external_id: String(b.sessionId ?? 'chat-unknown'),\n    channel: 'instagram',\n    name: null,\n    message: String(b.chatInput ?? ''),\n    studio_id: 1\n  } };\n}\nreturn { json: {\n  external_id: String(pick('external_id','from','Email or Instagram handle','email') ?? 'unknown'),\n  channel: String(pick('channel') ?? 'form'),\n  name: (pick('name','Name') ?? null),\n  message: String(pick('message','text','Your message') ?? ''),\n  studio_id: Number(pick('studio_id') ?? 1)\n} };"
       },
       "id": "normalize",
       "name": "Normalize Lead",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [224, 304]
+      "position": [
+        672,
+        272
+      ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "INSERT INTO leads (external_id, channel, name, studio_id, status, created_at, updated_at)\nVALUES ($1, $2, $3, $4, 'engaged', now(), now())\nON CONFLICT (channel, external_id)\nDO UPDATE SET name = COALESCE(EXCLUDED.name, leads.name), updated_at = now()\nRETURNING id;",
-        "options": { "queryReplacement": "={{ [$json.external_id, $json.channel, $json.name, $json.studio_id] }}" }
+        "options": {
+          "queryReplacement": "={{ [$json.external_id, $json.channel, $json.name, $json.studio_id] }}"
+        }
       },
       "id": "upsertLead",
       "name": "Upsert Lead",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
-      "position": [448, 304],
-      "retryOnFail": true
+      "position": [
+        896,
+        272
+      ],
+      "retryOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      }
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "INSERT INTO messages (lead_id, direction, channel, body, created_at)\nVALUES ($1, 'inbound', $2, $3, now());",
-        "options": { "queryReplacement": "={{ [$json.id, $('Normalize Lead').item.json.channel, $('Normalize Lead').item.json.message] }}" }
+        "options": {
+          "queryReplacement": "={{ [$json.id, $('Normalize Lead').item.json.channel, $('Normalize Lead').item.json.message] }}"
+        }
       },
       "id": "logInbound",
       "name": "Log Inbound Message",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
-      "position": [672, 304],
+      "position": [
+        1120,
+        272
+      ],
       "retryOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "promptType": "define",
-        "text": "={{ $('Normalize Lead').item.json.message }}",
+        "text": "=Current date and time: {{ $now.setZone('Asia/Karachi').toFormat('cccc yyyy-MM-dd HH:mm') }} (Pakistan Standard Time, UTC+5). Resolve any relative or unspecified dates against this, and NEVER schedule a booking in the past.\n\nThe studio's REAL upcoming classes (with seats remaining) — only ever offer or confirm a class from THIS list, and never one marked FULL:\n{{ $json.scheduleText }}\n\nLead's message: {{ $('Normalize Lead').first().json.message }}",
         "options": {
-          "systemMessage": "You are the voice of {{STUDIO_NAME}}, a boutique {{STUDIO_TYPE}} studio in {{LOCATION}}. You reply to inbound leads as if you ARE the owner — warm, casual, human.\n\nStudio facts you may use:\n- Intro offer: {{OFFER e.g. 2-week unlimited pass for $35}}\n- Class schedule / open slots: {{SCHEDULE}}\n\nRules:\n- Sound like a real person texting. NEVER a template. No 'Hi [NAME], thanks for your interest!'.\n- Keep it short. No walls of text. Ask exactly ONE question that moves toward booking a class.\n- Use the conversation history to adapt to what the lead says.\n- If the lead accepts a specific class date/time, treat it as a booking.\n- ESCALATE (do not attempt to answer) if the lead asks a medical question or tries to negotiate price.\n\nYou MUST respond with ONLY a JSON object — no prose, no code fences:\n{\n  \"reply\": \"<message to send the lead>\",\n  \"intent\": \"continue\" | \"booking\" | \"escalate\",\n  \"booking\": { \"class_type\": \"...\", \"start_time\": \"YYYY-MM-DDTHH:MM:SS\", \"end_time\": \"YYYY-MM-DDTHH:MM:SS\" } | null,\n  \"escalate\": { \"reason\": \"...\" } | null\n}\nSet intent to 'booking' ONLY when a specific date/time is agreed, and include the booking object. Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. Set intent to 'escalate' for medical/pricing-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null."
+          "systemMessage": "You are Mia, the owner of Reform Collective Pilates, a boutique reformer & mat Pilates studio in Lahore. You personally reply to inbound leads who message us on Instagram, Facebook, or the website form — warm, casual, and human, like you're texting someone curious about trying a class.\n\nStudio facts you can use:\n- Classes: Reformer Flow, Mat Pilates, and Beginner Reformer (small groups, max 8).\n- Intro offer: 2-week unlimited intro pass for PKR 3,500 (first-timers only).\n- Class schedule & availability: ONLY offer or confirm a class from the studio's real upcoming schedule shown in the user message below (with seats remaining). NEVER invent a class, day, or time, and never claim a class exists unless it is in that list; if nothing fits, say you will check and follow up. The calendar is the single source of truth for which classes run and when — only offer or confirm times that appear as real classes on it. A class is FULL if it already has 8 'Trial:' bookings at that time; if so, offer the next open class instead.\n- Location: Gulberg, Lahore. Free parking.\n- Studio timezone: Pakistan Standard Time.\n\nHow you talk:\n- Sound like a real person, never a template. No 'Hi [NAME], thanks for your interest!'.\n- Keep it short — a line or two. Ask exactly ONE question that moves toward booking a class.\n- Use the conversation history; adapt to what the lead actually says. Don't repeat yourself.\n- Goal: get them booked into a specific class. Gently keep steering toward a day and time.\n- If they give a day/time, confirm it back and treat it as a booking.\n- Do NOT claim a class is full, busy, or already booked — you do not track capacity, so never invent availability or say a class is taken. If the lead asks for one of the listed class times, confirm it and treat it as a booking.\n- ESCALATE (don't answer) medical/injury questions or price negotiation.\n\nYou MUST respond with ONLY a JSON object — no prose, no code fences:\n{\n  \"reply\": \"<message to send the lead>\",\n  \"intent\": \"continue\" | \"booking\" | \"escalate\",\n  \"booking\": { \"class_type\": \"...\", \"start_time\": \"YYYY-MM-DDTHH:MM:SS\", \"end_time\": \"YYYY-MM-DDTHH:MM:SS\" } | null,\n  \"escalate\": { \"reason\": \"...\" } | null\n}\nSet intent to 'booking' ONLY when a specific date and time are agreed, and include the booking object (class_type from the classes above; default a 50-minute duration if the lead doesn't specify). Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. The current date and time (Pakistan Standard Time) is given at the top of the user's message — always resolve dates against it, output a FUTURE date in the correct current year, and NEVER use a past year such as 2023. Set intent to 'escalate' for medical/injury or price-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null."
         }
       },
       "id": "agent",
       "name": "AI Agent",
       "type": "@n8n/n8n-nodes-langchain.agent",
       "typeVersion": 3.1,
-      "position": [912, 304]
-    },
-    {
-      "parameters": {
-        "operation": "getAll",
-        "calendar": { "__rl": true, "value": "CALENDAR_EMAIL", "mode": "list", "cachedResultName": "CALENDAR_EMAIL" },
-        "limit": 20,
-        "options": {}
-      },
-      "id": "gcalTool",
-      "name": "Google Calendar (read availability)",
-      "type": "n8n-nodes-base.googleCalendarTool",
-      "typeVersion": 1.3,
-      "position": [1120, 544]
+      "position": [
+        1792,
+        272
+      ]
     },
     {
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "const raw = $json.output ?? $json.text ?? '';\nlet data;\ntry {\n  const m = String(raw).match(/\\{[\\s\\S]*\\}/);\n  data = JSON.parse(m ? m[0] : raw);\n} catch (e) {\n  data = { reply: String(raw), intent: 'continue' };\n}\nconst ZONE = 'America/New_York'; // studio timezone — change per studio\nconst toZoned = (s) => {\n  try {\n    if (typeof s !== 'string' || !s) return s;\n    const naive = s.replace(/(?:Z|[+-]\\d{2}:?\\d{2})$/, '');\n    const dt = DateTime.fromISO(naive, { zone: ZONE });\n    return dt.isValid ? dt.toISO() : naive;\n  } catch (e) { return s; }\n};\nlet booking = data.booking ?? null;\nif (booking && typeof booking === 'object') {\n  booking = { ...booking, start_time: toZoned(booking.start_time), end_time: toZoned(booking.end_time) };\n}\nreturn { json: {\n  reply: data.reply ?? '',\n  intent: data.intent ?? 'continue',\n  booking: booking,\n  escalate: data.escalate ?? null\n} };"
+        "jsCode": "const raw = $json.output ?? $json.text ?? '';\nlet data;\ntry {\n  const m = String(raw).match(/\\{[\\s\\S]*\\}/);\n  data = JSON.parse(m ? m[0] : raw);\n} catch (e) {\n  data = { reply: String(raw), intent: 'continue' };\n}\nconst ZONE = 'Asia/Karachi'; // studio timezone (Pakistan Standard Time, UTC+5) — change per studio\nconst toZoned = (s) => {\n  try {\n    if (typeof s !== 'string' || !s) return s;\n    const naive = s.replace(/(?:Z|[+-]\\d{2}:?\\d{2})$/, '');\n    const dt = DateTime.fromISO(naive, { zone: ZONE });\n    return dt.isValid ? dt.toISO() : naive;\n  } catch (e) { return s; }\n};\nlet booking = data.booking ?? null;\nif (booking && typeof booking === 'object') {\n  booking = { ...booking, start_time: toZoned(booking.start_time), end_time: toZoned(booking.end_time) };\n}\nreturn { json: {\n  reply: data.reply ?? '',\n  intent: data.intent ?? 'continue',\n  booking: booking,\n  escalate: data.escalate ?? null\n} };"
       },
       "id": "parse",
       "name": "Parse Agent JSON",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1184, 304]
+      "position": [
+        2144,
+        272
+      ]
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "INSERT INTO messages (lead_id, direction, channel, body, created_at)\nVALUES ($1, 'outbound', $2, $3, now());",
-        "options": { "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Normalize Lead').first().json.channel, $('Parse Agent JSON').first().json.reply] }}" }
+        "options": {
+          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Normalize Lead').first().json.channel, $('Parse Agent JSON').first().json.reply] }}"
+        }
       },
       "id": "logOutbound",
       "name": "Log Outbound Message",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
-      "position": [1408, 304],
+      "position": [
+        3488,
+        272
+      ],
       "retryOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "rules": {
           "values": [
-            { "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 }, "conditions": [ { "leftValue": "={{ $json.intent }}", "rightValue": "booking", "operator": { "type": "string", "operation": "equals" } } ], "combinator": "and" }, "renameOutput": true, "outputKey": "booking" },
-            { "conditions": { "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose", "version": 2 }, "conditions": [ { "leftValue": "={{ $json.intent }}", "rightValue": "escalate", "operator": { "type": "string", "operation": "equals" } } ], "combinator": "and" }, "renameOutput": true, "outputKey": "escalate" }
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "booking",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "58236b72-c522-48d3-a74c-5b3e48d54c16"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "booking"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "escalate",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "2fbd9994-d462-4836-bd42-b6be693fa350"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "escalate"
+            }
           ]
         },
-        "options": { "fallbackOutput": "extra" }
+        "options": {
+          "fallbackOutput": "extra"
+        }
       },
-      "id": "routeByIntent",
+      "id": "ac0638ec-f18b-4a96-9d3b-47a56c495f4f",
       "name": "Route by Intent",
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
-      "position": [1408, 544]
+      "position": [
+        2368,
+        256
+      ]
     },
     {
       "parameters": {
-        "calendar": { "__rl": true, "value": "CALENDAR_EMAIL", "mode": "list", "cachedResultName": "CALENDAR_EMAIL" },
+        "calendar": {
+          "__rl": true,
+          "value": "STUDIO_SCHEDULE_CALENDAR_ID",
+          "mode": "id"
+        },
         "start": "={{ $('Parse Agent JSON').item.json.booking.start_time }}",
         "end": "={{ $('Parse Agent JSON').item.json.booking.end_time }}",
         "additionalFields": {
-          "description": "=Booked via AI for lead {{ $('Normalize Lead').item.json.external_id }}",
+          "description": "=Booked via AI for lead {{ $('Normalize Lead').first().json.external_id }}",
           "summary": "={{ 'Trial: ' + ($('Parse Agent JSON').item.json.booking.class_type || 'Class') }}"
         }
       },
-      "id": "createCalendarEvent",
+      "id": "f5e5f9e1-4192-479f-a1bf-a45bdf9f7c0c",
       "name": "Create Calendar Event",
       "type": "n8n-nodes-base.googleCalendar",
       "typeVersion": 1.3,
-      "position": [1632, 448],
+      "position": [
+        2592,
+        80
+      ],
       "retryOnFail": true,
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GOOGLE_CAL_CRED_ID",
+          "name": "Google Calendar account"
+        }
+      },
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "INSERT INTO bookings (lead_id, class_type, start_time, end_time, gcal_event_id, status, created_at)\nVALUES ($1, $2, $3, $4, $5, 'confirmed', now());",
-        "options": { "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Parse Agent JSON').first().json.booking.class_type, $('Parse Agent JSON').first().json.booking.start_time, $('Parse Agent JSON').first().json.booking.end_time, $json.id] }}" }
+        "options": {
+          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Parse Agent JSON').first().json.booking.class_type, $('Parse Agent JSON').first().json.booking.start_time, $('Parse Agent JSON').first().json.booking.end_time, $json.id] }}"
+        }
       },
-      "id": "insertBooking",
+      "id": "6c2eed1d-9f44-4e6e-9abb-f714fd3ea2cc",
       "name": "Insert Booking",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
-      "position": [1840, 448],
+      "position": [
+        2816,
+        80
+      ],
       "retryOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "UPDATE leads SET status = 'booked', updated_at = now() WHERE id = $1;",
-        "options": { "queryReplacement": "={{ [$('Upsert Lead').first().json.id] }}" }
+        "options": {
+          "queryReplacement": "={{ [$('Upsert Lead').first().json.id] }}"
+        }
       },
-      "id": "markLeadBooked",
+      "id": "29ffe4de-1ccf-4df3-8ddd-e739bd9d4829",
       "name": "Mark Lead Booked",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
-      "position": [2064, 448],
+      "position": [
+        3040,
+        80
+      ],
       "retryOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "select": "channel",
-        "channelId": { "__rl": true, "value": "SLACK_CHANNEL_ID", "mode": "list", "cachedResultName": "new-leads" },
+        "channelId": {
+          "__rl": true,
+          "value": "SLACK_OWNER_CHANNEL_ID",
+          "mode": "id"
+        },
         "text": "=:tada: New trial booked: {{ $('Parse Agent JSON').first().json.booking.class_type }} at {{ $('Parse Agent JSON').first().json.booking.start_time }} (lead {{ $('Normalize Lead').first().json.external_id }})",
         "otherOptions": {}
       },
-      "id": "notifyBooking",
+      "id": "31b17576-1178-4035-a2fe-03040e5db1d1",
       "name": "Notify Owner - Booking",
       "type": "n8n-nodes-base.slack",
       "typeVersion": 2.3,
-      "position": [2288, 448],
+      "position": [
+        3264,
+        80
+      ],
       "retryOnFail": true,
+      "webhookId": "4d9a0174-ee76-4b33-9df2-0785115007cc",
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_OWNER_BOT_CRED_ID",
+          "name": "Reform Concierge"
+        }
+      },
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "operation": "executeQuery",
         "query": "INSERT INTO escalations (lead_id, reason, resolved, created_at)\nVALUES ($1, $2, false, now());",
-        "options": { "queryReplacement": "={{ [$('Upsert Lead').first().json.id, ($('Parse Agent JSON').first().json.escalate && $('Parse Agent JSON').first().json.escalate.reason) || 'unspecified'] }}" }
+        "options": {
+          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, ($('Parse Agent JSON').first().json.escalate && $('Parse Agent JSON').first().json.escalate.reason) || 'unspecified'] }}"
+        }
       },
-      "id": "insertEscalation",
+      "id": "51d756f1-6b4a-495f-a5d8-bbd6f659ecb9",
       "name": "Insert Escalation",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
-      "position": [1632, 672],
+      "position": [
+        3040,
+        272
+      ],
       "retryOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {
         "select": "channel",
-        "channelId": { "__rl": true, "value": "SLACK_CHANNEL_ID", "mode": "list", "cachedResultName": "new-leads" },
+        "channelId": {
+          "__rl": true,
+          "value": "SLACK_OWNER_CHANNEL_ID",
+          "mode": "id"
+        },
         "text": "=:rotating_light: Lead needs you ({{ $('Normalize Lead').first().json.external_id }}): {{ ($('Parse Agent JSON').first().json.escalate && $('Parse Agent JSON').first().json.escalate.reason) || 'unspecified' }}",
         "otherOptions": {}
       },
-      "id": "notifyEscalation",
+      "id": "de25f18f-cda0-4a33-87b5-64835f011f0a",
       "name": "Notify Owner - Escalation",
       "type": "n8n-nodes-base.slack",
       "typeVersion": 2.3,
-      "position": [1840, 672],
+      "position": [
+        3264,
+        272
+      ],
       "retryOnFail": true,
+      "webhookId": "1dc5633b-3f77-4f60-ac59-be90d482eeb3",
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_OWNER_BOT_CRED_ID",
+          "name": "Reform Concierge"
+        }
+      },
       "onError": "continueRegularOutput"
     },
     {
       "parameters": {},
-      "id": "continueNoOp",
+      "id": "95e0c0ae-2ba5-42bb-bbe5-f8af8f88044d",
       "name": "Continue (no action)",
       "type": "n8n-nodes-base.noOp",
       "typeVersion": 1,
-      "position": [1632, 832]
+      "position": [
+        3264,
+        464
+      ]
     },
     {
       "parameters": {
-        "model": { "__rl": true, "value": "gpt-4o-mini", "mode": "list", "cachedResultName": "gpt-4o-mini" },
+        "model": {
+          "__rl": true,
+          "value": "gpt-5.4-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-5.4-mini"
+        },
         "builtInTools": {},
         "options": {}
       },
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "typeVersion": 1.3,
-      "position": [768, 560],
-      "id": "openAiModel",
-      "name": "OpenAI Chat Model"
+      "position": [
+        1800,
+        496
+      ],
+      "id": "b5c72f55-61ac-4e48-a8fe-2f0beea9ddf9",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "OPENAI_CRED_ID",
+          "name": "OpenAi account"
+        }
+      }
     },
     {
       "parameters": {
@@ -224,9 +395,18 @@
       },
       "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
       "typeVersion": 1.3,
-      "position": [928, 544],
-      "id": "pgMemory",
-      "name": "Postgres Chat Memory"
+      "position": [
+        1928,
+        496
+      ],
+      "id": "7b874ea7-23c5-440d-8daa-e1d57166861a",
+      "name": "Postgres Chat Memory",
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      }
     },
     {
       "parameters": {
@@ -234,19 +414,31 @@
         "formDescription": "Leave your details and a quick note — we'll reply right here.",
         "formFields": {
           "values": [
-            { "fieldLabel": "Name" },
-            { "fieldLabel": "Email or Instagram handle", "requiredField": true },
-            { "fieldLabel": "Your message", "fieldType": "textarea", "requiredField": true }
+            {
+              "fieldLabel": "Name"
+            },
+            {
+              "fieldLabel": "Email or Instagram handle",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Your message",
+              "fieldType": "textarea",
+              "requiredField": true
+            }
           ]
         },
         "responseMode": "lastNode",
         "options": {}
       },
-      "id": "leadForm",
+      "id": "a0d91b7c-c768-4c43-9132-8cd9b3f206eb",
       "name": "Lead Form",
       "type": "n8n-nodes-base.formTrigger",
       "typeVersion": 2.2,
-      "position": [0, 304],
+      "position": [
+        448,
+        464
+      ],
       "webhookId": "f1a2b3c4-d5e6-47f8-9a0b-1c2d3e4f5a6b"
     },
     {
@@ -256,39 +448,987 @@
         "completionTitle": "Thanks — here's our reply 👋",
         "completionMessage": "={{ $('Parse Agent JSON').first().json.reply }}"
       },
-      "id": "showReply",
+      "id": "cbbae184-e74b-4052-af32-87f91677fb41",
       "name": "Show Reply",
       "type": "n8n-nodes-base.form",
       "typeVersion": 2.2,
-      "position": [1632, 304],
+      "position": [
+        3936,
+        80
+      ],
       "webhookId": "a9b8c7d6-e5f4-4321-8765-0a1b2c3d4e5f"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "set-output",
+              "name": "output",
+              "value": "={{ $('Parse Agent JSON').first().json.reply }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "985b9216-846d-4366-9090-2288c34debba",
+      "name": "Respond to Chat",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3936,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "f33a68aa-7849-407d-afcd-40f47f5f223a",
+      "name": "Follow-up Scheduler",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        976
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH last_inbound AS (\n  SELECT lead_id, MAX(created_at) AS t FROM messages WHERE direction = 'inbound' GROUP BY lead_id\n),\nlast_msg AS (\n  SELECT lead_id, MAX(created_at) AS t FROM messages GROUP BY lead_id\n),\nout_since AS (\n  SELECT m.lead_id, COUNT(*) AS n\n  FROM messages m JOIN last_inbound li ON li.lead_id = m.lead_id\n  WHERE m.direction = 'outbound' AND m.created_at > li.t\n  GROUP BY m.lead_id\n)\nSELECT l.id, l.external_id, l.channel, l.name, COALESCE(os.n, 0) AS nudges_sent,\n       (SELECT m.body FROM messages m WHERE m.lead_id = l.id AND m.direction = 'inbound' ORDER BY m.created_at DESC LIMIT 1) AS last_msg\nFROM leads l\nJOIN last_msg lm ON lm.lead_id = l.id\nLEFT JOIN out_since os ON os.lead_id = l.id\nWHERE l.status = 'engaged'\n  AND (\n    (COALESCE(os.n, 0) = 1 AND lm.t < now() - INTERVAL '1 hour')\n    OR\n    (COALESCE(os.n, 0) = 2 AND lm.t < now() - INTERVAL '24 hours')\n  )\nORDER BY lm.t ASC\nLIMIT 20;",
+        "options": {}
+      },
+      "id": "a24ea10f-3f01-49d3-9f2d-51909069f6df",
+      "name": "Find Stale Leads",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        976
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const n = Number($json.nudges_sent ?? 1);\nconst first = $json.name ? (' ' + String($json.name).trim().split(/\\s+/)[0]) : '';\nconst msgs = [\n  `Hey${first} 😊 no rush at all — I know starting something new can feel a bit daunting, especially if you're not sure it's for you yet. Our Beginner Reformer classes are small (max 8) and built for total first-timers, so you'd be in really good hands. Your 2-week unlimited intro pass is still open — want me to suggest an easy time to come try one class? No commitment, just see how it feels.`,\n  `Hey${first}, just checking in one last time 💛 honestly, most of our members were on the fence before their first class and now they can't imagine their week without it. If you're even a little curious, just tell me which day suits and I'll hold a spot for you on the intro pass — nothing to lose. And if the timing isn't right, no worries at all, I'm here whenever you're ready.`\n];\nconst idx = Math.min(Math.max(n - 1, 0), msgs.length - 1);\nreturn { json: {\n  id: $json.id,\n  external_id: $json.external_id,\n  channel: $json.channel,\n  name: $json.name ?? null,\n  last_msg: $json.last_msg ?? '',\n  followup_text: msgs[idx],\n  nudge_number: idx + 1,\n  is_final: n >= 2\n} };"
+      },
+      "id": "14031457-31a3-4422-9945-2d4b21fca9d6",
+      "name": "Compose Follow-up",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        976
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (lead_id, direction, channel, body, created_at)\nVALUES ($1, 'outbound', $2, $3, now());",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.channel, $json.followup_text] }}"
+        }
+      },
+      "id": "91117c05-95cd-4e65-9690-8bc0b9633443",
+      "name": "Log Follow-up (outbound)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1472,
+        688
+      ],
+      "retryOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads SET status = CASE WHEN $2 THEN 'cold' ELSE status END, updated_at = now() WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.is_final] }}"
+        }
+      },
+      "id": "1a806896-f04f-4108-886b-a1cf606af640",
+      "name": "Mark Cold if Final",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1472,
+        1264
+      ],
+      "retryOnFail": true,
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "SLACK_OWNER_CHANNEL_ID",
+          "mode": "id"
+        },
+        "text": "=:wave: Auto follow-up #{{ $json.nudge_number }} sent to {{ $json.external_id }}: \"{{ $json.followup_text }}\"",
+        "otherOptions": {}
+      },
+      "id": "1cb72d1a-7a99-45ab-9507-26e3e1ac24f8",
+      "name": "Notify Owner - Follow-up",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1472,
+        1072
+      ],
+      "retryOnFail": true,
+      "webhookId": "68f85fd1-020f-4b15-b215-13771845f744",
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_OWNER_BOT_CRED_ID",
+          "name": "Reform Concierge"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "058614c2-89fa-4e2c-9125-7f47bd2579ac",
+      "name": "Chat Trigger (IG/FB DM sim)",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        448,
+        272
+      ],
+      "webhookId": "722b8598-ce1b-49e1-ae6c-2e9e6f9934a7",
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-id",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "304e7667-e380-4e18-b1ee-fcde01697d9a",
+      "name": "Has Stale Leads?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        448,
+        976
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "9320fb73-3d8b-43c2-ab1b-1d968658dee1",
+      "name": "Slack Poller",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "channel",
+        "operation": "history",
+        "channelId": {
+          "__rl": true,
+          "value": "SLACK_LEAD_CHANNEL_ID",
+          "mode": "id"
+        },
+        "limit": 10,
+        "filters": {}
+      },
+      "id": "9e4cd74e-9ffa-4329-bcea-e5918f136e1b",
+      "name": "Get Slack Messages",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        224,
+        80
+      ],
+      "webhookId": "31e42a0b-4e34-49d8-8536-a4c4e041c30e",
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_LEAD_BOT_CRED_ID",
+          "name": "Reform Collective"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const sd = $getWorkflowStaticData('global');\nconst items = $input.all();\n// First run after activation: set cursor to newest and skip the existing backlog\nif (sd.slackLastTs === undefined) {\n  let mx = 0;\n  for (const it of items) { const t = parseFloat(it.json.ts); if (t > mx) mx = t; }\n  sd.slackLastTs = String(mx || (Date.now() / 1000));\n  return [];\n}\nconst lastTs = parseFloat(sd.slackLastTs);\nlet maxTs = lastTs;\nconst out = [];\nfor (const it of items) {\n  const m = it.json;\n  const ts = parseFloat(m.ts);\n  if (!ts || ts <= lastTs) continue;\n  if (m.bot_id || m.app_id || m.subtype) continue; // ignore bots / apps / system events\n  if (!m.user || !m.text) continue;\n  if (ts > maxTs) maxTs = ts;\n  out.push({ json: { slack_user: m.user, slack_ts: m.ts, text: m.text } });\n}\nsd.slackLastTs = String(maxTs);\nreturn out;"
+      },
+      "id": "95f9f08d-e435-4d65-aee3-875ee46def58",
+      "name": "Filter New Lead Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-form",
+                    "leftValue": "={{ $('Normalize Lead').first().json.channel }}",
+                    "rightValue": "form",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "form"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-slack",
+                    "leftValue": "={{ $('Normalize Lead').first().json.channel }}",
+                    "rightValue": "slack",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "slack"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "11054b4d-b736-490c-aa3a-0738f88ead1c",
+      "name": "Route Reply",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        3712,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "SLACK_LEAD_CHANNEL_ID",
+          "mode": "id"
+        },
+        "text": "={{ $('Parse Agent JSON').first().json.reply }}",
+        "otherOptions": {}
+      },
+      "id": "cbcc4eba-1168-40d3-ac19-ce67811312d8",
+      "name": "Slack Reply",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        3936,
+        464
+      ],
+      "retryOnFail": true,
+      "webhookId": "9d74d105-1226-48f3-90ef-207324f043ba",
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_LEAD_BOT_CRED_ID",
+          "name": "Reform Collective"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "is-slack",
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "slack",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c20936e4-9cf7-4a0c-970b-38d185cb332a",
+      "name": "Is Slack Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1472,
+        880
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "SLACK_LEAD_CHANNEL_ID",
+          "mode": "id"
+        },
+        "text": "={{ $json.followup_text }}",
+        "otherOptions": {}
+      },
+      "id": "1ee7b6a7-dba6-40f3-8b8e-c9887c183adb",
+      "name": "Send Follow-up to Lead (Slack)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1696,
+        880
+      ],
+      "retryOnFail": true,
+      "webhookId": "e96f548f-29c4-4fcf-85e2-e87ccc7c3f87",
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_LEAD_BOT_CRED_ID",
+          "name": "Reform Collective"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "STUDIO_SCHEDULE_CALENDAR_ID",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "0e409946-4591-4e4e-8a1b-edfbd968c3b0",
+      "name": "Get Schedule",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.3,
+      "position": [
+        1344,
+        272
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "GOOGLE_CAL_CRED_ID",
+          "name": "Google Calendar account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst CAP = 8;\nconst classes = [];\nconst trials = {};\nfor (const it of items) {\n  const j = it.json || {};\n  const s = j.start && (j.start.dateTime || j.start.date);\n  if (!s) continue;\n  const summary = String(j.summary || '').trim();\n  if (/^trial/i.test(summary)) {\n    const key = new Date(s).getTime();\n    trials[key] = (trials[key] || 0) + 1;\n  } else {\n    classes.push({ summary, start: s });\n  }\n}\nconst fmt = (iso) => DateTime.fromISO(iso, { zone: 'Asia/Karachi' }).toFormat('cccc dd LLL, h:mm a');\nconst lines = classes\n  .sort((a, b) => new Date(a.start) - new Date(b.start))\n  .map((c) => {\n    const taken = trials[new Date(c.start).getTime()] || 0;\n    const left = CAP - taken;\n    return '- ' + c.summary + ' — ' + fmt(c.start) + ' — ' + (left > 0 ? left + ' seats left' : 'FULL');\n  });\nconst scheduleText = lines.length ? lines.join('\\n') : '(no upcoming classes on the schedule right now)';\nreturn [{ json: { scheduleText } }];"
+      },
+      "id": "f9efc8fc-ec7d-48f8-b70a-d1c79bb52792",
+      "name": "Format Schedule",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Write a follow-up message — nudge #{{ $json.nudge_number }}{{ $json.is_final ? ' (FINAL nudge: extra gentle, leave the door open)' : '' }}.\nLead's first name: {{ $json.name || 'there' }}\nWhat they last said to us: \"{{ $json.last_msg }}\"\nWrite the message now.",
+        "options": {
+          "systemMessage": "You are Mia, the warm, friendly owner of Reform Collective Pilates, a boutique reformer & mat Pilates studio in Gulberg, Lahore. You are writing a short follow-up DM to a lead who asked about classes but went quiet — they seem interested but unsure about committing. Re-engage them and make trying a class feel easy, WITHOUT being pushy or salesy.\n\nRules:\n- 1 to 3 short sentences, warm and human, like a real text from a person. No 'Dear', no formal sign-off, no subject line.\n- Use what they last said to gently address their specific hesitation (e.g. reassure that beginners are welcome, it's relaxed and no-pressure, easy to try once).\n- Naturally remind them of the value: 2-week unlimited intro pass, small classes (max 8), free parking.\n- End with ONE easy, low-friction question or invite (e.g. 'want me to hold you a spot?').\n- If it is the FINAL nudge, be extra gentle and leave the door open (e.g. 'no rush at all — I'll keep your intro offer open for whenever you're ready').\n- Output ONLY the message text. No quotes, no labels, no JSON. At most one tasteful emoji."
+        }
+      },
+      "id": "6d4b612b-5f2f-4a81-8407-17b866b4cc06",
+      "name": "Write Nudge (AI)",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        896,
+        976
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5.4-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-5.4-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "id": "3aba35a8-4e06-4c6c-9c34-c007121bd449",
+      "name": "OpenAI (Nudge)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        968,
+        1200
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "OPENAI_CRED_ID",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "followup_text",
+              "value": "={{ $json.output || $('Compose Follow-up').item.json.followup_text }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "id",
+              "value": "={{ $('Compose Follow-up').item.json.id }}",
+              "type": "number"
+            },
+            {
+              "id": "a3",
+              "name": "external_id",
+              "value": "={{ $('Compose Follow-up').item.json.external_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "channel",
+              "value": "={{ $('Compose Follow-up').item.json.channel }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "nudge_number",
+              "value": "={{ $('Compose Follow-up').item.json.nudge_number }}",
+              "type": "number"
+            },
+            {
+              "id": "a6",
+              "name": "is_final",
+              "value": "={{ $('Compose Follow-up').item.json.is_final }}",
+              "type": "boolean"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "76ea1ec0-6203-4926-ae8e-82970a1ef47f",
+      "name": "Assemble Nudge",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1248,
+        976
+      ]
     }
   ],
   "connections": {
-    "Lead Form": { "main": [[{ "node": "Normalize Lead", "type": "main", "index": 0 }]] },
-    "Normalize Lead": { "main": [[{ "node": "Upsert Lead", "type": "main", "index": 0 }]] },
-    "Upsert Lead": { "main": [[{ "node": "Log Inbound Message", "type": "main", "index": 0 }]] },
-    "Log Inbound Message": { "main": [[{ "node": "AI Agent", "type": "main", "index": 0 }]] },
-    "AI Agent": { "main": [[{ "node": "Parse Agent JSON", "type": "main", "index": 0 }]] },
-    "Parse Agent JSON": { "main": [[{ "node": "Route by Intent", "type": "main", "index": 0 }]] },
-    "Route by Intent": {
+    "Normalize Lead": {
       "main": [
-        [{ "node": "Create Calendar Event", "type": "main", "index": 0 }],
-        [{ "node": "Insert Escalation", "type": "main", "index": 0 }],
-        [{ "node": "Continue (no action)", "type": "main", "index": 0 }]
+        [
+          {
+            "node": "Upsert Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
-    "Create Calendar Event": { "main": [[{ "node": "Insert Booking", "type": "main", "index": 0 }]] },
-    "Insert Booking": { "main": [[{ "node": "Mark Lead Booked", "type": "main", "index": 0 }]] },
-    "Mark Lead Booked": { "main": [[{ "node": "Notify Owner - Booking", "type": "main", "index": 0 }]] },
-    "Notify Owner - Booking": { "main": [[{ "node": "Log Outbound Message", "type": "main", "index": 0 }]] },
-    "Insert Escalation": { "main": [[{ "node": "Notify Owner - Escalation", "type": "main", "index": 0 }]] },
-    "Notify Owner - Escalation": { "main": [[{ "node": "Log Outbound Message", "type": "main", "index": 0 }]] },
-    "Continue (no action)": { "main": [[{ "node": "Log Outbound Message", "type": "main", "index": 0 }]] },
-    "Log Outbound Message": { "main": [[{ "node": "Show Reply", "type": "main", "index": 0 }]] },
-    "Google Calendar (read availability)": { "ai_tool": [[{ "node": "AI Agent", "type": "ai_tool", "index": 0 }]] },
-    "OpenAI Chat Model": { "ai_languageModel": [[{ "node": "AI Agent", "type": "ai_languageModel", "index": 0 }]] },
-    "Postgres Chat Memory": { "ai_memory": [[{ "node": "AI Agent", "type": "ai_memory", "index": 0 }]] }
+    "Upsert Lead": {
+      "main": [
+        [
+          {
+            "node": "Log Inbound Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse Agent JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Agent JSON": {
+      "main": [
+        [
+          {
+            "node": "Route by Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Intent": {
+      "main": [
+        [
+          {
+            "node": "Create Calendar Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Insert Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Continue (no action)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Calendar Event": {
+      "main": [
+        [
+          {
+            "node": "Insert Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Booking": {
+      "main": [
+        [
+          {
+            "node": "Mark Lead Booked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Lead Booked": {
+      "main": [
+        [
+          {
+            "node": "Notify Owner - Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Escalation": {
+      "main": [
+        [
+          {
+            "node": "Notify Owner - Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres Chat Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead Form": {
+      "main": [
+        [
+          {
+            "node": "Normalize Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Owner - Booking": {
+      "main": [
+        [
+          {
+            "node": "Log Outbound Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Owner - Escalation": {
+      "main": [
+        [
+          {
+            "node": "Log Outbound Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Continue (no action)": {
+      "main": [
+        [
+          {
+            "node": "Log Outbound Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Follow-up Scheduler": {
+      "main": [
+        [
+          {
+            "node": "Find Stale Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chat Trigger (IG/FB DM sim)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Stale Leads": {
+      "main": [
+        [
+          {
+            "node": "Has Stale Leads?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Stale Leads?": {
+      "main": [
+        [
+          {
+            "node": "Compose Follow-up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Poller": {
+      "main": [
+        [
+          {
+            "node": "Get Slack Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Slack Messages": {
+      "main": [
+        [
+          {
+            "node": "Filter New Lead Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter New Lead Messages": {
+      "main": [
+        [
+          {
+            "node": "Normalize Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Outbound Message": {
+      "main": [
+        [
+          {
+            "node": "Route Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Reply": {
+      "main": [
+        [
+          {
+            "node": "Show Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Slack Lead?": {
+      "main": [
+        [
+          {
+            "node": "Send Follow-up to Lead (Slack)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Inbound Message": {
+      "main": [
+        [
+          {
+            "node": "Get Schedule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Schedule": {
+      "main": [
+        [
+          {
+            "node": "Format Schedule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Schedule": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Follow-up": {
+      "main": [
+        [
+          {
+            "node": "Write Nudge (AI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI (Nudge)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Write Nudge (AI)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Nudge (AI)": {
+      "main": [
+        [
+          {
+            "node": "Assemble Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Nudge": {
+      "main": [
+        [
+          {
+            "node": "Log Follow-up (outbound)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Mark Cold if Final",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Owner - Follow-up",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Is Slack Lead?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
-  "settings": { "executionOrder": "v1" }
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false,
+    "timezone": "Asia/Karachi",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  },
+  "pinData": {}
 }
