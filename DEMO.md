@@ -1,11 +1,11 @@
-# Phase 1 Demonstration Guide — Lead Capture & Booking (v.1.5)
+# Phase 1 Demonstration Guide — Lead Capture & Booking (v.1.6)
 
 This is a script for demonstrating the working Phase 1 prototype. The system answers inbound
 leads in the studio owner's voice, holds a real conversation, books trial classes to Google
 Calendar, alerts the owner on Slack, and chases leads who go quiet — across a **website form**
 and a **two-way Slack channel**.
 
-Workflow: `Lead Capture & Booking — Core Loop v.1.5` (n8n, id `t7y3ISrzAcj8fCmA`).
+Workflow: `Lead Capture & Booking — Core Loop v.1.6` (n8n, id `t7y3ISrzAcj8fCmA`).
 Mock studio: **Reform Collective Pilates** (Lahore, PKT). Agent persona: "Mia", the owner.
 
 ---

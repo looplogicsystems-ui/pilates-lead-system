@@ -9,7 +9,7 @@ to Postgres.
 ## Status
 
 **Phase 1 (core conversational loop) is built, finalized, and running** in a self-hosted n8n
-instance (workflow `Lead Capture & Booking — Core Loop v.1.5`, id `t7y3ISrzAcj8fCmA`).
+instance (workflow `Lead Capture & Booking — Core Loop v.1.6`, id `t7y3ISrzAcj8fCmA`).
 
 Inbound channels: an n8n hosted **Form** (website lead capture) **and a two-way Slack channel**
 (a "lead bot" polls the channel every minute and replies in it — simulating an Instagram/Facebook
@@ -25,6 +25,12 @@ The mock studio used in the agent prompt is **"Reform Collective Pilates"** (Gul
 `ZONE` constant in **Parse Agent JSON**. The agent is given the current date each turn (so it books
 real future dates, never a past year) and only offers/confirms classes that actually exist on the
 schedule calendar.
+
+### v.1.6 highlights (hardening)
+- **Resilient AI calls.** The conversation agent retries transient OpenAI failures (3× with 2s
+  backoff), so an occasional `Connection error` no longer drops a lead. Verified end-to-end against
+  the live workflow (form → real-schedule read → agent reply → log), plus the Slack inbound poller,
+  the follow-up eligibility query, and the Error Handler alert path.
 
 ### v.1.5 highlights (Phase 1 finalized)
 - **Real availability, not prompt guesswork.** A dedicated **studio schedule calendar** of recurring
@@ -44,7 +50,7 @@ schedule calendar.
 ## Repo layout
 
 - `PLAN.md` — the production & monetization plan (the working design doc; refined via Ultraplan).
-- `workflows/lead-capture-core-loop.json` — importable n8n workflow export (the **live v.1.5** graph,
+- `workflows/lead-capture-core-loop.json` — importable n8n workflow export (the **live v.1.6** graph,
   39 nodes). Credentials, Slack channel IDs, and the calendar ID are redacted to placeholders
   (`POSTGRES_CRED_ID`, `SLACK_LEAD_CHANNEL_ID`, `STUDIO_SCHEDULE_CALENDAR_ID`, …); re-select/replace
   them after importing.
@@ -53,7 +59,7 @@ schedule calendar.
 - `DEMO.md` — a 5-act demonstration script for the working prototype.
 - `docs-project-outline.txt` — the original project brief.
 
-## Architecture (Phase 1, v.1.5)
+## Architecture (Phase 1, v.1.6)
 
 ```
 INBOUND

@@ -1,5 +1,5 @@
 {
-  "name": "Lead Capture & Booking — Core Loop v.1.5",
+  "name": "Lead Capture & Booking — Core Loop v.1.6",
   "nodes": [
     {
       "parameters": {
@@ -79,7 +79,10 @@
       "position": [
         1792,
         272
-      ]
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
     },
     {
       "parameters": {
@@ -292,7 +295,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Reform Concierge"
+          "name": "Reform Concierge Talha"
         }
       },
       "onError": "continueRegularOutput"
@@ -346,7 +349,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Reform Concierge"
+          "name": "Reform Concierge Talha"
         }
       },
       "onError": "continueRegularOutput"
@@ -610,7 +613,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Reform Concierge"
+          "name": "Reform Concierge Talha"
         }
       },
       "onError": "continueRegularOutput"
@@ -708,7 +711,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_LEAD_BOT_CRED_ID",
-          "name": "Reform Collective"
+          "name": "Reform Collective Talha"
         }
       }
     },
@@ -816,7 +819,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_LEAD_BOT_CRED_ID",
-          "name": "Reform Collective"
+          "name": "Reform Collective Talha"
         }
       },
       "onError": "continueRegularOutput"
@@ -878,7 +881,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_LEAD_BOT_CRED_ID",
-          "name": "Reform Collective"
+          "name": "Reform Collective Talha"
         }
       },
       "onError": "continueRegularOutput"
