@@ -1,10 +1,10 @@
 {
-  "name": "Lead Capture & Booking — Core Loop v.1.6",
+  "name": "Lead Capture & Booking — Core Loop v.2.0",
   "nodes": [
     {
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "const b = $json.body ?? $json;\nconst pick = (...keys) => { for (const k of keys) { const v = b[k]; if (v !== undefined && v !== null && v !== '') return v; } return undefined; };\nconst isSlack = b.slack_user !== undefined || b.slack_ts !== undefined;\nconst isChat = b.chatInput !== undefined || (b.sessionId !== undefined && b.action !== undefined);\nif (isSlack) {\n  return { json: {\n    external_id: String(b.slack_user ?? 'slack-unknown'),\n    channel: 'slack',\n    name: null,\n    message: String(b.text ?? ''),\n    studio_id: 1\n  } };\n}\nif (isChat) {\n  return { json: {\n    external_id: String(b.sessionId ?? 'chat-unknown'),\n    channel: 'instagram',\n    name: null,\n    message: String(b.chatInput ?? ''),\n    studio_id: 1\n  } };\n}\nreturn { json: {\n  external_id: String(pick('external_id','from','Email or Instagram handle','email') ?? 'unknown'),\n  channel: String(pick('channel') ?? 'form'),\n  name: (pick('name','Name') ?? null),\n  message: String(pick('message','text','Your message') ?? ''),\n  studio_id: Number(pick('studio_id') ?? 1)\n} };"
+        "jsCode": "const b = $json.body ?? $json;\nconst pick = (...keys) => { for (const k of keys) { const v = b[k]; if (v !== undefined && v !== null && v !== '') return v; } return undefined; };\n\nconst isInstagram = b.ig_sender !== undefined;\nconst isSlack = b.slack_user !== undefined || b.slack_ts !== undefined;\n\nif (isInstagram) {\n  return { json: {\n    external_id: String(b.ig_sender),\n    channel: 'instagram',\n    name: (b.name ?? null),\n    message: String(b.text ?? ''),\n    studio_id: 1\n  } };\n}\n\nif (isSlack) {\n  return { json: {\n    external_id: String(b.slack_user ?? 'slack-unknown'),\n    channel: 'slack',\n    name: null,\n    message: String(b.text ?? ''),\n    studio_id: 1\n  } };\n}\n\n// generic fallback (manual executions / future channels)\nreturn { json: {\n  external_id: String(pick('external_id','from','email') ?? 'unknown'),\n  channel: String(pick('channel') ?? 'unknown'),\n  name: (pick('name','Name') ?? null),\n  message: String(pick('message','text') ?? ''),\n  studio_id: Number(pick('studio_id') ?? 1)\n} };"
       },
       "id": "normalize",
       "name": "Normalize Lead",
@@ -295,7 +295,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Reform Concierge Talha"
+          "name": "Owner Alerts Bot (Slack)"
         }
       },
       "onError": "continueRegularOutput"
@@ -349,7 +349,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Reform Concierge Talha"
+          "name": "Owner Alerts Bot (Slack)"
         }
       },
       "onError": "continueRegularOutput"
@@ -379,7 +379,7 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "typeVersion": 1.3,
       "position": [
-        1800,
+        1808,
         496
       ],
       "id": "b5c72f55-61ac-4e48-a8fe-2f0beea9ddf9",
@@ -387,7 +387,7 @@
       "credentials": {
         "openAiApi": {
           "id": "OPENAI_CRED_ID",
-          "name": "OpenAi account"
+          "name": "OpenAI account"
         }
       }
     },
@@ -399,7 +399,7 @@
       "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
       "typeVersion": 1.3,
       "position": [
-        1928,
+        1936,
         496
       ],
       "id": "7b874ea7-23c5-440d-8daa-e1d57166861a",
@@ -410,79 +410,6 @@
           "name": "Postgres account"
         }
       }
-    },
-    {
-      "parameters": {
-        "formTitle": "Book your intro class",
-        "formDescription": "Leave your details and a quick note — we'll reply right here.",
-        "formFields": {
-          "values": [
-            {
-              "fieldLabel": "Name"
-            },
-            {
-              "fieldLabel": "Email or Instagram handle",
-              "requiredField": true
-            },
-            {
-              "fieldLabel": "Your message",
-              "fieldType": "textarea",
-              "requiredField": true
-            }
-          ]
-        },
-        "responseMode": "lastNode",
-        "options": {}
-      },
-      "id": "a0d91b7c-c768-4c43-9132-8cd9b3f206eb",
-      "name": "Lead Form",
-      "type": "n8n-nodes-base.formTrigger",
-      "typeVersion": 2.2,
-      "position": [
-        448,
-        464
-      ],
-      "webhookId": "f1a2b3c4-d5e6-47f8-9a0b-1c2d3e4f5a6b"
-    },
-    {
-      "parameters": {
-        "operation": "completion",
-        "respondWith": "text",
-        "completionTitle": "Thanks — here's our reply 👋",
-        "completionMessage": "={{ $('Parse Agent JSON').first().json.reply }}"
-      },
-      "id": "cbbae184-e74b-4052-af32-87f91677fb41",
-      "name": "Show Reply",
-      "type": "n8n-nodes-base.form",
-      "typeVersion": 2.2,
-      "position": [
-        3936,
-        80
-      ],
-      "webhookId": "a9b8c7d6-e5f4-4321-8765-0a1b2c3d4e5f"
-    },
-    {
-      "parameters": {
-        "assignments": {
-          "assignments": [
-            {
-              "id": "set-output",
-              "name": "output",
-              "value": "={{ $('Parse Agent JSON').first().json.reply }}",
-              "type": "string"
-            }
-          ]
-        },
-        "options": {}
-      },
-      "id": "985b9216-846d-4366-9090-2288c34debba",
-      "name": "Respond to Chat",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [
-        3936,
-        272
-      ]
     },
     {
       "parameters": {
@@ -613,25 +540,10 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Reform Concierge Talha"
+          "name": "Owner Alerts Bot (Slack)"
         }
       },
       "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
-        "options": {}
-      },
-      "id": "058614c2-89fa-4e2c-9125-7f47bd2579ac",
-      "name": "Chat Trigger (IG/FB DM sim)",
-      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
-      "typeVersion": 1.1,
-      "position": [
-        448,
-        272
-      ],
-      "webhookId": "722b8598-ce1b-49e1-ae6c-2e9e6f9934a7",
-      "disabled": true
     },
     {
       "parameters": {
@@ -711,7 +623,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_LEAD_BOT_CRED_ID",
-          "name": "Reform Collective Talha"
+          "name": "Studio Lead Bot (Slack)"
         }
       }
     },
@@ -742,30 +654,6 @@
                 },
                 "conditions": [
                   {
-                    "id": "r-form",
-                    "leftValue": "={{ $('Normalize Lead').first().json.channel }}",
-                    "rightValue": "form",
-                    "operator": {
-                      "type": "string",
-                      "operation": "equals"
-                    }
-                  }
-                ],
-                "combinator": "and"
-              },
-              "renameOutput": true,
-              "outputKey": "form"
-            },
-            {
-              "conditions": {
-                "options": {
-                  "caseSensitive": true,
-                  "leftValue": "",
-                  "typeValidation": "loose",
-                  "version": 2
-                },
-                "conditions": [
-                  {
                     "id": "r-slack",
                     "leftValue": "={{ $('Normalize Lead').first().json.channel }}",
                     "rightValue": "slack",
@@ -779,6 +667,30 @@
               },
               "renameOutput": true,
               "outputKey": "slack"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "r-instagram",
+                    "leftValue": "={{ $('Normalize Lead').first().json.channel }}",
+                    "rightValue": "instagram",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "instagram"
             }
           ]
         },
@@ -819,7 +731,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_LEAD_BOT_CRED_ID",
-          "name": "Reform Collective Talha"
+          "name": "Studio Lead Bot (Slack)"
         }
       },
       "onError": "continueRegularOutput"
@@ -881,7 +793,7 @@
       "credentials": {
         "slackApi": {
           "id": "SLACK_LEAD_BOT_CRED_ID",
-          "name": "Reform Collective Talha"
+          "name": "Studio Lead Bot (Slack)"
         }
       },
       "onError": "continueRegularOutput"
@@ -942,8 +854,8 @@
         896,
         976
       ],
-      "onError": "continueRegularOutput",
-      "retryOnFail": true
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
     },
     {
       "parameters": {
@@ -961,13 +873,13 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "typeVersion": 1.3,
       "position": [
-        968,
+        976,
         1200
       ],
       "credentials": {
         "openAiApi": {
           "id": "OPENAI_CRED_ID",
-          "name": "OpenAi account"
+          "name": "OpenAI account"
         }
       }
     },
@@ -1022,6 +934,195 @@
       "position": [
         1248,
         976
+      ]
+    },
+    {
+      "parameters": {
+        "path": "instagram",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "680a6f8a-e748-4ff2-9ffb-c9e1970ce723",
+      "name": "IG Verify",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -224,
+        -160
+      ],
+      "webhookId": "b72a54a7-2976-4bb5-84df-3674c21440f7",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-verify",
+              "leftValue": "={{ $json.query['hub.verify_token'] }}",
+              "rightValue": "={{ $env.IG_VERIFY_TOKEN }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c84f9989-3b25-47ea-835f-c045ccd44850",
+      "name": "Verify Token OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $('IG Verify').first().json.query['hub.challenge'] }}",
+        "options": {}
+      },
+      "id": "cf18151d-1b5a-4205-bbc3-0d4ecef56fed",
+      "name": "Respond Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        224,
+        -256
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "options": {
+          "responseCode": 403
+        }
+      },
+      "id": "b35e89fc-4a8a-4c60-b1b4-530e7bb3e28a",
+      "name": "Respond Forbidden",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        224,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "instagram",
+        "options": {
+          "rawBody": true,
+          "responseData": "EVENT_RECEIVED"
+        }
+      },
+      "id": "4b6cd3ca-7e9d-49fa-854d-30ee0d39c828",
+      "name": "IG Events",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -224,
+        272
+      ],
+      "webhookId": "a078ab54-7006-4123-a910-3bae36bbbc3c",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verifies Meta's X-Hub-Signature-256 over the EXACT raw bytes that were signed.\n// Meta may sign with either the main app secret or the Instagram-product app\n// secret depending on how the subscription was created, so we accept either.\n// Anything failing verification is dropped silently (returns no items).\nconst crypto = require('crypto');\n\nconst secrets = [$env.IG_APP_SECRET, $env.IG_APP_SECRET_INSTAGRAM].filter(Boolean);\nconst items = $input.all();\nconst out = [];\n\nconst matches = (raw, sig) => secrets.some((secret) => {\n  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');\n  const a = Buffer.from(expected, 'utf8');\n  const b = Buffer.from(String(sig), 'utf8');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n});\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const headers = item.json.headers ?? {};\n  const sig = headers['x-hub-signature-256'] ?? headers['X-Hub-Signature-256'];\n\n  // Raw body arrives as a binary property (webhook option rawBody=true)\n  let raw = null;\n  const b64 = item.binary?.data?.data;\n  if (b64) {\n    raw = Buffer.from(b64, 'base64');\n  } else {\n    try { raw = await $helpers.getBinaryDataBuffer(i, 'data'); } catch (e) { raw = null; }\n  }\n\n  if (!secrets.length || !sig || !raw) continue;\n  if (!matches(raw, sig)) continue;\n\n  let body;\n  try { body = JSON.parse(raw.toString('utf8')); } catch (e) { continue; }\n  out.push({ json: { body } });\n}\n\nreturn out;"
+      },
+      "id": "31230507-9626-48a6-a16f-52cabe034223",
+      "name": "Verify IG Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flattens Meta's batched webhook payload into one item per inbound text DM.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const body = item.json.body ?? {};\n  if (body.object !== 'instagram') continue;\n\n  for (const entry of body.entry ?? []) {\n    for (const ev of entry.messaging ?? []) {\n      const msg = ev.message;\n      if (!msg) continue;          // delivery / read receipts\n      if (msg.is_echo) continue;   // our own outbound DM echoed back\n      if (!msg.text) continue;     // reactions, attachments, stickers\n\n      out.push({ json: {\n        ig_sender: ev.sender?.id,\n        ig_mid: msg.mid,\n        text: msg.text,\n        ig_account_id: entry.id\n      } });\n    }\n  }\n}\n\nreturn out;"
+      },
+      "id": "d098a0a9-e603-4ccc-9e90-ee944a8fc7db",
+      "name": "Extract IG Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Meta retries aggressively; drop message IDs we've already handled.\nconst store = $getWorkflowStaticData('global');\nif (!Array.isArray(store.igSeenMids)) store.igSeenMids = [];\n\nconst seen = new Set(store.igSeenMids);\nconst out = [];\n\nfor (const item of $input.all()) {\n  const mid = item.json.ig_mid;\n  if (!mid) { out.push(item); continue; }\n  if (seen.has(mid)) continue;\n  seen.add(mid);\n  store.igSeenMids.push(mid);\n  out.push(item);\n}\n\n// keep the rolling window bounded\nif (store.igSeenMids.length > 500) {\n  store.igSeenMids = store.igSeenMids.slice(-500);\n}\n\nreturn out;"
+      },
+      "id": "cab734e2-c10b-4da4-b754-8e47a9e6db25",
+      "name": "Dedupe IG",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.instagram.com/v25.0/me/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ recipient: { id: $('Normalize Lead').first().json.external_id }, message: { text: $('Parse Agent JSON').first().json.reply } }) }}",
+        "options": {}
+      },
+      "id": "a660f84b-dffa-41df-9674-be9ca1e036e8",
+      "name": "Send IG Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3936,
+        272
+      ],
+      "retryOnFail": true,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "IG_TOKEN_CRED_ID",
+          "name": "Instagram DM Token"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "id": "69a249e9-721d-41d0-9f23-299c280ff4dc",
+      "name": "Unknown Channel",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        3936,
+        640
       ]
     }
   ],
@@ -1161,17 +1262,6 @@
         ]
       ]
     },
-    "Lead Form": {
-      "main": [
-        [
-          {
-            "node": "Normalize Lead",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Notify Owner - Booking": {
       "main": [
         [
@@ -1210,17 +1300,6 @@
         [
           {
             "node": "Find Stale Leads",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Chat Trigger (IG/FB DM sim)": {
-      "main": [
-        [
-          {
-            "node": "Normalize Lead",
             "type": "main",
             "index": 0
           }
@@ -1287,31 +1366,6 @@
         [
           {
             "node": "Route Reply",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Route Reply": {
-      "main": [
-        [
-          {
-            "node": "Show Reply",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Slack Reply",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Respond to Chat",
             "type": "main",
             "index": 0
           }
@@ -1420,6 +1474,104 @@
           }
         ]
       ]
+    },
+    "IG Verify": {
+      "main": [
+        [
+          {
+            "node": "Verify Token OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Token OK?": {
+      "main": [
+        [
+          {
+            "node": "Respond Challenge",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Forbidden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG Events": {
+      "main": [
+        [
+          {
+            "node": "Verify IG Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify IG Signature": {
+      "main": [
+        [
+          {
+            "node": "Extract IG Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract IG Messages": {
+      "main": [
+        [
+          {
+            "node": "Dedupe IG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedupe IG": {
+      "main": [
+        [
+          {
+            "node": "Normalize Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Reply": {
+      "main": [
+        [
+          {
+            "node": "Slack Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send IG Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unknown Channel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "settings": {
@@ -1429,9 +1581,8 @@
     "saveManualExecutions": true,
     "saveExecutionProgress": true,
     "callerPolicy": "workflowsFromSameOwner",
-    "availableInMCP": false,
     "timezone": "Asia/Karachi",
     "errorWorkflow": "4L4K72aSSwiBcnjX"
   },
-  "pinData": {}
+  "active": false
 }
