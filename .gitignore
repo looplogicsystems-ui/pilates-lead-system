@@ -4,6 +4,13 @@
 secrets/
 credentials*.json
 
+# Deployment-specific IDs (calendar / Slack channel / IG account).
+# Not secrets, but specific to one environment — see local-ids.sql.example
+db/seed/local-ids.sql
+
+# Windows "downloaded from the internet" marker files
+*:Zone.Identifier
+
 # OS / editor
 .DS_Store
 *.swp
