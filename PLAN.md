@@ -75,10 +75,15 @@ One platform, many studios — but **you** onboard each (no self-serve UI needed
 
 ## Build order (concrete, on top of what's built)
 
-**Phase 2a — Productionize the core (channel-agnostic):**
-1. Refactor the current workflow's core into a **Lead Brain** sub-workflow that *returns* `{reply, intent, …}` (decouple from the Form/HTTP response).
-2. Move studio config into **`studios`** (timezone, prompt vars, slack channel, calendar) + add **`channel_accounts`** routing table; load per-lead at the top of Lead Brain (replaces hardcoded NY timezone + prompt placeholders).
-3. Add **idempotency** (message-id dedupe), an **Error Trigger** workflow + dead-letter + admin alert.
+**Phase 2a — Productionize the core (channel-agnostic): ✅ DONE (2026-08-01)**
+1. ~~Refactor the current workflow's core into a **Lead Brain** sub-workflow that *returns* `{reply, intent, …}`.~~ Done — `Lead Brain` (`fvHhAUDCbVN9ELb0`), called by thin adapters with `mode: each` (which also fixed a latent bug where batched messages silently dropped every lead after the first).
+2. ~~Move studio config into **`studios`** + add **`channel_accounts`** routing table.~~ Done — verified with two studios on different timezones, no cross-over, and no fallback studio (unknown accounts dead-letter and stop).
+3. ~~Add **idempotency**, an **Error Trigger** workflow + dead-letter + admin alert.~~ Done — `processed_messages` (restart-safe), `dead_letters` persisted before the Slack alert.
+
+Also landed in this phase: booking blocked on a verified calendar write (with an honest holding
+reply to the lead), `escalated`/`ai_paused` lifecycle states, cold-lead revival, bounded schedule
+reads with ±15-min seat matching, and versioned SQL migrations. See `PHASE-2A-BRIEF.md` for the
+brief and `README.md` for the resulting architecture.
 
 **Phase 2b — Stand up production + Instagram:**
 4. VPS + domain + HTTPS + n8n queue mode + backed-up Postgres.

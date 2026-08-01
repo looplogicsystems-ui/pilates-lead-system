@@ -1,0 +1,447 @@
+{
+  "id": "OQMXzwDyu5YAmRTo",
+  "name": "Channel Adapter: Instagram",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000a001",
+  "nodes": [
+    {
+      "id": "ig-verify",
+      "name": "IG Verify",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -460,
+        -120
+      ],
+      "parameters": {
+        "path": "instagram",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "4f6d1a2b-7c3e-4d51-9a80-1e2f3a4b5c6d",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "verify-token-ok",
+      "name": "Verify Token OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -240,
+        -120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "c-verify",
+              "leftValue": "={{ $json.query['hub.verify_token'] }}",
+              "rightValue": "={{ $env.IG_VERIFY_TOKEN }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "respond-challenge",
+      "name": "Respond Challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -20,
+        -200
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $('IG Verify').first().json.query['hub.challenge'] }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "respond-forbidden",
+      "name": "Respond Forbidden",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -20,
+        -40
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "options": {
+          "responseCode": 403
+        }
+      }
+    },
+    {
+      "id": "ig-events",
+      "name": "IG Events",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -460,
+        160
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "instagram",
+        "options": {
+          "rawBody": true,
+          "responseData": "EVENT_RECEIVED"
+        }
+      },
+      "webhookId": "8b1c2d3e-4f5a-6b7c-8d9e-0a1b2c3d4e5f",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "verify-ig-signature",
+      "name": "Verify IG Signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        160
+      ],
+      "parameters": {
+        "jsCode": "\n// Verifies Meta's X-Hub-Signature-256 over the EXACT raw bytes that were signed.\n// Meta may sign with either the main app secret or the Instagram-product app\n// secret depending on how the subscription was created, so we accept either.\n// Anything failing verification is dropped silently (returns no items).\nconst crypto = require('crypto');\n\nconst secrets = [$env.IG_APP_SECRET, $env.IG_APP_SECRET_INSTAGRAM].filter(Boolean);\nconst items = $input.all();\nconst out = [];\n\nconst matches = (raw, sig) => secrets.some((secret) => {\n  const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(raw).digest('hex');\n  const a = Buffer.from(expected, 'utf8');\n  const b = Buffer.from(String(sig), 'utf8');\n  return a.length === b.length && crypto.timingSafeEqual(a, b);\n});\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const headers = item.json.headers ?? {};\n  const sig = headers['x-hub-signature-256'] ?? headers['X-Hub-Signature-256'];\n\n  let raw = null;\n  const b64 = item.binary?.data?.data;\n  if (b64) {\n    raw = Buffer.from(b64, 'base64');\n  } else {\n    try { raw = await $helpers.getBinaryDataBuffer(i, 'data'); } catch (e) { raw = null; }\n  }\n\n  if (!secrets.length || !sig || !raw) continue;\n  if (!matches(raw, sig)) continue;\n\n  let body;\n  try { body = JSON.parse(raw.toString('utf8')); } catch (e) { continue; }\n  out.push({ json: { body } });\n}\n\nreturn out;\n"
+      }
+    },
+    {
+      "id": "extract-ig-messages",
+      "name": "Extract IG Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        160
+      ],
+      "parameters": {
+        "jsCode": "\n// Flattens Meta's batched webhook payload into one item per inbound text DM.\n// `entry` and `messaging` are both arrays: a single POST can legitimately carry\n// messages from several different people.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const body = item.json.body ?? {};\n  if (body.object !== 'instagram') continue;\n\n  for (const entry of body.entry ?? []) {\n    for (const ev of entry.messaging ?? []) {\n      const msg = ev.message;\n      if (!msg) continue;          // delivery / read receipts\n      if (msg.is_echo) continue;   // our own outbound DM echoed back\n      if (!msg.text) continue;     // reactions, attachments, stickers\n\n      out.push({ json: {\n        ig_sender: ev.sender?.id,\n        ig_mid: msg.mid,\n        text: msg.text,\n        // The account the lead messaged. This is what resolves the studio.\n        account_ref: String(ev.recipient?.id ?? entry.id ?? ''),\n        received_at: ev.timestamp ? new Date(ev.timestamp).toISOString() : new Date().toISOString(),\n      } });\n    }\n  }\n}\n\nreturn out;\n"
+      }
+    },
+    {
+      "id": "claim-message-ids",
+      "name": "Claim Message IDs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        200,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO processed_messages (provider, provider_msg_id)\nVALUES ('instagram', $1)\nON CONFLICT (provider, provider_msg_id) DO NOTHING\nRETURNING provider_msg_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.ig_mid] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "drop-replays",
+      "name": "Drop Replays",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        160
+      ],
+      "parameters": {
+        "jsCode": "\n// Keep only the messages whose mid we actually just claimed. A mid already in\n// processed_messages returns no row, so it never reaches the brain — this is\n// what makes a Meta retry (or a replay after an n8n restart) a no-op.\nconst claimed = new Set(\n  $input.all().map((i) => i.json.provider_msg_id).filter(Boolean)\n);\nreturn $('Extract IG Messages').all().filter((i) => claimed.has(i.json.ig_mid));\n"
+      }
+    },
+    {
+      "id": "build-inbound-contract",
+      "name": "Build Inbound Contract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\n// The channel-agnostic contract the Lead Brain accepts. Note there is no\n// studio_id: the brain resolves that from (channel, account_ref) itself, so an\n// adapter can never assert which studio a message belongs to.\nreturn { json: {\n  channel: 'instagram',\n  account_ref: $json.account_ref,\n  external_id: String($json.ig_sender),\n  name: null,\n  message: String($json.text ?? ''),\n  provider_message_id: $json.ig_mid,\n  received_at: $json.received_at,\n} };\n"
+      }
+    },
+    {
+      "id": "call-lead-brain",
+      "name": "Call Lead Brain",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        860,
+        160
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "fvHhAUDCbVN9ELb0",
+          "mode": "list",
+          "cachedResultName": "Lead Brain"
+        },
+        "mode": "each",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "should-reply",
+      "name": "Should Reply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1080,
+        160
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "send-flag",
+              "leftValue": "={{ $json.send }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "has-text",
+              "leftValue": "={{ $json.reply }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "send-ig-reply",
+      "name": "Send IG Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.instagram.com/v25.0/me/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ recipient: { id: $json.external_id }, message: { text: $json.reply } }) }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "IG_TOKEN_CRED_ID",
+          "name": "Instagram DM Token"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "no-reply-sent",
+      "name": "No Reply Sent",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        240
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "IG Verify": {
+      "main": [
+        [
+          {
+            "node": "Verify Token OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Token OK?": {
+      "main": [
+        [
+          {
+            "node": "Respond Challenge",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Forbidden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG Events": {
+      "main": [
+        [
+          {
+            "node": "Verify IG Signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify IG Signature": {
+      "main": [
+        [
+          {
+            "node": "Extract IG Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract IG Messages": {
+      "main": [
+        [
+          {
+            "node": "Claim Message IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Message IDs": {
+      "main": [
+        [
+          {
+            "node": "Drop Replays",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop Replays": {
+      "main": [
+        [
+          {
+            "node": "Build Inbound Contract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Inbound Contract": {
+      "main": [
+        [
+          {
+            "node": "Call Lead Brain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Lead Brain": {
+      "main": [
+        [
+          {
+            "node": "Should Reply?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Reply?": {
+      "main": [
+        [
+          {
+            "node": "Send IG Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Reply Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}
