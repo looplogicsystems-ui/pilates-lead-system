@@ -1,0 +1,480 @@
+{
+  "id": "fyk6eYsVGtUVS1dh",
+  "name": "Follow-up Scheduler",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000a003",
+  "nodes": [
+    {
+      "id": "follow-up-scheduler",
+      "name": "Follow-up Scheduler",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "find-stale-leads",
+      "name": "Find Stale Leads",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Leads who went quiet and are still fair game for an automated nudge.\n--\n-- Exclusions that did not exist before: `escalated` leads (handed to a human --\n-- they used to sit at 'engaged' and get nudged an hour after asking a medical\n-- or pricing question) and `ai_paused` leads (the owner has taken the thread\n-- over). Cadence comes from studios, not from literals in this query.\nWITH last_inbound AS (\n  SELECT lead_id, MAX(created_at) AS t FROM messages WHERE direction = 'inbound' GROUP BY lead_id\n),\nlast_msg AS (\n  SELECT lead_id, MAX(created_at) AS t FROM messages GROUP BY lead_id\n),\nout_since AS (\n  SELECT m.lead_id, COUNT(*) AS n\n    FROM messages m JOIN last_inbound li ON li.lead_id = m.lead_id\n   WHERE m.direction = 'outbound' AND m.created_at > li.t\n   GROUP BY m.lead_id\n)\nSELECT l.id, l.external_id, l.channel, l.name,\n       COALESCE(os.n, 0) AS nudges_sent,\n       (SELECT m.body FROM messages m\n         WHERE m.lead_id = l.id AND m.direction = 'inbound'\n         ORDER BY m.created_at DESC LIMIT 1) AS last_msg,\n       s.id AS studio_id, s.timezone, s.prompt_vars, s.offers, s.class_capacity,\n       s.slack_lead_channel_id, s.slack_owner_channel_id, s.max_nudges,\n       (COALESCE(os.n, 0) >= s.max_nudges) AS is_final\n  FROM leads l\n  JOIN studios s  ON s.id = l.studio_id\n  JOIN last_msg lm ON lm.lead_id = l.id\n  LEFT JOIN out_since os ON os.lead_id = l.id\n WHERE l.status = 'engaged'\n   AND NOT l.ai_paused\n   AND s.active\n   AND COALESCE(os.n, 0) BETWEEN 1 AND s.max_nudges\n   AND lm.t < now() - make_interval(mins => CASE\n                                              WHEN COALESCE(os.n, 0) = 1\n                                                THEN s.followup_first_after_minutes\n                                              ELSE s.followup_final_after_minutes\n                                            END)\n ORDER BY lm.t ASC\n LIMIT 20;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "has-stale-leads",
+      "name": "Has Stale Leads?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "has-id",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "compose-follow-up",
+      "name": "Compose Follow-up",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\n// Builds the AI prompt AND a persuasive template fallback.\n//\n// The fallback is genuinely reachable, not dead code: Write Nudge (AI) runs\n// with onError=continueRegularOutput, so an OpenAI failure passes this item\n// straight through with no `output` field and Assemble Nudge falls back to\n// `followup_text` below.\nconst v = (typeof $json.prompt_vars === 'string')\n            ? JSON.parse($json.prompt_vars) : ($json.prompt_vars || {});\nconst first = $json.name ? (' ' + String($json.name).trim().split(/\\s+/)[0]) : '';\nconst persona = v.persona_name || 'the studio';\nconst offer = v.offer || $json.offers || 'our intro offer';\nconst cap = $json.class_capacity;\nconst isFinal = $json.is_final === true || $json.is_final === 'true';\n\nconst msgs = [\n  `Hey${first} 😊 no rush at all — I know starting something new can feel a bit daunting, especially if you're not sure it's for you yet. Our beginner classes are small (max ${cap}) and built for total first-timers, so you'd be in really good hands. Your ${offer} is still open — want me to suggest an easy time to come try one class? No commitment, just see how it feels.`,\n  `Hey${first}, just checking in one last time 💛 honestly, most of our members were on the fence before their first class and now they can't imagine their week without it. If you're even a little curious, just tell me which day suits and I'll hold a spot for you — nothing to lose. And if the timing isn't right, no worries at all, I'm here whenever you're ready.`,\n];\n\nconst systemMessage = [\n`You are ${persona}, the warm, friendly owner of ${v.studio_name || 'the studio'}, a ${v.studio_type || 'fitness studio'} in ${v.location || ''}. You are writing a short follow-up DM to a lead who asked about classes but went quiet — they seem interested but unsure about committing. Re-engage them and make trying a class feel easy, WITHOUT being pushy or salesy.`,\n``,\n`Rules:`,\n`- 1 to 3 short sentences, warm and human, like a real text from a person. No 'Dear', no formal sign-off, no subject line.`,\n`- Use what they last said to gently address their specific hesitation.`,\n`- Naturally remind them of the value: ${offer}, small classes (max ${cap})${v.amenities ? ', ' + v.amenities.toLowerCase() : ''}.`,\n`- End with ONE easy, low-friction question or invite.`,\n`- If it is the FINAL nudge, be extra gentle and leave the door open.`,\n`- Output ONLY the message text. No quotes, no labels, no JSON. At most one tasteful emoji.`,\n].join('\\n');\n\nconst userMessage = [\n`Write a follow-up message — nudge #${Number($json.nudges_sent)}${isFinal ? ' (FINAL nudge: extra gentle, leave the door open)' : ''}.`,\n`Lead's first name: ${$json.name || 'there'}`,\n`What they last said to us: \"${$json.last_msg ?? ''}\"`,\n`Write the message now.`,\n].join('\\n');\n\nreturn { json: {\n  id: $json.id,\n  external_id: $json.external_id,\n  channel: $json.channel,\n  studio_id: $json.studio_id,\n  slack_lead_channel_id: $json.slack_lead_channel_id,\n  slack_owner_channel_id: $json.slack_owner_channel_id,\n  name: $json.name ?? null,\n  last_msg: $json.last_msg ?? '',\n  followup_text: msgs[Math.min(Math.max(Number($json.nudges_sent) - 1, 0), msgs.length - 1)],\n  nudge_number: Number($json.nudges_sent),\n  is_final: isFinal,\n  systemMessage,\n  userMessage,\n} };\n"
+      }
+    },
+    {
+      "id": "write-nudge-ai",
+      "name": "Write Nudge (AI)",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        420,
+        0
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.userMessage }}",
+        "options": {
+          "systemMessage": "={{ $json.systemMessage }}"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "openai-nudge",
+      "name": "OpenAI (Nudge)",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        420,
+        200
+      ],
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-5.4-mini",
+          "mode": "list",
+          "cachedResultName": "gpt-5.4-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "OPENAI_CRED_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "id": "assemble-nudge",
+      "name": "Assemble Nudge",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        640,
+        0
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "followup_text",
+              "type": "string",
+              "value": "={{ $json.output || $('Compose Follow-up').item.json.followup_text }}"
+            },
+            {
+              "id": "a2",
+              "name": "id",
+              "type": "number",
+              "value": "={{ $('Compose Follow-up').item.json.id }}"
+            },
+            {
+              "id": "a3",
+              "name": "external_id",
+              "type": "string",
+              "value": "={{ $('Compose Follow-up').item.json.external_id }}"
+            },
+            {
+              "id": "a4",
+              "name": "channel",
+              "type": "string",
+              "value": "={{ $('Compose Follow-up').item.json.channel }}"
+            },
+            {
+              "id": "a5",
+              "name": "nudge_number",
+              "type": "number",
+              "value": "={{ $('Compose Follow-up').item.json.nudge_number }}"
+            },
+            {
+              "id": "a6",
+              "name": "is_final",
+              "type": "boolean",
+              "value": "={{ $('Compose Follow-up').item.json.is_final }}"
+            },
+            {
+              "id": "a7",
+              "name": "slack_lead_channel_id",
+              "type": "string",
+              "value": "={{ $('Compose Follow-up').item.json.slack_lead_channel_id }}"
+            },
+            {
+              "id": "a8",
+              "name": "slack_owner_channel_id",
+              "type": "string",
+              "value": "={{ $('Compose Follow-up').item.json.slack_owner_channel_id }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "log-follow-up-outbound",
+      "name": "Log Follow-up (outbound)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        860,
+        -180
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (lead_id, direction, channel, body, created_at)\nVALUES ($1, 'outbound', $2, $3, now());",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.channel, $json.followup_text] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "mark-cold-if-final",
+      "name": "Mark Cold if Final",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        860,
+        -60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE leads\n   SET status = CASE WHEN $2 THEN 'cold' ELSE status END, updated_at = now()\n WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.is_final] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "notify-owner---follow-up",
+      "name": "Notify Owner - Follow-up",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        860,
+        60
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $json.slack_owner_channel_id }}",
+          "mode": "id"
+        },
+        "text": "=:wave: Auto follow-up #{{ $json.nudge_number }} for {{ $json.external_id }} ({{ $json.channel }}): \"{{ $json.followup_text }}\"{{ $json.channel === 'slack' ? '' : '\\n:information_source: Not auto-sent — Instagram nudges outside Meta''s 24h window need a message tag, so this one is logged for you to send.' }}",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_OWNER_BOT_CRED_ID",
+          "name": "Slack"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "is-slack-lead",
+      "name": "Is Slack Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        860,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "is-slack",
+              "leftValue": "={{ $json.channel }}",
+              "rightValue": "slack",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "send-follow-up-to-lead-slack",
+      "name": "Send Follow-up to Lead (Slack)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1080,
+        200
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $json.slack_lead_channel_id }}",
+          "mode": "id"
+        },
+        "text": "={{ $json.followup_text }}",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_LEAD_BOT_CRED_ID",
+          "name": "Slack"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "ig-nudge-deferred",
+      "name": "IG Nudge (deferred)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1080,
+        320
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Follow-up Scheduler": {
+      "main": [
+        [
+          {
+            "node": "Find Stale Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Stale Leads": {
+      "main": [
+        [
+          {
+            "node": "Has Stale Leads?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Stale Leads?": {
+      "main": [
+        [
+          {
+            "node": "Compose Follow-up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Follow-up": {
+      "main": [
+        [
+          {
+            "node": "Write Nudge (AI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI (Nudge)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Write Nudge (AI)",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Nudge (AI)": {
+      "main": [
+        [
+          {
+            "node": "Assemble Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Assemble Nudge": {
+      "main": [
+        [
+          {
+            "node": "Log Follow-up (outbound)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Mark Cold if Final",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Notify Owner - Follow-up",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Is Slack Lead?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Slack Lead?": {
+      "main": [
+        [
+          {
+            "node": "Send Follow-up to Lead (Slack)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IG Nudge (deferred)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

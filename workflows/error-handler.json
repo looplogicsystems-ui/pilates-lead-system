@@ -1,0 +1,104 @@
+{
+  "id": "4L4K72aSSwiBcnjX",
+  "name": "Lead System — Error Handler",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000c001",
+  "nodes": [
+    {
+      "id": "on-workflow-error",
+      "name": "On Workflow Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        -260,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "persist-dead-letter",
+      "name": "Persist Dead Letter",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -40,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dead_letters (workflow_id, execution_id, reason, payload, error)\nVALUES ($1, $2, 'execution_error', $3::jsonb, $4);",
+        "options": {
+          "queryReplacement": "={{ [ $json.workflow && $json.workflow.id, String(($json.execution && $json.execution.id) ?? ''), JSON.stringify($json), [($json.execution && $json.execution.lastNodeExecuted), ($json.execution && $json.execution.error && $json.execution.error.message)].filter(Boolean).join(' — ') ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "alert-owner-slack",
+      "name": "Alert Owner (Slack)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        180,
+        0
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $env.OPS_SLACK_CHANNEL_ID }}",
+          "mode": "id"
+        },
+        "text": "=:rotating_light: *Lead system error* in \"{{ $('On Workflow Error').first().json.workflow.name }}\"\nNode: {{ $('On Workflow Error').first().json.execution.lastNodeExecuted }}\nError: {{ $('On Workflow Error').first().json.execution.error && $('On Workflow Error').first().json.execution.error.message }}\nExecution: {{ $('On Workflow Error').first().json.execution.id }}\n_Persisted to dead_letters for replay._",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_OPS_BOT_CRED_ID",
+          "name": "Lead System Monitor"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    }
+  ],
+  "connections": {
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Persist Dead Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Dead Letter": {
+      "main": [
+        [
+          {
+            "node": "Alert Owner (Slack)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  }
+}

@@ -1,0 +1,34 @@
+-- Deployment-specific IDs — copy to `db/seed/local-ids.sql` and fill in.
+--
+-- `local-ids.sql` is gitignored. These are not secrets (they are opaque account
+-- handles, not tokens), but they are specific to one deployment, and keeping
+-- them out of the repo is what lets the same migrations and the same exported
+-- workflow JSON stand up a second environment untouched.
+--
+-- Where each value comes from:
+--   gcal_schedule_id  Google Calendar > the studio schedule calendar >
+--                     Settings > "Calendar ID" (…@group.calendar.google.com)
+--   gcal_booking_id   Usually the same calendar; split only if trial bookings
+--                     should be written somewhere separate from the class schedule.
+--   slack_lead_channel_id   Slack > channel > View channel details > ID (C…)
+--   slack_owner_channel_id  Same, for the owner-alerts channel.
+--   account_ref (instagram) The Instagram account ID that receives the DMs —
+--                     `entry.id` on any inbound webhook payload (NOT the @handle).
+--   credential_ref    The n8n credential ID used for outbound on that channel,
+--                     from the credential's editor URL: /credentials/<ID>.
+
+UPDATE studios SET
+    gcal_schedule_id       = 'REPLACE_ME@group.calendar.google.com',
+    gcal_booking_id        = 'REPLACE_ME@group.calendar.google.com',
+    slack_lead_channel_id  = 'CXXXXXXXXXX',
+    slack_owner_channel_id = 'CXXXXXXXXXX'
+WHERE id = 1;
+
+INSERT INTO channel_accounts (studio_id, channel, account_ref, credential_ref, active)
+VALUES
+    (1, 'instagram', 'REPLACE_ME_IG_ACCOUNT_ID', 'REPLACE_ME_N8N_CRED_ID', true),
+    (1, 'slack',     'CXXXXXXXXXX',              'REPLACE_ME_N8N_CRED_ID', true)
+ON CONFLICT (channel, account_ref) DO UPDATE SET
+    studio_id      = EXCLUDED.studio_id,
+    credential_ref = EXCLUDED.credential_ref,
+    active         = EXCLUDED.active;

@@ -1,0 +1,413 @@
+{
+  "id": "px8F683kj1I8Sb9X",
+  "name": "Channel Adapter: Slack",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000a002",
+  "nodes": [
+    {
+      "id": "slack-poller",
+      "name": "Slack Poller",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "load-slack-accounts",
+      "name": "Load Slack Accounts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Which Slack channels are we listening to, and for which studio.\nSELECT ca.account_ref AS channel_id, ca.studio_id\n  FROM channel_accounts ca\n  JOIN studios s ON s.id = ca.studio_id\n WHERE ca.channel = 'slack' AND ca.active AND s.active;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "get-slack-messages",
+      "name": "Get Slack Messages",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        -20,
+        0
+      ],
+      "parameters": {
+        "resource": "channel",
+        "operation": "history",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $json.channel_id }}",
+          "mode": "id"
+        },
+        "limit": 20,
+        "filters": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_LEAD_BOT_CRED_ID",
+          "name": "Studio Lead Bot (Slack)"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "filter-new-lead-messages",
+      "name": "Filter New Lead Messages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ],
+      "parameters": {
+        "jsCode": "\n// Cursor keeps the poll cheap; processed_messages (next node) is what actually\n// guarantees we never answer the same message twice across restarts.\nconst sd = $getWorkflowStaticData('global');\nconst items = $input.all();\n\n// First run after activation: jump the cursor to newest and skip the backlog,\n// so activating the workflow does not blast replies at old channel history.\nif (sd.slackLastTs === undefined) {\n  let mx = 0;\n  for (const it of items) { const t = parseFloat(it.json.ts); if (t > mx) mx = t; }\n  sd.slackLastTs = String(mx || (Date.now() / 1000));\n  return [];\n}\n\nconst lastTs = parseFloat(sd.slackLastTs);\nlet maxTs = lastTs;\nconst out = [];\nfor (const it of items) {\n  const m = it.json;\n  const ts = parseFloat(m.ts);\n  if (!ts || ts <= lastTs) continue;\n  if (m.bot_id || m.app_id || m.subtype) continue; // ignore bots / apps / system events\n  if (!m.user || !m.text) continue;\n  if (ts > maxTs) maxTs = ts;\n  out.push({ json: {\n    slack_user: m.user,\n    slack_ts: m.ts,\n    text: m.text,\n    account_ref: m.channel ?? $('Get Slack Messages').first().json.channel ?? '',\n  } });\n}\nsd.slackLastTs = String(maxTs);\nreturn out;\n"
+      }
+    },
+    {
+      "id": "claim-message-ids",
+      "name": "Claim Message IDs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        420,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO processed_messages (provider, provider_msg_id)\nVALUES ('slack', $1)\nON CONFLICT (provider, provider_msg_id) DO NOTHING\nRETURNING provider_msg_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.slack_ts] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "drop-replays",
+      "name": "Drop Replays",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        0
+      ],
+      "parameters": {
+        "jsCode": "\nconst claimed = new Set(\n  $input.all().map((i) => i.json.provider_msg_id).filter(Boolean)\n);\nreturn $('Filter New Lead Messages').all().filter((i) => claimed.has(i.json.slack_ts));\n"
+      }
+    },
+    {
+      "id": "build-inbound-contract",
+      "name": "Build Inbound Contract",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "\n// Slack's conversations.history rows do not carry the channel id, so fall back\n// to the account we polled for this batch.\nconst acct = $json.account_ref || $('Load Slack Accounts').first().json.channel_id;\nreturn { json: {\n  channel: 'slack',\n  account_ref: String(acct),\n  external_id: String($json.slack_user ?? 'slack-unknown'),\n  name: null,\n  message: String($json.text ?? ''),\n  provider_message_id: $json.slack_ts,\n  received_at: new Date(Number($json.slack_ts) * 1000).toISOString(),\n} };\n"
+      }
+    },
+    {
+      "id": "call-lead-brain",
+      "name": "Call Lead Brain",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1080,
+        0
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "fvHhAUDCbVN9ELb0",
+          "mode": "list",
+          "cachedResultName": "Lead Brain"
+        },
+        "mode": "each",
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "should-reply",
+      "name": "Should Reply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1300,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "send-flag",
+              "leftValue": "={{ $json.send }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "has-text",
+              "leftValue": "={{ $json.reply }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "load-reply-channel",
+      "name": "Load Reply Channel",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1520,
+        -60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT slack_lead_channel_id FROM studios WHERE id = $1;",
+        "options": {
+          "queryReplacement": "={{ [$json.studio_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "retryOnFail": true
+    },
+    {
+      "id": "slack-reply",
+      "name": "Slack Reply",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        1740,
+        -60
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $json.slack_lead_channel_id }}",
+          "mode": "id"
+        },
+        "text": "={{ $('Call Lead Brain').item.json.reply }}",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_LEAD_BOT_CRED_ID",
+          "name": "Slack"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "no-reply-sent",
+      "name": "No Reply Sent",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1520,
+        100
+      ],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Slack Poller": {
+      "main": [
+        [
+          {
+            "node": "Load Slack Accounts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Slack Accounts": {
+      "main": [
+        [
+          {
+            "node": "Get Slack Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Slack Messages": {
+      "main": [
+        [
+          {
+            "node": "Filter New Lead Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter New Lead Messages": {
+      "main": [
+        [
+          {
+            "node": "Claim Message IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Message IDs": {
+      "main": [
+        [
+          {
+            "node": "Drop Replays",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drop Replays": {
+      "main": [
+        [
+          {
+            "node": "Build Inbound Contract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Inbound Contract": {
+      "main": [
+        [
+          {
+            "node": "Call Lead Brain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Lead Brain": {
+      "main": [
+        [
+          {
+            "node": "Should Reply?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Reply?": {
+      "main": [
+        [
+          {
+            "node": "Load Reply Channel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Reply Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Reply Channel": {
+      "main": [
+        [
+          {
+            "node": "Slack Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

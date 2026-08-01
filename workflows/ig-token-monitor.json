@@ -1,0 +1,158 @@
+{
+  "id": "n56lLK7WRdYFesdW",
+  "name": "IG Token Expiry Monitor",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000c002",
+  "nodes": [
+    {
+      "id": "weekly-check",
+      "name": "Weekly Check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 1,
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "load-ig-accounts",
+      "name": "Load IG Accounts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ca.id, ca.account_ref, ca.credential_ref,\n       ca.token_issued_at, ca.token_lifetime_days, ca.alert_within_days,\n       s.name AS studio_name, s.slack_owner_channel_id,\n       (ca.token_issued_at + make_interval(days => ca.token_lifetime_days)) AS expires_at,\n       EXTRACT(DAY FROM (ca.token_issued_at\n                         + make_interval(days => ca.token_lifetime_days)\n                         - now()))::int AS days_left\n  FROM channel_accounts ca\n  JOIN studios s ON s.id = ca.studio_id\n WHERE ca.channel = 'instagram'\n   AND ca.active\n   AND s.active\n   AND ca.token_issued_at IS NOT NULL;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "expiring-soon",
+      "name": "Expiring Soon?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "soon",
+              "leftValue": "={{ $json.days_left }}",
+              "rightValue": "={{ $json.alert_within_days }}",
+              "operator": {
+                "type": "number",
+                "operation": "lte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "alert-token-expiry",
+      "name": "Alert Token Expiry",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.3,
+      "position": [
+        200,
+        0
+      ],
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $json.slack_owner_channel_id }}",
+          "mode": "id"
+        },
+        "text": "=:key: *Instagram token expiring* for {{ $json.studio_name }}\nAccount: {{ $json.account_ref }}\nExpires: {{ $json.expires_at }} ({{ $json.days_left }} days left)\nReconnect the token in the Meta app, update the n8n credential, then set `channel_accounts.token_issued_at = now()` for this account — otherwise outbound replies stop silently.",
+        "otherOptions": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "SLACK_OPS_BOT_CRED_ID",
+          "name": "Lead System Monitor"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    }
+  ],
+  "connections": {
+    "Weekly Check": {
+      "main": [
+        [
+          {
+            "node": "Load IG Accounts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load IG Accounts": {
+      "main": [
+        [
+          {
+            "node": "Expiring Soon?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expiring Soon?": {
+      "main": [
+        [
+          {
+            "node": "Alert Token Expiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  }
+}
