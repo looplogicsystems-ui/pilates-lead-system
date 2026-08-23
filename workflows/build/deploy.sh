@@ -11,7 +11,11 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SCRATCH="${SCRATCH_DIR:-/tmp/claude-1000/-home-talha/f89f7d52-17bf-4a21-816e-51099ce92798/scratchpad}"
+# Holds the *unredacted* generated graphs (real credential ids) on their way into
+# n8n. Repo-local and gitignored so this runs on any host; override with
+# SCRATCH_DIR if you want them somewhere else.
+SCRATCH="${SCRATCH_DIR:-$REPO/.deploy-tmp}"
+mkdir -p "$SCRATCH"
 BRAIN_ID="${BRAIN_ID:-fvHhAUDCbVN9ELb0}"
 
 DOCKER=""

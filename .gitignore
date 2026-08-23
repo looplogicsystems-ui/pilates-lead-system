@@ -4,6 +4,11 @@
 secrets/
 credentials*.json
 
+# Generated workflow JSON carrying real credential ids, staged for import.
+# deploy.sh writes here; never commit it (the redacted copies in workflows/ are
+# the committed ones).
+.deploy-tmp/
+
 # Deployment-specific IDs (calendar / Slack channel / IG account).
 # Not secrets, but specific to one environment — see local-ids.sql.example
 db/seed/local-ids.sql

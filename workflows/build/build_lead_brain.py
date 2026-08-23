@@ -602,6 +602,7 @@ workflow = {
 
 def main():
     scratch = sys.argv[1] if len(sys.argv) > 1 else "."
+    os.makedirs(scratch, exist_ok=True)
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(os.path.dirname(here))
 

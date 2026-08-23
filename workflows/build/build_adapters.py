@@ -628,6 +628,7 @@ VALUES ($1, 'outbound', $2, $3, now());""",
 # ===========================================================================
 def main():
     scratch = sys.argv[1]
+    os.makedirs(scratch, exist_ok=True)
     brain_id = sys.argv[2]
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.dirname(os.path.dirname(here))
