@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# llctl — deploy, inspect, snapshot and roll back the Loop Logic lead system.
+#
+# Runs the same way from either founder's machine: if you are not on the mini it
+# re-invokes itself there over SSH, so `llctl deploy demo` means the same thing
+# everywhere. deploy.sh itself uses `docker exec` and can only run on the mini.
+#
+#   llctl status              what is the mini actually running right now
+#   llctl deploy <branch>     snapshot, switch branch, regenerate, publish, verify
+#   llctl snapshot            export every live workflow to ~/llctl-snapshots/<ts>/
+#   llctl rollback [ts]       re-import a snapshot (default: the most recent)
+#   llctl snapshots           list snapshots
+#
+# Branch shorthands: `demo` = demo/computed-availability, `master` = master.
+set -euo pipefail
+
+MINI_HOST="${MINI_HOST:-mac-server@100.64.98.51}"
+MINI_NAME="${MINI_NAME:-mac-server}"
+REPO_DIR="${REPO_DIR:-$HOME/pilates-lead-system}"
+SNAP_ROOT="${SNAP_ROOT:-$HOME/llctl-snapshots}"
+N8N="${N8N_CONTAINER:-n8n}"
+PG="${PG_CONTAINER:-postgres}"
+
+# Every workflow deploy.sh manages. Legal Pages is active but not generated,
+# so it is snapshotted and reported but never overwritten.
+MANAGED="Lead Brain|Channel Adapter: Instagram|Channel Adapter: Slack|Follow-up Scheduler|Lead System — Error Handler|IG Token Expiry Monitor"
+
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+ylw()  { printf '\033[33m%s\033[0m\n' "$*"; }
+die()  { red "error: $*" >&2; exit 1; }
+
+# --- run on the mini, wherever we were invoked from ------------------------
+if [ "$(hostname)" != "$MINI_NAME" ]; then
+    [ -n "${LLCTL_REMOTE:-}" ] && die "already remote but hostname is $(hostname), not $MINI_NAME"
+    ylw "→ $MINI_HOST"
+    exec ssh -t "$MINI_HOST" "LLCTL_REMOTE=1 $REPO_DIR/bin/llctl $*"
+fi
+
+cd "$REPO_DIR" || die "no repo at $REPO_DIR"
+psql_n8n () { docker exec -i "$PG" psql -qtA -v ON_ERROR_STOP=1 -U n8n -d n8n "$@"; }
+
+resolve_branch () {
+    case "$1" in
+        demo)   echo "demo/computed-availability" ;;
+        master|main) echo "master" ;;
+        *)      echo "$1" ;;
+    esac
+}
+
+health () { curl -s -o /dev/null -w '%{http_code}' -m 5 http://localhost:5678/healthz 2>/dev/null || echo "000"; }
+
+cmd_status () {
+    echo "=== repo ==="
+    printf '  branch   %s\n' "$(git branch --show-current)"
+    printf '  commit   %s\n' "$(git log --oneline -1)"
+    local dirty; dirty="$(git status --porcelain)"
+    if [ -n "$dirty" ]; then red "  UNCOMMITTED CHANGES:"; echo "$dirty" | sed 's/^/    /'; else echo "  clean"; fi
+    git fetch -q origin 2>/dev/null || true
+    local ahead behind up
+    up="$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || echo '')"
+    if [ -n "$up" ]; then
+        behind="$(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0)"
+        ahead="$(git rev-list --count @{u}..HEAD 2>/dev/null || echo 0)"
+        [ "$behind" != "0" ] && ylw "  BEHIND $up by $behind commit(s)"
+        [ "$ahead"  != "0" ] && ylw "  AHEAD  of $up by $ahead commit(s)"
+        [ "$behind" = "0" ] && [ "$ahead" = "0" ] && echo "  in sync with $up"
+    fi
+
+    echo
+    echo "=== n8n ==="
+    local h; h="$(health)"
+    if [ "$h" = "200" ]; then grn "  /healthz 200"; else red "  /healthz $h"; fi
+    printf '  container up since  %s\n' "$(docker inspect -f '{{.State.StartedAt}}' "$N8N" 2>/dev/null || echo '?')"
+
+    echo
+    echo "=== active workflows ==="
+    psql_n8n -F'  ' -c "SELECT name, \"activeVersionId\" FROM workflow_entity WHERE active ORDER BY name;" \
+        | sed 's/^/  /' || red "  could not read the database"
+
+    echo
+    echo "=== snapshots ==="
+    if [ -d "$SNAP_ROOT" ] && [ -n "$(ls -A "$SNAP_ROOT" 2>/dev/null)" ]; then
+        ls -1 "$SNAP_ROOT" | tail -5 | sed 's/^/  /'
+    else
+        ylw "  none — run: llctl snapshot"
+    fi
+}
+
+cmd_snapshot () {
+    local ts; ts="$(date -u +%Y-%m-%dT%H%M%SZ)"
+    local dir="$SNAP_ROOT/$ts"
+    mkdir -p "$dir"
+    docker exec "$N8N" rm -rf /tmp/llctl-snap >/dev/null 2>&1 || true
+    docker exec "$N8N" n8n export:workflow --backup --output=/tmp/llctl-snap >/dev/null 2>&1 \
+        || die "export failed"
+    docker cp "$N8N:/tmp/llctl-snap/." "$dir/" >/dev/null
+    docker exec "$PG" pg_dumpall -U n8n 2>/dev/null | gzip > "$dir/pgdump.sql.gz" || ylw "  (db dump failed - workflows still saved)"
+    grn "snapshot $ts  ($(ls -1 "$dir"/*.json 2>/dev/null | wc -l) workflows, $(du -sh "$dir" | cut -f1))"
+    echo "$dir"
+}
+
+cmd_snapshots () {
+    [ -d "$SNAP_ROOT" ] || { ylw "no snapshots yet"; return; }
+    for d in "$SNAP_ROOT"/*/; do
+        [ -d "$d" ] || continue
+        printf '  %-24s %3s workflows  %s\n' "$(basename "$d")" "$(ls -1 "$d"/*.json 2>/dev/null | wc -l)" "$(du -sh "$d" | cut -f1)"
+    done
+}
+
+publish_managed () {
+    psql_n8n -c "
+    INSERT INTO workflow_history (\"versionId\", \"workflowId\", authors, nodes, connections, name)
+    SELECT w.\"versionId\", w.id, 'llctl', w.nodes, w.connections, w.name
+      FROM workflow_entity w
+     WHERE w.name ~ '^($MANAGED)\$'
+    ON CONFLICT (\"versionId\") DO UPDATE
+       SET nodes = EXCLUDED.nodes, connections = EXCLUDED.connections,
+           name = EXCLUDED.name, \"updatedAt\" = now();" >/dev/null
+    for id in $(psql_n8n -c "SELECT id FROM workflow_entity WHERE name ~ '^($MANAGED)\$';"); do
+        docker exec "$N8N" n8n publish:workflow --id="$id" >/dev/null 2>&1 \
+            && echo "    published $id" || red "    publish $id FAILED"
+    done
+}
+
+wait_healthy () {
+    for i in $(seq 1 40); do
+        [ "$(health)" = "200" ] && { grn "    healthy after ~$((i*3))s"; return 0; }
+        sleep 3
+    done
+    red "    NOT healthy after 120s"; return 1
+}
+
+cmd_deploy () {
+    local want; want="$(resolve_branch "${1:-}")"
+    [ -n "$want" ] || die "usage: llctl deploy <branch>"
+
+    git fetch -q origin
+    git rev-parse --verify -q "origin/$want" >/dev/null \
+        || die "no branch 'origin/$want' on GitHub. Push it first — llctl never deploys a branch that only exists locally."
+
+    local dirty; dirty="$(git status --porcelain)"
+    if [ -n "$dirty" ]; then
+        red "the repo on the mini has uncommitted changes:"; echo "$dirty" | sed 's/^/  /'
+        echo "deploy does a hard reset and would discard them."
+        read -r -p "discard and continue? [y/N] " a
+        [ "$a" = "y" ] || die "aborted"
+    fi
+
+    echo "==> snapshotting current state"
+    cmd_snapshot >/dev/null && grn "    saved" || die "snapshot failed - not deploying blind"
+
+    echo "==> switching to $want"
+    git checkout -q "$want" 2>/dev/null || git checkout -q -b "$want" "origin/$want"
+    git reset -q --hard "origin/$want"
+    printf '    %s\n' "$(git log --oneline -1)"
+
+    echo "==> deploying"
+    workflows/build/deploy.sh
+
+    echo "==> verifying"
+    wait_healthy || ylw "    check 'llctl status' and consider 'llctl rollback'"
+    grn "deployed $want"
+}
+
+cmd_rollback () {
+    local ts="${1:-}"
+    [ -d "$SNAP_ROOT" ] || die "no snapshots"
+    [ -n "$ts" ] || ts="$(ls -1 "$SNAP_ROOT" | tail -1)"
+    local dir="$SNAP_ROOT/$ts"
+    [ -d "$dir" ] || die "no snapshot '$ts' (see: llctl snapshots)"
+
+    ylw "rolling back to $ts — this overwrites the live workflows."
+    read -r -p "continue? [y/N] " a; [ "$a" = "y" ] || die "aborted"
+
+    local work; work="$(mktemp -d)"
+    # The n8n CLI export carries fields import:workflow will not accept
+    # (updatedAt, createdAt, isArchived, shared, tags ...). Reduce each file to
+    # the same shape the generators emit.
+    python3 - "$dir" "$work" <<'PY'
+import json, sys, pathlib
+src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+keep = ("id", "name", "nodes", "connections", "settings", "active", "versionId")
+n = 0
+for f in sorted(src.glob("*.json")):
+    d = json.load(open(f))
+    if "nodes" not in d:
+        continue
+    json.dump({k: d[k] for k in keep if k in d}, open(dst / f.name, "w"), indent=2)
+    n += 1
+print(f"    normalized {n} workflows")
+PY
+
+    for f in "$work"/*.json; do
+        b="$(basename "$f")"
+        docker cp "$f" "$N8N:/tmp/$b" >/dev/null
+        docker exec "$N8N" n8n import:workflow --input="/tmp/$b" >/dev/null 2>&1 \
+            && echo "    imported $b" || red "    import $b FAILED"
+    done
+    rm -rf "$work"
+
+    echo "==> publishing"
+    publish_managed
+    echo "==> restarting n8n"
+    docker restart "$N8N" >/dev/null
+    wait_healthy
+    grn "rolled back to $ts"
+}
+
+case "${1:-status}" in
+    status)    cmd_status ;;
+    deploy)    shift; cmd_deploy "$@" ;;
+    snapshot)  cmd_snapshot ;;
+    snapshots) cmd_snapshots ;;
+    rollback)  shift; cmd_rollback "$@" ;;
+    -h|--help|help)
+        sed -n '2,20p' "$0" | sed 's/^# \?//' ;;
+    *) die "unknown command '$1' (try: llctl help)" ;;
+esac
