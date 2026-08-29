@@ -108,19 +108,37 @@ cmd_snapshots () {
     done
 }
 
-publish_managed () {
+publish_ids () {
+    # $@ = workflow ids to (re)publish. Refreshes each workflow_history row from
+    # the draft first, because n8n 2.x runs the published graph, not the draft.
+    local ids=("$@"); [ ${#ids[@]} -gt 0 ] || return 0
+    local list; list="$(printf "'%s'," "${ids[@]}")"; list="${list%,}"
     psql_n8n -c "
     INSERT INTO workflow_history (\"versionId\", \"workflowId\", authors, nodes, connections, name)
     SELECT w.\"versionId\", w.id, 'llctl', w.nodes, w.connections, w.name
       FROM workflow_entity w
-     WHERE w.name ~ '^($MANAGED)\$'
+     WHERE w.id IN ($list)
     ON CONFLICT (\"versionId\") DO UPDATE
        SET nodes = EXCLUDED.nodes, connections = EXCLUDED.connections,
            name = EXCLUDED.name, \"updatedAt\" = now();" >/dev/null
-    for id in $(psql_n8n -c "SELECT id FROM workflow_entity WHERE name ~ '^($MANAGED)\$';"); do
+    local id
+    for id in "${ids[@]}"; do
         docker exec "$N8N" n8n publish:workflow --id="$id" >/dev/null 2>&1 \
             && echo "    published $id" || red "    publish $id FAILED"
     done
+}
+
+publish_managed () {
+    local ids=() id
+    while read -r id; do [ -n "$id" ] && ids+=("$id"); done < <(
+        psql_n8n -c "SELECT id FROM workflow_entity WHERE name ~ '^($MANAGED)\$';" )
+    publish_ids "${ids[@]}"
+}
+
+
+show_active () {
+    echo "    active now:"
+    psql_n8n -c "SELECT name FROM workflow_entity WHERE active ORDER BY name;" | sed 's/^/      /'
 }
 
 wait_healthy () {
@@ -160,6 +178,7 @@ cmd_deploy () {
 
     echo "==> verifying"
     wait_healthy || ylw "    check 'llctl status' and consider 'llctl rollback'"
+    show_active
     grn "deployed $want"
 }
 
@@ -176,19 +195,24 @@ cmd_rollback () {
     local work; work="$(mktemp -d)"
     # The n8n CLI export carries fields import:workflow will not accept
     # (updatedAt, createdAt, isArchived, shared, tags ...). Reduce each file to
-    # the same shape the generators emit.
+    # the same shape the generators emit, and record which ones were active --
+    # import does NOT restore the active flag, so they have to be reactivated
+    # and republished explicitly or they come back switched off.
     python3 - "$dir" "$work" <<'PY'
 import json, sys, pathlib
 src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 keep = ("id", "name", "nodes", "connections", "settings", "active", "versionId")
-n = 0
+active, n = [], 0
 for f in sorted(src.glob("*.json")):
     d = json.load(open(f))
     if "nodes" not in d:
         continue
     json.dump({k: d[k] for k in keep if k in d}, open(dst / f.name, "w"), indent=2)
+    if d.get("active"):
+        active.append(d["id"])
     n += 1
-print(f"    normalized {n} workflows")
+(dst / "_active.txt").write_text("\n".join(active))
+print(f"    normalized {n} workflows ({len(active)} were active)")
 PY
 
     for f in "$work"/*.json; do
@@ -197,13 +221,23 @@ PY
         docker exec "$N8N" n8n import:workflow --input="/tmp/$b" >/dev/null 2>&1 \
             && echo "    imported $b" || red "    import $b FAILED"
     done
+
+    local active_ids=() id
+    while read -r id; do [ -n "$id" ] && active_ids+=("$id"); done < "$work/_active.txt"
     rm -rf "$work"
 
+    echo "==> restoring active flags"
+    local list; list="$(printf "'%s'," "${active_ids[@]}")"; list="${list%,}"
+    psql_n8n -c "UPDATE workflow_entity SET active = (id IN ($list));" >/dev/null \
+        && echo "    ${#active_ids[@]} active, the rest off"
+
     echo "==> publishing"
-    publish_managed
+    publish_ids "${active_ids[@]}"
+
     echo "==> restarting n8n"
     docker restart "$N8N" >/dev/null
     wait_healthy
+    show_active
     grn "rolled back to $ts"
 }
 
