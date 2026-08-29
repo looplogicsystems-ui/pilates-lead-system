@@ -130,7 +130,7 @@ publish_ids () {
 
 publish_managed () {
     local ids=() id
-    while read -r id; do [ -n "$id" ] && ids+=("$id"); done < <(
+    while IFS= read -r id || [ -n "$id" ]; do [ -n "$id" ] && ids+=("$id"); done < <(
         psql_n8n -c "SELECT id FROM workflow_entity WHERE name ~ '^($MANAGED)\$';" )
     publish_ids "${ids[@]}"
 }
@@ -139,6 +139,11 @@ publish_managed () {
 show_active () {
     echo "    active now:"
     psql_n8n -c "SELECT name FROM workflow_entity WHERE active ORDER BY name;" | sed 's/^/      /'
+    local n; n="$(psql_n8n -c "SELECT count(*) FROM workflow_entity WHERE active;")"
+    if [ -n "${EXPECT_ACTIVE:-}" ] && [ "$n" != "$EXPECT_ACTIVE" ]; then
+        red "    WARNING: $n active, expected $EXPECT_ACTIVE"
+        return 1
+    fi
 }
 
 wait_healthy () {
@@ -211,7 +216,7 @@ for f in sorted(src.glob("*.json")):
     if d.get("active"):
         active.append(d["id"])
     n += 1
-(dst / "_active.txt").write_text("\n".join(active))
+(dst / "_active.txt").write_text("".join(i + "\n" for i in active))
 print(f"    normalized {n} workflows ({len(active)} were active)")
 PY
 
@@ -222,9 +227,15 @@ PY
             && echo "    imported $b" || red "    import $b FAILED"
     done
 
+    local snap_active; snap_active="$(grep -c . "$work/_active.txt")"
     local active_ids=() id
-    while read -r id; do [ -n "$id" ] && active_ids+=("$id"); done < "$work/_active.txt"
+    while IFS= read -r id || [ -n "$id" ]; do [ -n "$id" ] && active_ids+=("$id"); done < "$work/_active.txt"
     rm -rf "$work"
+
+    local want_n="${#active_ids[@]}"
+    if [ "$want_n" -ne "$snap_active" ]; then
+        die "read $want_n active ids but the snapshot had $snap_active - refusing to roll back a partial set"
+    fi
 
     echo "==> restoring active flags"
     local list; list="$(printf "'%s'," "${active_ids[@]}")"; list="${list%,}"
@@ -237,7 +248,7 @@ PY
     echo "==> restarting n8n"
     docker restart "$N8N" >/dev/null
     wait_healthy
-    show_active
+    EXPECT_ACTIVE="$snap_active" show_active
     grn "rolled back to $ts"
 }
 
