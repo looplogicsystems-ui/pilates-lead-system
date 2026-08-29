@@ -40,6 +40,22 @@ fi
 cd "$REPO_DIR" || die "no repo at $REPO_DIR"
 psql_n8n () { docker exec -i "$PG" psql -qtA -v ON_ERROR_STOP=1 -U n8n -d n8n "$@"; }
 
+confirm () {
+    # Read from the terminal, not stdin: when these commands are pasted as a
+    # block the shell has the following lines buffered on stdin, and a plain
+    # `read` swallows one of those instead of the answer. Also tolerates a
+    # stray CR and accepts y/yes in any case.
+    [ -n "${ASSUME_YES:-}" ] && return 0
+    local a=""
+    if [ -r /dev/tty ]; then read -r -p "$1 [y/N] " a < /dev/tty || a=""
+    else read -r -p "$1 [y/N] " a || a=""; fi
+    a="${a//$'\r'/}"; a="${a// /}"
+    case "$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')" in
+        y|yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 resolve_branch () {
     case "$1" in
         demo)   echo "demo/computed-availability" ;;
@@ -166,8 +182,7 @@ cmd_deploy () {
     if [ -n "$dirty" ]; then
         red "the repo on the mini has uncommitted changes:"; echo "$dirty" | sed 's/^/  /'
         echo "deploy does a hard reset and would discard them."
-        read -r -p "discard and continue? [y/N] " a
-        [ "$a" = "y" ] || die "aborted"
+        confirm "discard and continue?" || die "aborted"
     fi
 
     echo "==> snapshotting current state"
@@ -195,7 +210,7 @@ cmd_rollback () {
     [ -d "$dir" ] || die "no snapshot '$ts' (see: llctl snapshots)"
 
     ylw "rolling back to $ts — this overwrites the live workflows."
-    read -r -p "continue? [y/N] " a; [ "$a" = "y" ] || die "aborted"
+    confirm "continue?" || die "aborted"
 
     local work; work="$(mktemp -d)"
     # The n8n CLI export carries fields import:workflow will not accept
@@ -251,6 +266,8 @@ PY
     EXPECT_ACTIVE="$snap_active" show_active
     grn "rolled back to $ts"
 }
+
+if [ "${1:-}" = "-y" ] || [ "${1:-}" = "--yes" ]; then ASSUME_YES=1; shift; fi
 
 case "${1:-status}" in
     status)    cmd_status ;;
