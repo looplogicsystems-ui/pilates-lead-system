@@ -238,59 +238,90 @@ node("Get Schedule", "n8n-nodes-base.googleCalendar", 1.3, [860, 200], {
 connect("AI Paused?", "Get Schedule", out=1)
 
 node("Format Schedule", "n8n-nodes-base.code", 2, [1080, 200], {"jsCode": r"""
-// Turn raw calendar events into the seats-left list the agent is allowed to
-// offer from. Capacity and timezone come from studio config, not constants.
-const cfg = $('Resolve Studio').first().json;
-const CAP  = Number(cfg.class_capacity) || 8;
+// Availability is COMPUTED from the studio's open hours minus whatever is on the
+// calendar. It used to be READ from pre-created class events, which meant an empty
+// calendar produced zero offerable slots and the agent could only stall.
+//
+// A slot is offerable when it (a) sits inside open hours, (b) starts at least
+// LEAD_MIN from now, (c) is not overlapped by a non-booking event, and (d) still
+// has seats left after counting overlapping 'Trial:' bookings.
+const cfg  = $('Resolve Studio').first().json;
 const ZONE = cfg.timezone || 'UTC';
+const CAP  = Number(cfg.class_capacity) || 8;
+const DUR  = Number(cfg.booking_duration_minutes) || 50;
 
-// A 'Trial:' booking counts against the class it belongs to. Matching on exact
-// start-timestamp equality meant a 09:05 booking never decremented the 09:00
-// class, so classes looked emptier than they were. Match within a window.
-const TOLERANCE_MS = 15 * 60 * 1000;
+// Per-studio override, if someone later adds studios.prompt_vars.open_hours.
+let pv = {};
+try {
+  pv = (typeof cfg.prompt_vars === 'string') ? JSON.parse(cfg.prompt_vars) : (cfg.prompt_vars || {});
+} catch (e) { pv = {}; }
+const oh = (pv && pv.open_hours) || {};
 
-const now = Date.now();
-const classes = [];
-const trials  = [];
+const OPEN_HOUR  = Number(oh.open_hour     ?? 8);    // 08:00 local
+const CLOSE_HOUR = Number(oh.close_hour    ?? 21);   // 21:00 local — a slot must END by this
+const STEP_MIN   = Number(oh.step_minutes  ?? 60);   // slots on the hour
+const LEAD_MIN   = Number(oh.lead_minutes  ?? 120);  // earliest bookable = now + 2h
+const HORIZON    = Number(oh.horizon_days  ?? 7);
+
+const now      = DateTime.now().setZone(ZONE);
+const earliest = now.plus({ minutes: LEAD_MIN });
+
+// ---- classify what is already on the calendar ---------------------------
+const blocks = [];   // anything not a booking: blocks the slot outright
+const trials = [];   // our own 'Trial:' bookings: consume one seat each
 
 for (const it of $input.all()) {
   const j = it.json || {};
-  const s = j.start && (j.start.dateTime || j.start.date);
-  if (!s) continue;
-  const t = new Date(s).getTime();
-  if (!Number.isFinite(t)) continue;
-  if (t < now) continue;                       // never offer a class in the past
-  const summary = String(j.summary || '').trim();
-  if (/^trial/i.test(summary)) trials.push(t);
-  else classes.push({ summary, start: s, t, id: j.id });
+  if (String(j.status || '').toLowerCase() === 'cancelled') continue;   // was never filtered
+  const st = j.start || {}, en = j.end || {};
+  let s, e;
+  if (st.dateTime) {
+    s = DateTime.fromISO(st.dateTime, { zone: ZONE });
+    e = en.dateTime ? DateTime.fromISO(en.dateTime, { zone: ZONE }) : s.plus({ minutes: DUR });
+  } else if (st.date) {
+    // All-day event blocks the whole LOCAL day. Parsing this as a bare Date made it
+    // UTC midnight, which lands in the previous evening in western timezones and
+    // invented a phantom block.
+    s = DateTime.fromISO(st.date, { zone: ZONE }).startOf('day');
+    e = en.date ? DateTime.fromISO(en.date, { zone: ZONE }).startOf('day') : s.plus({ days: 1 });
+  } else continue;
+  if (!s.isValid || !e.isValid) continue;
+  const rec = { s, e, summary: String(j.summary || '').trim() };
+  if (/^trial\b/i.test(rec.summary)) trials.push(rec); else blocks.push(rec);
 }
 
-// De-duplicate: Get Schedule can return the same event more than once.
-const seen = new Set();
-const unique = classes.filter((c) => {
-  const k = c.id || (c.summary + '@' + c.t);
-  if (seen.has(k)) return false;
-  seen.add(k);
-  return true;
-});
+const overlaps = (aS, aE, bS, bE) => aS < bE && bS < aE;
 
-const seatsLeft = (c) => {
-  const taken = trials.filter((t) => Math.abs(t - c.t) <= TOLERANCE_MS).length;
-  return Math.max(CAP - taken, 0);
-};
+// ---- generate candidate slots and subtract ------------------------------
+const lines = [];
+let slotCount = 0;
 
-const fmt = (iso) => DateTime.fromISO(iso, { zone: ZONE }).toFormat('cccc dd LLL, h:mm a');
+for (let d = 0; d <= HORIZON; d++) {
+  const day   = now.plus({ days: d }).startOf('day');
+  const open  = day.set({ hour: OPEN_HOUR,  minute: 0, second: 0, millisecond: 0 });
+  const close = day.set({ hour: CLOSE_HOUR, minute: 0, second: 0, millisecond: 0 });
 
-const lines = unique
-  .sort((a, b) => a.t - b.t)
-  .map((c) => {
-    const left = seatsLeft(c);
-    return '- ' + c.summary + ' — ' + fmt(c.start) + ' — ' + (left > 0 ? left + ' seats left' : 'FULL');
-  });
+  const parts = [];
+  for (let t = open; t.plus({ minutes: DUR }) <= close; t = t.plus({ minutes: STEP_MIN })) {
+    const tEnd = t.plus({ minutes: DUR });
+    if (t < earliest) continue;
+    if (blocks.some((b) => overlaps(t, tEnd, b.s, b.e))) continue;
+    const taken = trials.filter((b) => overlaps(t, tEnd, b.s, b.e)).length;
+    const left  = CAP - taken;
+    if (left <= 0) continue;
+    const label = t.minute === 0 ? t.toFormat('h a') : t.toFormat('h:mm a');
+    parts.push(left < CAP ? `${label} (${left} left)` : label);
+    slotCount++;
+  }
+  if (parts.length) lines.push(`- ${day.toFormat('cccc dd LLL')}: ${parts.join(', ')}`);
+}
 
 return [{ json: {
-  scheduleText: lines.length ? lines.join('\n') : '(no upcoming classes on the schedule right now)',
-  classCount: unique.length,
+  scheduleText: lines.length
+    ? lines.join('\n')
+    : `(no open slots in the next ${HORIZON} days)`,
+  classCount: slotCount,
+  slotMinutes: DUR,
 } }];
 """})
 connect("Get Schedule", "Format Schedule")
@@ -315,15 +346,16 @@ const systemMessage = [
 `You are ${v.persona_name || 'the studio host'}, ${v.persona_role || 'the owner'} of ${v.studio_name || cfg.studio_name}, a ${v.studio_type || 'fitness studio'} in ${v.city || v.location || ''}. You personally reply to inbound leads who message the studio — ${v.voice || 'warm, casual and human'}.`,
 ``,
 `Studio facts you can use:`,
-`- Classes: ${v.classes || 'see the schedule below'} (small groups, max ${cfg.class_capacity}).`,
+`- Classes: ${v.classes || 'ask which one they are interested in'} (small groups, max ${cfg.class_capacity}).`,
 `- Intro offer: ${v.offer || cfg.offers || ''}.`,
 `- Location: ${v.location || ''}.${v.amenities ? ' ' + v.amenities + '.' : ''}`,
 `- Studio timezone: ${tzLabel}.`,
 ``,
 `Availability rules — the calendar is the single source of truth:`,
-`- ONLY offer or confirm a class that appears in the real schedule shown in the user message, with the seats remaining given there.`,
-`- NEVER invent a class, day or time, and never claim a class exists unless it is in that list. If nothing fits, say you will check and follow up.`,
-`- A class showing FULL has no seats left: do not offer it, and offer the next open class instead.`,
+`- The user message lists the studio's genuinely OPEN times, already checked against the calendar. ONLY offer or confirm a time from that list.`,
+`- NEVER invent a day or time, and never offer a time that is not in that list. Times not listed are unavailable — do not explain why, just offer the nearest listed alternative.`,
+`- Sessions are ${cfg.booking_duration_minutes} minutes. Offer two or three specific times rather than the whole list, and let the lead pick.`,
+`- '(N left)' means only N seats remain at that time. A time with no marker is wide open.`,
 ``,
 `How you talk:`,
 `- Sound like a real person, never a template. No 'Hi [NAME], thanks for your interest!'.`,
@@ -340,13 +372,13 @@ const systemMessage = [
 `  "booking": { "class_type": "...", "start_time": "YYYY-MM-DDTHH:MM:SS", "end_time": "YYYY-MM-DDTHH:MM:SS" } | null,`,
 `  "escalate": { "reason": "..." } | null`,
 `}`,
-`Set intent to 'booking' ONLY when a specific date and time are agreed, and include the booking object (class_type from the classes above; default a ${cfg.booking_duration_minutes}-minute duration if the lead doesn't specify). Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. Always resolve dates against the current date and time given at the top of the user's message, output a FUTURE date in the correct current year, and NEVER use a past year. Set intent to 'escalate' for medical/injury or price-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null.`,
+`Set intent to 'booking' ONLY when a specific date and time are agreed, and include the booking object (class_type = the class the lead asked for, or a sensible default from the studio's classes above; duration is ${cfg.booking_duration_minutes} minutes). Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. Always resolve dates against the current date and time given at the top of the user's message, output a FUTURE date in the correct current year, and NEVER use a past year. Set intent to 'escalate' for medical/injury or price-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null.`,
 ].join('\n');
 
 const userMessage = [
 `Current date and time: ${nowLocal} (${tzLabel}). Resolve any relative or unspecified dates against this, and NEVER schedule a booking in the past.`,
 ``,
-`The studio's REAL upcoming classes (with seats remaining) — only ever offer or confirm a class from THIS list, and never one marked FULL:`,
+`The studio's REAL open times, already checked against the calendar — only ever offer or confirm a time from THIS list:`,
 $('Format Schedule').first().json.scheduleText,
 ``,
 `Lead's message: ${inb.message}`,
