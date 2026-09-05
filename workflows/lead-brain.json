@@ -376,6 +376,7 @@
           "name": "Google Calendar account"
         }
       },
+      "alwaysOutputData": true,
       "retryOnFail": true
     },
     {

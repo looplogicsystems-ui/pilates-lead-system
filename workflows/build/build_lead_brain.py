@@ -231,6 +231,16 @@ connect("Notify Owner: Paused Lead", "Return: Paused")
 # `Testing`, which caps refresh tokens at 7 days), the read failed silently,
 # the agent invented slots, and only the calendar WRITE failed loudly.
 # Failing outright dead-letters the message and alerts the owner instead.
+#
+# `alwaysOutputData` STAYS. It does a different job and removing it broke the
+# whole channel on 2026-09-05: a calendar with no events in the window returns
+# zero items, n8n does not run anything downstream of a node that emitted
+# nothing, so Format Schedule never fired and the lead got silence — with no
+# error, no dead-letter and no alert, because the execution genuinely
+# succeeded. The two flags are not interchangeable: `onError` decides what a
+# FAILED read does, `alwaysOutputData` decides what an EMPTY read does. An
+# empty calendar is a legitimate state under the computed model (it means
+# everything is open); a failed read is not.
 node("Get Schedule", "n8n-nodes-base.googleCalendar", 1.3, [860, 200], {
     "operation": "getAll",
     "calendar": {"__rl": True, "value": f"={{{{ {CFG}.gcal_schedule_id }}}}", "mode": "id"},
@@ -244,7 +254,7 @@ node("Get Schedule", "n8n-nodes-base.googleCalendar", 1.3, [860, 200], {
     }},
      credentials={"googleCalendarOAuth2Api": {"id": "GOOGLE_CAL_CRED_ID",
                                               "name": "Google Calendar account"}},
-     retryOnFail=True)
+     alwaysOutputData=True, retryOnFail=True)
 connect("AI Paused?", "Get Schedule", out=1)
 
 node("Format Schedule", "n8n-nodes-base.code", 2, [1080, 200], {"jsCode": r"""
