@@ -221,6 +221,16 @@ connect("Notify Owner: Paused Lead", "Return: Paused")
 # ---------------------------------------------------------------------------
 # 3. Real availability
 # ---------------------------------------------------------------------------
+# This node deliberately has NO onError override. It used to carry
+# `continueRegularOutput` + `alwaysOutputData`, which meant a dead Google
+# credential produced an EMPTY event list instead of an error — and because
+# availability is computed as "open hours minus the calendar", an empty list
+# reads as "nothing is booked" and the agent offers the entire 08:00-21:00
+# grid as verified availability. That is exactly what happened between
+# 2026-08-22 and 2026-09-05: the refresh token expired (the OAuth app was in
+# `Testing`, which caps refresh tokens at 7 days), the read failed silently,
+# the agent invented slots, and only the calendar WRITE failed loudly.
+# Failing outright dead-letters the message and alerts the owner instead.
 node("Get Schedule", "n8n-nodes-base.googleCalendar", 1.3, [860, 200], {
     "operation": "getAll",
     "calendar": {"__rl": True, "value": f"={{{{ {CFG}.gcal_schedule_id }}}}", "mode": "id"},
@@ -234,7 +244,7 @@ node("Get Schedule", "n8n-nodes-base.googleCalendar", 1.3, [860, 200], {
     }},
      credentials={"googleCalendarOAuth2Api": {"id": "GOOGLE_CAL_CRED_ID",
                                               "name": "Google Calendar account"}},
-     onError="continueRegularOutput", alwaysOutputData=True, retryOnFail=True)
+     retryOnFail=True)
 connect("AI Paused?", "Get Schedule", out=1)
 
 node("Format Schedule", "n8n-nodes-base.code", 2, [1080, 200], {"jsCode": r"""
@@ -362,7 +372,8 @@ const systemMessage = [
 `- Keep it short — a line or two. Ask exactly ONE question that moves toward booking a class.`,
 `- Use the conversation history; adapt to what the lead actually says. Don't repeat yourself.`,
 `- Goal: get them booked into a specific class. Gently keep steering toward a day and time.`,
-`- If they give a day/time that exists on the schedule and has seats, confirm it back and treat it as a booking.`,
+`- If they give a day/time that exists on the schedule and has seats, confirm the TIME back and ask which class they want. The booking is not made until they answer that.`,
+`- NEVER say a lead is booked — no 'you're booked', 'you're in', 'I've got you down', 'you're set' — unless you are setting intent to 'booking' in this same response. Saying it earlier is a lie: nothing has been written to the calendar yet.`,
 `- ESCALATE (don't answer) medical/injury questions or price negotiation.`,
 ``,
 `You MUST respond with ONLY a JSON object — no prose, no code fences:`,
@@ -372,7 +383,7 @@ const systemMessage = [
 `  "booking": { "class_type": "...", "start_time": "YYYY-MM-DDTHH:MM:SS", "end_time": "YYYY-MM-DDTHH:MM:SS" } | null,`,
 `  "escalate": { "reason": "..." } | null`,
 `}`,
-`Set intent to 'booking' ONLY when a specific date and time are agreed, and include the booking object (class_type = the class the lead asked for, or a sensible default from the studio's classes above; duration is ${cfg.booking_duration_minutes} minutes). Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. Always resolve dates against the current date and time given at the top of the user's message, output a FUTURE date in the correct current year, and NEVER use a past year. Set intent to 'escalate' for medical/injury or price-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null.`,
+`Set intent to 'booking' ONLY when the lead has explicitly agreed BOTH (a) a specific date and time from the open-times list AND (b) a specific class, named by them. If either is still unsettled, intent stays 'continue'. NEVER choose the class for them and NEVER fall back to a default — class_type must be a class the lead actually named, because setting intent to 'booking' writes a real event to a real calendar and consumes a seat. (Booking a defaulted class on the turn where you also ask which class they want is what produced two events for one lead on 2026-09-05.) Duration is ${cfg.booking_duration_minutes} minutes. Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. Always resolve dates against the current date and time given at the top of the user's message, output a FUTURE date in the correct current year, and NEVER use a past year. Set intent to 'escalate' for medical/injury or price-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null.`,
 ].join('\n');
 
 const userMessage = [
@@ -484,7 +495,37 @@ node("Create Calendar Event", "n8n-nodes-base.googleCalendar", 1.3, [2180, 60], 
      credentials={"googleCalendarOAuth2Api": {"id": "GOOGLE_CAL_CRED_ID",
                                               "name": "Google Calendar account"}},
      onError="continueErrorOutput", retryOnFail=True)
-connect("Route by Intent", "Create Calendar Event", out=0)
+# --- duplicate guard -------------------------------------------------------
+# The prompt rules above are the primary defence; this is the structural one.
+# On 2026-09-05 the agent set intent 'booking' with a DEFAULTED class, wrote the
+# event, then asked which class the lead wanted and booked again 30 seconds
+# later — two calendar events and two rows for one lead in one slot, two seats
+# consumed. Nothing between `Route by Intent` and the calendar write ever asked
+# whether this lead already had that slot. Now it does.
+pg("Existing Booking?", [2020, -60], """SELECT id
+FROM bookings
+WHERE lead_id = $1 AND start_time = $2 AND status = 'confirmed'
+LIMIT 1;""",
+   replacement=("={{ [$('Upsert Lead').first().json.id, "
+                f"{AGENT}.booking.start_time] }}}}"),
+   alwaysOutputData=True, onError="continueRegularOutput", retryOnFail=True)
+connect("Route by Intent", "Existing Booking?", out=0)
+
+node("Already Booked?", "n8n-nodes-base.if", 2.2, [2120, -60], {
+    "conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
+                               "typeValidation": "loose"},
+                   "conditions": [{"id": "dupe-slot",
+                                   "leftValue": "={{ $json.id }}",
+                                   "rightValue": "",
+                                   "operator": {"type": "string", "operation": "notEmpty",
+                                                "singleValue": True}}],
+                   "combinator": "and"},
+    "options": {}})
+connect("Existing Booking?", "Already Booked?")
+# Already booked: send the agent's reply, write nothing. `Continue (no action)`
+# is already wired to Log Outbound, so the lead is never left in silence.
+connect("Already Booked?", "Continue (no action)", out=0)
+connect("Already Booked?", "Create Calendar Event", out=1)
 
 node("Event Really Created?", "n8n-nodes-base.if", 2.2, [2400, -60], {
     "conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
@@ -540,7 +581,22 @@ node("Soft-fail Reply", "n8n-nodes-base.set", 3.4, [2840, 120], {
          "value": "=Let me just double-check that slot with the studio and come straight back to you — give me a few minutes."},
         {"id": "sf2", "name": "booking_failed", "type": "boolean", "value": "={{ true }}"},
     ]}, "options": {}})
-connect("Alert Owner - Booking Failed", "Soft-fail Reply")
+# A caught calendar failure is NOT an execution error, so the Error Handler
+# never fires and nothing reaches `dead_letters`. Combined with
+# `saveDataSuccessExecution: none` below, that left literally no trace: bookings
+# were failing from ~2026-08-22 and the only signal was a Slack line nobody
+# read. Persist it, so "has booking been failing?" is one SQL query.
+_dl_payload = ("JSON.stringify({ lead_id: $('Upsert Lead').first().json.id, external_id: "
+               + IN + ".external_id, channel: " + IN + ".channel, booking: "
+               + AGENT + ".booking })")
+pg("Log Booking Failure", [2730, 220],
+   """INSERT INTO dead_letters (workflow_id, execution_id, reason, payload, error, created_at)
+VALUES ($1, $2, 'booking_write_failed', $3::jsonb, $4, now());""",
+   replacement=("={{ [$workflow.id, String($execution.id), " + _dl_payload
+                + ", 'Calendar write failed or returned no event id'] }}"),
+   onError="continueRegularOutput", retryOnFail=True, alwaysOutputData=True)
+connect("Alert Owner - Booking Failed", "Log Booking Failure")
+connect("Log Booking Failure", "Soft-fail Reply")
 
 # ---------------------------------------------------------------------------
 # 7. Escalation — now actually pauses automation

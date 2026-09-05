@@ -376,8 +376,6 @@
           "name": "Google Calendar account"
         }
       },
-      "onError": "continueRegularOutput",
-      "alwaysOutputData": true,
       "retryOnFail": true
     },
     {
@@ -403,7 +401,7 @@
         200
       ],
       "parameters": {
-        "jsCode": "\n// Everything the persona says about itself now comes from studios.prompt_vars.\n// Previously the studio name, city, offer and class list were string literals\n// inside the system message, so a second studio meant a second workflow.\nconst cfg = $('Resolve Studio').first().json;\nconst inb = $('When Called').first().json;\nconst v   = (typeof cfg.prompt_vars === 'string')\n              ? JSON.parse(cfg.prompt_vars) : (cfg.prompt_vars || {});\n\nconst ZONE = cfg.timezone || 'UTC';\nconst tzLabel = v.timezone_label || ZONE;\nconst nowLocal = DateTime.now().setZone(ZONE).toFormat('cccc yyyy-MM-dd HH:mm');\n\nconst systemMessage = [\n`You are ${v.persona_name || 'the studio host'}, ${v.persona_role || 'the owner'} of ${v.studio_name || cfg.studio_name}, a ${v.studio_type || 'fitness studio'} in ${v.city || v.location || ''}. You personally reply to inbound leads who message the studio — ${v.voice || 'warm, casual and human'}.`,\n``,\n`Studio facts you can use:`,\n`- Classes: ${v.classes || 'ask which one they are interested in'} (small groups, max ${cfg.class_capacity}).`,\n`- Intro offer: ${v.offer || cfg.offers || ''}.`,\n`- Location: ${v.location || ''}.${v.amenities ? ' ' + v.amenities + '.' : ''}`,\n`- Studio timezone: ${tzLabel}.`,\n``,\n`Availability rules — the calendar is the single source of truth:`,\n`- The user message lists the studio's genuinely OPEN times, already checked against the calendar. ONLY offer or confirm a time from that list.`,\n`- NEVER invent a day or time, and never offer a time that is not in that list. Times not listed are unavailable — do not explain why, just offer the nearest listed alternative.`,\n`- Sessions are ${cfg.booking_duration_minutes} minutes. Offer two or three specific times rather than the whole list, and let the lead pick.`,\n`- '(N left)' means only N seats remain at that time. A time with no marker is wide open.`,\n``,\n`How you talk:`,\n`- Sound like a real person, never a template. No 'Hi [NAME], thanks for your interest!'.`,\n`- Keep it short — a line or two. Ask exactly ONE question that moves toward booking a class.`,\n`- Use the conversation history; adapt to what the lead actually says. Don't repeat yourself.`,\n`- Goal: get them booked into a specific class. Gently keep steering toward a day and time.`,\n`- If they give a day/time that exists on the schedule and has seats, confirm it back and treat it as a booking.`,\n`- ESCALATE (don't answer) medical/injury questions or price negotiation.`,\n``,\n`You MUST respond with ONLY a JSON object — no prose, no code fences:`,\n`{`,\n`  \"reply\": \"<message to send the lead>\",`,\n`  \"intent\": \"continue\" | \"booking\" | \"escalate\",`,\n`  \"booking\": { \"class_type\": \"...\", \"start_time\": \"YYYY-MM-DDTHH:MM:SS\", \"end_time\": \"YYYY-MM-DDTHH:MM:SS\" } | null,`,\n`  \"escalate\": { \"reason\": \"...\" } | null`,\n`}`,\n`Set intent to 'booking' ONLY when a specific date and time are agreed, and include the booking object (class_type = the class the lead asked for, or a sensible default from the studio's classes above; duration is ${cfg.booking_duration_minutes} minutes). Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. Always resolve dates against the current date and time given at the top of the user's message, output a FUTURE date in the correct current year, and NEVER use a past year. Set intent to 'escalate' for medical/injury or price-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null.`,\n].join('\\n');\n\nconst userMessage = [\n`Current date and time: ${nowLocal} (${tzLabel}). Resolve any relative or unspecified dates against this, and NEVER schedule a booking in the past.`,\n``,\n`The studio's REAL open times, already checked against the calendar — only ever offer or confirm a time from THIS list:`,\n$('Format Schedule').first().json.scheduleText,\n``,\n`Lead's message: ${inb.message}`,\n].join('\\n');\n\nreturn [{ json: { systemMessage, userMessage } }];\n"
+        "jsCode": "\n// Everything the persona says about itself now comes from studios.prompt_vars.\n// Previously the studio name, city, offer and class list were string literals\n// inside the system message, so a second studio meant a second workflow.\nconst cfg = $('Resolve Studio').first().json;\nconst inb = $('When Called').first().json;\nconst v   = (typeof cfg.prompt_vars === 'string')\n              ? JSON.parse(cfg.prompt_vars) : (cfg.prompt_vars || {});\n\nconst ZONE = cfg.timezone || 'UTC';\nconst tzLabel = v.timezone_label || ZONE;\nconst nowLocal = DateTime.now().setZone(ZONE).toFormat('cccc yyyy-MM-dd HH:mm');\n\nconst systemMessage = [\n`You are ${v.persona_name || 'the studio host'}, ${v.persona_role || 'the owner'} of ${v.studio_name || cfg.studio_name}, a ${v.studio_type || 'fitness studio'} in ${v.city || v.location || ''}. You personally reply to inbound leads who message the studio — ${v.voice || 'warm, casual and human'}.`,\n``,\n`Studio facts you can use:`,\n`- Classes: ${v.classes || 'ask which one they are interested in'} (small groups, max ${cfg.class_capacity}).`,\n`- Intro offer: ${v.offer || cfg.offers || ''}.`,\n`- Location: ${v.location || ''}.${v.amenities ? ' ' + v.amenities + '.' : ''}`,\n`- Studio timezone: ${tzLabel}.`,\n``,\n`Availability rules — the calendar is the single source of truth:`,\n`- The user message lists the studio's genuinely OPEN times, already checked against the calendar. ONLY offer or confirm a time from that list.`,\n`- NEVER invent a day or time, and never offer a time that is not in that list. Times not listed are unavailable — do not explain why, just offer the nearest listed alternative.`,\n`- Sessions are ${cfg.booking_duration_minutes} minutes. Offer two or three specific times rather than the whole list, and let the lead pick.`,\n`- '(N left)' means only N seats remain at that time. A time with no marker is wide open.`,\n``,\n`How you talk:`,\n`- Sound like a real person, never a template. No 'Hi [NAME], thanks for your interest!'.`,\n`- Keep it short — a line or two. Ask exactly ONE question that moves toward booking a class.`,\n`- Use the conversation history; adapt to what the lead actually says. Don't repeat yourself.`,\n`- Goal: get them booked into a specific class. Gently keep steering toward a day and time.`,\n`- If they give a day/time that exists on the schedule and has seats, confirm the TIME back and ask which class they want. The booking is not made until they answer that.`,\n`- NEVER say a lead is booked — no 'you're booked', 'you're in', 'I've got you down', 'you're set' — unless you are setting intent to 'booking' in this same response. Saying it earlier is a lie: nothing has been written to the calendar yet.`,\n`- ESCALATE (don't answer) medical/injury questions or price negotiation.`,\n``,\n`You MUST respond with ONLY a JSON object — no prose, no code fences:`,\n`{`,\n`  \"reply\": \"<message to send the lead>\",`,\n`  \"intent\": \"continue\" | \"booking\" | \"escalate\",`,\n`  \"booking\": { \"class_type\": \"...\", \"start_time\": \"YYYY-MM-DDTHH:MM:SS\", \"end_time\": \"YYYY-MM-DDTHH:MM:SS\" } | null,`,\n`  \"escalate\": { \"reason\": \"...\" } | null`,\n`}`,\n`Set intent to 'booking' ONLY when the lead has explicitly agreed BOTH (a) a specific date and time from the open-times list AND (b) a specific class, named by them. If either is still unsettled, intent stays 'continue'. NEVER choose the class for them and NEVER fall back to a default — class_type must be a class the lead actually named, because setting intent to 'booking' writes a real event to a real calendar and consumes a seat. (Booking a defaulted class on the turn where you also ask which class they want is what produced two events for one lead on 2026-09-05.) Duration is ${cfg.booking_duration_minutes} minutes. Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. Always resolve dates against the current date and time given at the top of the user's message, output a FUTURE date in the correct current year, and NEVER use a past year. Set intent to 'escalate' for medical/injury or price-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null.`,\n].join('\\n');\n\nconst userMessage = [\n`Current date and time: ${nowLocal} (${tzLabel}). Resolve any relative or unspecified dates against this, and NEVER schedule a booking in the past.`,\n``,\n`The studio's REAL open times, already checked against the calendar — only ever offer or confirm a time from THIS list:`,\n$('Format Schedule').first().json.scheduleText,\n``,\n`Lead's message: ${inb.message}`,\n].join('\\n');\n\nreturn [{ json: { systemMessage, userMessage } }];\n"
       }
     },
     {
@@ -585,6 +583,66 @@
       "retryOnFail": true
     },
     {
+      "id": "existing-booking",
+      "name": "Existing Booking?",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2020,
+        -60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id\nFROM bookings\nWHERE lead_id = $1 AND start_time = $2 AND status = 'confirmed'\nLIMIT 1;",
+        "options": {
+          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Parse Agent JSON').first().json.booking.start_time] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "already-booked",
+      "name": "Already Booked?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2120,
+        -60
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "dupe-slot",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
       "id": "event-really-created",
       "name": "Event Really Created?",
       "type": "n8n-nodes-base.if",
@@ -751,6 +809,32 @@
         },
         "options": {}
       }
+    },
+    {
+      "id": "log-booking-failure",
+      "name": "Log Booking Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2730,
+        220
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO dead_letters (workflow_id, execution_id, reason, payload, error, created_at)\nVALUES ($1, $2, 'booking_write_failed', $3::jsonb, $4, now());",
+        "options": {
+          "queryReplacement": "={{ [$workflow.id, String($execution.id), JSON.stringify({ lead_id: $('Upsert Lead').first().json.id, external_id: $('When Called').first().json.external_id, channel: $('When Called').first().json.channel, booking: $('Parse Agent JSON').first().json.booking }), 'Calendar write failed or returned no event id'] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "alwaysOutputData": true
     },
     {
       "id": "insert-escalation",
@@ -1134,7 +1218,7 @@
       "main": [
         [
           {
-            "node": "Create Calendar Event",
+            "node": "Existing Booking?",
             "type": "main",
             "index": 0
           }
@@ -1149,6 +1233,35 @@
         [
           {
             "node": "Continue (no action)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Existing Booking?": {
+      "main": [
+        [
+          {
+            "node": "Already Booked?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Already Booked?": {
+      "main": [
+        [
+          {
+            "node": "Continue (no action)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Calendar Event",
             "type": "main",
             "index": 0
           }
@@ -1214,6 +1327,17 @@
       ]
     },
     "Alert Owner - Booking Failed": {
+      "main": [
+        [
+          {
+            "node": "Log Booking Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Booking Failure": {
       "main": [
         [
           {
