@@ -1,0 +1,86 @@
+{
+  "id": null,
+  "name": "Ops: Test Email",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000d002",
+  "nodes": [
+    {
+      "id": "te-manual",
+      "name": "Run Test",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "te-msg",
+      "name": "Test Message",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "{\"to\": \"founders\", \"subject\": \"Loop Logic \\u2014 alert test\", \"heading\": \"If you can read this on your phone, alerts work.\", \"lines\": [\"This is a test from the Ops: Test Email workflow on the Mac mini.\", \"Check it landed in the INBOX, not spam. If it is in spam, mark it 'not spam' once.\"], \"buttons\": [{\"label\": \"Open n8n\", \"url\": \"https://n8n.looplogicsystems.com/\"}], \"note\": \"Sent by the pilot build, step 3 (email alerts).\"}",
+        "options": {}
+      }
+    },
+    {
+      "id": "te-call",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "SEND_EMAIL_WF_ID"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Run Test": {
+      "main": [
+        [
+          {
+            "node": "Test Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Test Message": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

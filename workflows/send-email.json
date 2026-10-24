@@ -1,0 +1,139 @@
+{
+  "id": null,
+  "name": "Send Email",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000d001",
+  "nodes": [
+    {
+      "id": "se-trigger",
+      "name": "When Called",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "se-build",
+      "name": "Build Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const esc = (s) => String(s ?? '').replace(/[&<>\"']/g,\n  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\n\nconst from = String($env.ALERTS_FROM_EMAIL || '').trim();\nif (!from) throw new Error('Send Email: ALERTS_FROM_EMAIL is not set on the server');\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n\n  let to = String(j.to || '').trim();\n  if (to === 'founders') to = String($env.FOUNDER_ALERT_EMAILS || '').trim();\n  if (!to) throw new Error(`Send Email: no recipient (to=\"${j.to}\")`);\n  if (!j.subject) throw new Error('Send Email: no subject');\n\n  const lines = Array.isArray(j.lines) ? j.lines : (j.lines ? [j.lines] : []);\n  // https only: a button is a link a studio owner will tap on her phone.\n  const buttons = (Array.isArray(j.buttons) ? j.buttons : [])\n    .filter((b) => b && b.label && /^https:\\/\\//.test(String(b.url || '')));\n\n  const btnHtml = buttons.map((b) =>\n    `<a href=\"${esc(b.url)}\" style=\"display:inline-block;margin:0 8px 8px 0;padding:10px 18px;` +\n    `background:#1f2937;color:#ffffff;text-decoration:none;border-radius:6px;font-weight:600\">${esc(b.label)}</a>`\n  ).join('');\n\n  const html =\n    `<div style=\"font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:15px;line-height:1.5;color:#111;max-width:560px\">` +\n    (j.heading ? `<p style=\"font-size:18px;font-weight:700;margin:0 0 12px\">${esc(j.heading)}</p>` : '') +\n    lines.map((l) => `<p style=\"margin:0 0 10px\">${esc(l)}</p>`).join('') +\n    (btnHtml ? `<div style=\"margin:16px 0 8px\">${btnHtml}</div>` : '') +\n    (j.note ? `<p style=\"margin:16px 0 0;font-size:12px;color:#6b7280\">${esc(j.note)}</p>` : '') +\n    `</div>`;\n\n  const text = [\n    j.heading || '',\n    ...lines,\n    ...buttons.map((b) => `${b.label}: ${b.url}`),\n    j.note || '',\n  ].filter(Boolean).join('\\n\\n');\n\n  out.push({ json: { to, from: `Loop Logic Alerts <${from}>`, subject: String(j.subject), html, text } });\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "se-send",
+      "name": "Send via SMTP",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "fromEmail": "={{ $json.from }}",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "both",
+        "text": "={{ $json.text }}",
+        "html": "={{ $json.html }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_ALERTS_CRED_ID",
+          "name": "Loop Logic Alerts (SMTP)"
+        }
+      }
+    },
+    {
+      "id": "se-done",
+      "name": "Sent",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d1",
+              "name": "sent",
+              "type": "boolean",
+              "value": "={{ true }}"
+            },
+            {
+              "id": "d2",
+              "name": "to",
+              "type": "string",
+              "value": "={{ $('Build Email').item.json.to }}"
+            },
+            {
+              "id": "d3",
+              "name": "subject",
+              "type": "string",
+              "value": "={{ $('Build Email').item.json.subject }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "When Called": {
+      "main": [
+        [
+          {
+            "node": "Build Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Email": {
+      "main": [
+        [
+          {
+            "node": "Send via SMTP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send via SMTP": {
+      "main": [
+        [
+          {
+            "node": "Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

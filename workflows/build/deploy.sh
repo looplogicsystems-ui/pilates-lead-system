@@ -33,6 +33,7 @@ rm -f "$SCRATCH"/*.live.json
 python3 "$REPO/workflows/build/build_lead_brain.py" "$SCRATCH"
 python3 "$REPO/workflows/build/build_adapters.py"  "$SCRATCH" "$BRAIN_ID"
 python3 "$REPO/workflows/build/build_ops.py"       "$SCRATCH"
+python3 "$REPO/workflows/build/build_pilot.py"     "$SCRATCH"
 
 # Every generated workflow is imported AND published. This list used to be typed
 # by hand in three places; a new workflow missing from any of them imported as an
