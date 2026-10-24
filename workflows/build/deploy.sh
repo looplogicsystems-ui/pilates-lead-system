@@ -27,11 +27,25 @@ done
 psql_n8n () { "$DOCKER" exec -i postgres psql -q -v ON_ERROR_STOP=1 -U n8n -d n8n "$@"; }
 
 echo "==> generating"
+# Start from an empty scratch dir: the import list below is built from whatever
+# *.live.json files exist, so a stale file from an old build must not survive.
+rm -f "$SCRATCH"/*.live.json
 python3 "$REPO/workflows/build/build_lead_brain.py" "$SCRATCH"
 python3 "$REPO/workflows/build/build_adapters.py"  "$SCRATCH" "$BRAIN_ID"
 python3 "$REPO/workflows/build/build_ops.py"       "$SCRATCH"
 
-FILES="lead-brain channel-adapter-instagram channel-adapter-slack followup-scheduler error-handler ig-token-monitor"
+# Every generated workflow is imported AND published. This list used to be typed
+# by hand in three places; a new workflow missing from any of them imported as an
+# unpublished draft and never ran, while the deploy still reported success.
+FILES="$(cd "$SCRATCH" && ls *.live.json | sed 's/\.live\.json$//' | tr '\n' ' ')"
+NAMES_SQL="$(python3 - "$SCRATCH" <<'PYEOF'
+import glob, json, os, sys
+names = [json.load(open(f))["name"] for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.live.json")))]
+print(",".join("'" + n.replace("'", "''") + "'" for n in names))
+PYEOF
+)"
+[ -n "$FILES" ] && [ -n "$NAMES_SQL" ] || { echo "nothing generated" >&2; exit 1; }
+echo "    workflows: $FILES"
 
 echo "==> importing"
 for f in $FILES; do
@@ -46,8 +60,7 @@ psql_n8n -c "
 INSERT INTO workflow_history (\"versionId\", \"workflowId\", authors, nodes, connections, name)
 SELECT w.\"versionId\", w.id, 'phase-2a-deploy', w.nodes, w.connections, w.name
   FROM workflow_entity w
- WHERE w.name IN ('Lead Brain','Channel Adapter: Instagram','Channel Adapter: Slack',
-                  'Follow-up Scheduler','Lead System — Error Handler','IG Token Expiry Monitor')
+ WHERE w.name IN ($NAMES_SQL)
 ON CONFLICT (\"versionId\") DO UPDATE
    SET nodes = EXCLUDED.nodes,
        connections = EXCLUDED.connections,
@@ -57,8 +70,7 @@ ON CONFLICT (\"versionId\") DO UPDATE
 echo "==> publishing"
 for id in $(psql_n8n -t -A -c "
 SELECT id FROM workflow_entity
- WHERE name IN ('Lead Brain','Channel Adapter: Instagram','Channel Adapter: Slack',
-                'Follow-up Scheduler','Lead System — Error Handler','IG Token Expiry Monitor');"); do
+ WHERE name IN ($NAMES_SQL);"); do
     "$DOCKER" exec n8n n8n publish:workflow --id="$id" >/dev/null 2>&1 \
         && echo "    published $id" || echo "    publish $id FAILED"
 done
@@ -75,3 +87,10 @@ if [ "${1:-}" != "--no-restart" ]; then
 fi
 
 psql_n8n -c "SELECT name, active FROM workflow_entity WHERE active ORDER BY name;"
+
+# Don't trust the exit codes above: confirm every generated workflow is published.
+inactive="$(psql_n8n -t -A -c "SELECT name FROM workflow_entity WHERE name IN ($NAMES_SQL) AND NOT active;")"
+if [ -n "$inactive" ]; then
+    echo "!! NOT ACTIVE after deploy:" >&2; echo "$inactive" | sed 's/^/   /' >&2; exit 1
+fi
+echo "==> all $(echo $FILES | wc -w) generated workflows are active"
