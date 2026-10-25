@@ -108,9 +108,10 @@ const ownerButton = (label, action, leadId) => {
 
 # Where the lead's booking link points. The tracked redirect (Link Redirect
 # workflow) records the click, then sends her on to the studio's real page.
-# Switch to "https://go.looplogicsystems.com/" once the Cloudflare Worker for
-# that hostname is live — shorter and cleaner in a DM.
-LINK_BASE = "https://n8n.looplogicsystems.com/webhook/go?c="
+# go.looplogicsystems.com is a Cloudflare Worker ("go") that forwards
+# /<code> to /webhook/go?c=<code>, passing the user agent through so preview
+# robots are still recognised. The long n8n URL keeps working as a fallback.
+LINK_BASE = "https://go.looplogicsystems.com/"
 
 # ---------------------------------------------------------------------------
 # 1. Entry + studio resolution (unchanged in spirit since Phase 2a)
