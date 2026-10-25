@@ -1,0 +1,345 @@
+{
+  "id": "C3KkwuJYPyrwGUZS",
+  "name": "Owner Actions",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000d005",
+  "nodes": [
+    {
+      "id": "oa-get",
+      "name": "Action Link",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "b7c1e2d3-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "owner",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "oa-post",
+      "name": "Action Confirm",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "c8d2f3e4-5a6b-4c7d-9e8f-0a1b2c3d4e5f",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "owner",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "oa-verify",
+      "name": "Verify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        100
+      ],
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst j = $input.first().json;\nconst isPost = !!(j.body && j.body.a);\nconst src = isPost ? j.body : (j.query || {});\nconst a = String(src.a || ''), l = String(src.l || ''), t = String(src.t || '');\nconst secret = String($env.OWNER_LINK_SECRET || '');\n\nconst LABELS = {\n  pause:  { ask: 'Pause the AI for this lead?', go: 'Yes, pause it',\n            done: 'Paused. The AI won’t reply to this lead until you tap Resume in one of its emails.' },\n  resume: { ask: 'Hand this lead back to the AI?', go: 'Yes, resume',\n            done: 'Resumed. The AI will answer this lead’s next message.' },\n  booked: { ask: 'Mark this lead as booked?', go: 'Yes, she’s booked',\n            done: 'Marked as booked. It will count in your day-30 report.' },\n};\nconst sign = (act, lead) => crypto.createHmac('sha256', secret).update(`${act}:${lead}`).digest('hex').slice(0, 32);\nlet valid = false;\nif (secret && LABELS[a] && /^\\d{1,10}$/.test(l) && /^[0-9a-f]{32}$/.test(t)) {\n  const want = Buffer.from(sign(a, l)), got = Buffer.from(t);\n  valid = want.length === got.length && crypto.timingSafeEqual(want, got);\n}\n\nconst page = (title, body) => `<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>${title}</title>\n<style>body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f4f1;color:#1f1d1a}\nmain{max-width:420px;margin:12vh auto;padding:24px;background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);text-align:center}\nh1{font-size:20px;margin:0 0 14px} p{color:#6b6560;line-height:1.5}\nbutton{background:#1f1d1a;color:#fff;border:0;border-radius:8px;padding:13px 22px;font-size:16px;font-weight:600;cursor:pointer}</style>\n</head><body><main>${body}</main></body></html>`;\n\nlet route, html;\nif (!valid) {\n  route = 'deny';\n  html = page('Link not valid', '<h1>This link isn’t valid</h1><p>It may have been changed or cut off. Use the button in the original email.</p>');\n} else if (!isPost) {\n  route = 'confirm';\n  html = page(LABELS[a].ask, `<h1>${LABELS[a].ask}</h1>\n    <form method=\"POST\" action=\"\"><input type=\"hidden\" name=\"a\" value=\"${a}\"><input type=\"hidden\" name=\"l\" value=\"${l}\">\n    <input type=\"hidden\" name=\"t\" value=\"${t}\"><button type=\"submit\">${LABELS[a].go}</button></form>`);\n} else {\n  route = 'apply';\n  html = page('Done', `<h1>Done ✓</h1><p>${LABELS[a].done}</p>`);\n}\nreturn [{ json: { route, html, a, l } }];"
+      }
+    },
+    {
+      "id": "route",
+      "name": "Route",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        460,
+        100
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "Route-apply",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "apply",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "apply"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "Route-confirm",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "confirm",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "confirm"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "Route-deny",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "deny",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "deny"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "apply-action",
+      "name": "Apply Action",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        680,
+        -40
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One statement. Exactly one branch matches $1, so no row is updated twice.\nWITH p AS (\n  UPDATE leads SET ai_paused = true, updated_at = now()\n   WHERE id = $2::int AND $1 = 'pause' RETURNING id\n), r AS (\n  -- Resume hands the lead back: unpause, and an escalated lead re-enters normal flow.\n  UPDATE leads SET ai_paused = false,\n                   status = CASE WHEN status = 'escalated' THEN 'engaged' ELSE status END,\n                   updated_at = now()\n   WHERE id = $2::int AND $1 = 'resume' RETURNING id\n), re AS (\n  UPDATE escalations SET resolved = true\n   WHERE lead_id = $2::int AND $1 = 'resume' AND NOT resolved RETURNING id\n), bl AS (\n  UPDATE booking_links SET owner_confirmed_at = COALESCE(owner_confirmed_at, now())\n   WHERE $1 = 'booked'\n     AND id = (SELECT id FROM booking_links WHERE lead_id = $2::int ORDER BY sent_at DESC LIMIT 1)\n  RETURNING id\n), b AS (\n  UPDATE leads SET status = 'booked', updated_at = now()\n   WHERE id = $2::int AND $1 = 'booked' RETURNING id\n)\nSELECT $1 AS action,\n       (SELECT count(*) FROM p) + (SELECT count(*) FROM r) + (SELECT count(*) FROM b) AS leads_changed;",
+        "options": {
+          "queryReplacement": "={{ [$json.a, $json.l] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "id": "respond-done",
+      "name": "Respond Done",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        900,
+        -40
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $('Verify').first().json.html }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Robots-Tag",
+                "value": "noindex"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "respond-confirm",
+      "name": "Respond Confirm",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        680,
+        100
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Robots-Tag",
+                "value": "noindex"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "respond-denied",
+      "name": "Respond Denied",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        680,
+        240
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseCode": 403,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Robots-Tag",
+                "value": "noindex"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Action Link": {
+      "main": [
+        [
+          {
+            "node": "Verify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Action Confirm": {
+      "main": [
+        [
+          {
+            "node": "Verify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify": {
+      "main": [
+        [
+          {
+            "node": "Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Action": {
+      "main": [
+        [
+          {
+            "node": "Respond Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route": {
+      "main": [
+        [
+          {
+            "node": "Apply Action",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Confirm",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Denied",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

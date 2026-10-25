@@ -95,7 +95,22 @@ def if_true(name, pos, expr, cid):
 LEAD_LABEL_JS = r"""
 const leadLabel = (inb) => inb.name ? String(inb.name)
   : (inb.channel === 'instagram' ? 'An Instagram lead' : `A ${inb.channel} lead`);
+// Signed one-tap owner buttons (Owner Actions workflow). Same signature as its
+// Verify node: first 32 hex of HMAC-SHA256(OWNER_LINK_SECRET, "<action>:<lead id>").
+// No secret on the server -> no buttons, rather than buttons that can't work.
+const ownerButton = (label, action, leadId) => {
+  const secret = String($env.OWNER_LINK_SECRET || '');
+  if (!secret || !leadId) return null;
+  const t = require('crypto').createHmac('sha256', secret).update(`${action}:${leadId}`).digest('hex').slice(0, 32);
+  return { label, url: `https://n8n.looplogicsystems.com/webhook/owner?a=${action}&l=${leadId}&t=${t}` };
+};
 """
+
+# Where the lead's booking link points. The tracked redirect (Link Redirect
+# workflow) records the click, then sends her on to the studio's real page.
+# Switch to "https://go.looplogicsystems.com/" once the Cloudflare Worker for
+# that hostname is live — shorter and cleaner in a DM.
+LINK_BASE = "https://n8n.looplogicsystems.com/webhook/go?c="
 
 # ---------------------------------------------------------------------------
 # 1. Entry + studio resolution (unchanged in spirit since Phase 2a)
@@ -211,12 +226,14 @@ connect("Log Inbound", "AI Paused?")
 code("Email: Paused Lead", [860, 460], LEAD_LABEL_JS + r"""
 const inb = $('When Called').first().json;
 const cfg = $('Resolve Studio').first().json;
+const leadId = $('Upsert Lead').first().json.id;
 return [{ json: {
-  to: cfg.owner_alert_email || 'founders',
+  to: inb.channel === 'test' ? 'delivered@resend.dev' : (cfg.owner_alert_email || 'founders'),
   subject: `${leadLabel(inb)} replied — the AI is paused for her`,
-  heading: `${leadLabel(inb)} sent a new message. The AI did not answer, because you took this conversation over.`,
+  heading: `${leadLabel(inb)} sent a new message. The AI did not answer, because this conversation is with you.`,
   lines: [`Her message: "${String(inb.message || '').slice(0, 500)}"`,
-          `Reply to her in your ${inb.channel === 'instagram' ? 'Instagram DMs' : inb.channel}.`],
+          `Reply to her in your ${inb.channel === 'instagram' ? 'Instagram DMs' : inb.channel}, or tap Resume to hand her back to the AI.`],
+  buttons: [ownerButton('Resume AI', 'resume', leadId)].filter(Boolean),
 } }];
 """)
 connect("AI Paused?", "Email: Paused Lead", out=0)
@@ -404,7 +421,7 @@ connect("OpenAI Chat Model", "AI Agent", kind="ai_languageModel")
 # ---------------------------------------------------------------------------
 # 5. Decide — the CODE decides; the model only suggests.
 # ---------------------------------------------------------------------------
-code("Decide", [1520, 200], LEAD_LABEL_JS + r"""
+code("Decide", [1520, 200], LEAD_LABEL_JS + (r"""
 const crypto = require('crypto');
 const cfg = $('Resolve Studio').first().json;
 const inb = $('When Called').first().json;
@@ -469,8 +486,12 @@ if (intent === 'send_booking_link') {
 }
 
 // --- compose the final message --------------------------------------------
+// The lead gets a tracked short link (Link Redirect records the click, then
+// sends her to `link`). The owner email shows the real destination.
+const shortCode = link ? crypto.randomBytes(6).toString('base64url') : null;
+const trackedLink = shortCode ? `__LINK_BASE__${shortCode}` : null;
 let final;
-if (intent === 'send_booking_link')                     final = `${reply}\n${link}`;
+if (intent === 'send_booking_link')                     final = `${reply}\n${trackedLink}`;
 else if (intent === 'lead_booked' && v.first_visit_tips)
   // Once only: skip if the model already wrote tips despite being told not to.
   final = /grip socks|minutes early|waiver/i.test(reply) ? reply : `${reply}\n\n${v.first_visit_tips}`;
@@ -482,22 +503,27 @@ if (ctx.first_message && v.ai_disclosure) final = `${final}\n\n${v.ai_disclosure
 const who = leadLabel(inb);
 const where = inb.channel === 'instagram' ? 'your Instagram DMs' : inb.channel;
 const theirMsg = `Her message: "${String(inb.message || '').slice(0, 500)}"`;
+const leadId = $('Upsert Lead').first().json.id;
+const btn = (label, action) => ownerButton(label, action, leadId);
 let owner_email = null;
 if (intent === 'send_booking_link') owner_email = {
   subject: `${who} is heading to book${slot ? ' — ' + slot.label : ''}`,
   heading: `${who} wants to book, and was sent your booking link.`,
   lines: [slot ? `Recommended class: ${slot.label}` : 'No specific class was picked yet.',
           `Link sent: ${link}`, theirMsg,
-          'She books herself on your booking page. Look out for a new intro purchase or booking.'] };
+          'She books herself on your booking page. When she shows up in your booking system, tap Mark booked.'],
+  buttons: [btn('Mark booked', 'booked'), btn('Pause AI for her', 'pause')].filter(Boolean) };
 if (intent === 'lead_booked') owner_email = {
   subject: `${who} says she's booked`,
   heading: `${who} says she has booked or bought the pass.`,
-  lines: [theirMsg, 'Please check she shows up in your booking system.'] };
+  lines: [theirMsg, 'Please check she shows up in your booking system, then tap Confirm booked.'],
+  buttons: [btn('Confirm booked', 'booked'), btn('Pause AI for her', 'pause')].filter(Boolean) };
 if (intent === 'escalate') owner_email = {
   subject: `${who} needs you — ${reason || 'a question for you'}`,
   heading: `${who} asked something the AI handed to you.`,
   lines: [`Why: ${reason || 'not specified'}`, theirMsg,
-          `The AI sent her a holding reply and has stepped back for this lead. Reply to her in ${where}.`] };
+          `The AI sent her a holding reply and is now PAUSED for this lead, so it won't answer her again. Reply to her in ${where}. When you're done, tap Resume to hand her back to the AI.`],
+  buttons: [btn('Resume AI', 'resume')].filter(Boolean) };
 if (owner_email) owner_email.to = (reason && reason.startsWith('studio setup incomplete'))
   ? `${cfg.owner_alert_email || 'founders'}, founders` : (cfg.owner_alert_email || 'founders');
 // Voice-lab conversations (channel 'test') must not flood real inboxes:
@@ -507,10 +533,10 @@ if (owner_email && inb.channel === 'test') owner_email.to = 'delivered@resend.de
 return [{ json: {
   intent, reason, final_reply: final, ai_reply: reply,
   slot_id: slot ? slot.id : null, class_id: slot ? slot.class_id : null, slot_label: slot ? slot.label : null,
-  link, link_kind: kind, short_code: link ? crypto.randomBytes(6).toString('base64url') : null,
+  link, link_kind: kind, short_code: shortCode, tracked_link: trackedLink,
   returning_client: returning, owner_email,
 } }];
-""")
+""").replace("__LINK_BASE__", LINK_BASE))
 connect("AI Agent", "Decide")
 
 node("Route by Intent", "n8n-nodes-base.switch", 3.4, [1740, 200], {
@@ -562,7 +588,9 @@ pg("Insert Escalation", [1960, 320], """WITH e AS (
   VALUES ($1, $2, false, now())
   RETURNING id
 )
-UPDATE leads SET status = 'escalated', updated_at = now()
+-- Escalating PAUSES the AI for this lead until the owner taps Resume: the
+-- owner email says it has stepped back, and now it really has.
+UPDATE leads SET status = 'escalated', ai_paused = true, updated_at = now()
  WHERE id = $1
 RETURNING (SELECT id FROM e) AS escalation_id;""",
    replacement=("={{ [$('Upsert Lead').first().json.id, " + f"{DEC}.reason || 'unspecified'] }}}}"),

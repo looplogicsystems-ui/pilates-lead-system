@@ -1,0 +1,226 @@
+{
+  "id": "6Owetg7CkG7wRK2t",
+  "name": "Link Redirect",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000d006",
+  "nodes": [
+    {
+      "id": "lr-hook",
+      "name": "Link Opened",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "d9e3a4f5-6b7c-4d8e-8f9a-1b2c3d4e5f60",
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "go",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "lr-classify",
+      "name": "Classify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst code = String((j.query || {}).c || '');\nconst ua = String((j.headers || {})['user-agent'] || '');\nconst crawler = /facebookexternalhit|facebot|meta-externalagent|meta-externalfetcher|twitterbot|slackbot|linkedinbot|discordbot|telegrambot|whatsapp|googlebot|bingbot|applebot|crawler|spider|\\bbot\\b|preview/i.test(ua)\n  || ua === '';\nreturn [{ json: { code: /^[A-Za-z0-9_-]{4,16}$/.test(code) ? code : '', crawler } }];"
+      }
+    },
+    {
+      "id": "look-up-and-count",
+      "name": "Look Up & Count",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Always exactly one row: target_url is NULL for an unknown code.\nWITH hit AS (\n  UPDATE booking_links\n     SET click_count = click_count + 1,\n         clicked_at  = COALESCE(clicked_at, now())\n   WHERE short_code = $1 AND NOT $2::boolean\n  RETURNING target_url\n)\nSELECT COALESCE((SELECT target_url FROM hit),\n                (SELECT target_url FROM booking_links WHERE short_code = $1)) AS target_url;",
+        "options": {
+          "queryReplacement": "={{ [$json.code, $json.crawler] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "lr-found",
+      "name": "Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "has-target",
+              "leftValue": "={{ $json.target_url }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "redirect",
+      "name": "Redirect",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        880,
+        -80
+      ],
+      "parameters": {
+        "respondWith": "noData",
+        "options": {
+          "responseCode": 302,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/plain"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Robots-Tag",
+                "value": "noindex"
+              },
+              {
+                "name": "Location",
+                "value": "={{ $json.target_url }}"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "not-found",
+      "name": "Not Found",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        880,
+        80
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><title>Link not found</title></head><body style='font-family:-apple-system,Arial,sans-serif;text-align:center;margin-top:20vh'><h1>Link not found</h1><p>This booking link isn't valid any more. Message the studio and they'll send you a new one.</p></body></html>",
+        "options": {
+          "responseCode": 404,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Robots-Tag",
+                "value": "noindex"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Link Opened": {
+      "main": [
+        [
+          {
+            "node": "Classify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify": {
+      "main": [
+        [
+          {
+            "node": "Look Up & Count",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Look Up & Count": {
+      "main": [
+        [
+          {
+            "node": "Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Found?": {
+      "main": [
+        [
+          {
+            "node": "Redirect",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Not Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

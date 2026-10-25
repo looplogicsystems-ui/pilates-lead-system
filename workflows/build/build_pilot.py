@@ -33,6 +33,8 @@ WF_IDS = {
     "ops-test-email": "oh01IIck8xhZWADI",
     "demo-booking-page": "nxW4e7Mbf1dT3lqH",
     "ops-voice-lab":  "EeLbVJcxMU52wHen",
+    "owner-actions":  "C3KkwuJYPyrwGUZS",
+    "link-redirect":  "6Owetg7CkG7wRK2t",
 }
 
 LEAD_BRAIN_ID = "fvHhAUDCbVN9ELb0"
@@ -405,6 +407,226 @@ def ops_voice_lab():
             "nodes": nodes, "connections": conns, "settings": dict(SETTINGS)}
 
 
+def respond(name, pos, body_expr, code=200, ctype="text/html; charset=utf-8", extra_headers=()):
+    headers = [{"name": "Content-Type", "value": ctype}, {"name": "Cache-Control", "value": "no-store"},
+               {"name": "X-Robots-Tag", "value": "noindex"}] + list(extra_headers)
+    params = {"respondWith": "text", "responseBody": body_expr,
+              "options": {"responseCode": code, "responseHeaders": {"entries": headers}}}
+    return {"id": name.lower().replace(" ", "-").replace(":", ""), "name": name,
+            "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.5, "position": pos,
+            "parameters": params}
+
+
+def switch(name, pos, field, keys):
+    return {"id": name.lower().replace(" ", "-"), "name": name, "type": "n8n-nodes-base.switch",
+            "typeVersion": 3.4, "position": pos,
+            "parameters": {"rules": {"values": [
+                {"conditions": {"options": {"caseSensitive": True, "leftValue": "", "typeValidation": "strict",
+                                            "version": 3},
+                                "conditions": [{"id": f"{name}-{k}", "leftValue": f"={{{{ $json.{field} }}}}",
+                                                "rightValue": k,
+                                                "operator": {"type": "string", "operation": "equals"}}],
+                                "combinator": "and"},
+                 "renameOutput": True, "outputKey": k} for k in keys]}, "options": {}}}
+
+
+def pg_node(name, pos, query, replacement, **kw):
+    n = {"id": name.lower().replace(" ", "-").replace("&", "and"), "name": name,
+         "type": "n8n-nodes-base.postgres", "typeVersion": 2.6, "position": pos,
+         "parameters": {"operation": "executeQuery", "query": query.strip(),
+                        "options": {"queryReplacement": replacement}},
+         "credentials": {"postgres": {"id": "POSTGRES_CRED_ID", "name": "Postgres account"}}}
+    n.update(kw)
+    return n
+
+
+# ---------------------------------------------------------------------------
+# Owner Actions — the Pause / Resume / Mark-booked buttons in owner emails.
+#
+#   GET  /webhook/owner?a=<pause|resume|booked>&l=<lead id>&t=<signature>
+#        -> a CONFIRM page with one button. Nothing changes on GET: email
+#           security scanners open every link in a message, and a plain GET
+#           link would pause leads on its own.
+#   POST /webhook/owner   (the confirm button) -> verify again, apply, "Done".
+#
+# t = first 32 hex of HMAC-SHA256(OWNER_LINK_SECRET, "<action>:<lead id>").
+# Lead Brain signs with the same function, so an edited lead id or action is
+# refused (403). The secret is in the mini's .env, never in this repo.
+
+OWNER_VERIFY_JS = r"""
+const crypto = require('crypto');
+const j = $input.first().json;
+const isPost = !!(j.body && j.body.a);
+const src = isPost ? j.body : (j.query || {});
+const a = String(src.a || ''), l = String(src.l || ''), t = String(src.t || '');
+const secret = String($env.OWNER_LINK_SECRET || '');
+
+const LABELS = {
+  pause:  { ask: 'Pause the AI for this lead?', go: 'Yes, pause it',
+            done: 'Paused. The AI won’t reply to this lead until you tap Resume in one of its emails.' },
+  resume: { ask: 'Hand this lead back to the AI?', go: 'Yes, resume',
+            done: 'Resumed. The AI will answer this lead’s next message.' },
+  booked: { ask: 'Mark this lead as booked?', go: 'Yes, she’s booked',
+            done: 'Marked as booked. It will count in your day-30 report.' },
+};
+const sign = (act, lead) => crypto.createHmac('sha256', secret).update(`${act}:${lead}`).digest('hex').slice(0, 32);
+let valid = false;
+if (secret && LABELS[a] && /^\d{1,10}$/.test(l) && /^[0-9a-f]{32}$/.test(t)) {
+  const want = Buffer.from(sign(a, l)), got = Buffer.from(t);
+  valid = want.length === got.length && crypto.timingSafeEqual(want, got);
+}
+
+const page = (title, body) => `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title>
+<style>body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f4f1;color:#1f1d1a}
+main{max-width:420px;margin:12vh auto;padding:24px;background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);text-align:center}
+h1{font-size:20px;margin:0 0 14px} p{color:#6b6560;line-height:1.5}
+button{background:#1f1d1a;color:#fff;border:0;border-radius:8px;padding:13px 22px;font-size:16px;font-weight:600;cursor:pointer}</style>
+</head><body><main>${body}</main></body></html>`;
+
+let route, html;
+if (!valid) {
+  route = 'deny';
+  html = page('Link not valid', '<h1>This link isn’t valid</h1><p>It may have been changed or cut off. Use the button in the original email.</p>');
+} else if (!isPost) {
+  route = 'confirm';
+  html = page(LABELS[a].ask, `<h1>${LABELS[a].ask}</h1>
+    <form method="POST" action=""><input type="hidden" name="a" value="${a}"><input type="hidden" name="l" value="${l}">
+    <input type="hidden" name="t" value="${t}"><button type="submit">${LABELS[a].go}</button></form>`);
+} else {
+  route = 'apply';
+  html = page('Done', `<h1>Done ✓</h1><p>${LABELS[a].done}</p>`);
+}
+return [{ json: { route, html, a, l } }];
+"""
+
+OWNER_APPLY_SQL = """
+-- One statement. Exactly one branch matches $1, so no row is updated twice.
+WITH p AS (
+  UPDATE leads SET ai_paused = true, updated_at = now()
+   WHERE id = $2::int AND $1 = 'pause' RETURNING id
+), r AS (
+  -- Resume hands the lead back: unpause, and an escalated lead re-enters normal flow.
+  UPDATE leads SET ai_paused = false,
+                   status = CASE WHEN status = 'escalated' THEN 'engaged' ELSE status END,
+                   updated_at = now()
+   WHERE id = $2::int AND $1 = 'resume' RETURNING id
+), re AS (
+  UPDATE escalations SET resolved = true
+   WHERE lead_id = $2::int AND $1 = 'resume' AND NOT resolved RETURNING id
+), bl AS (
+  UPDATE booking_links SET owner_confirmed_at = COALESCE(owner_confirmed_at, now())
+   WHERE $1 = 'booked'
+     AND id = (SELECT id FROM booking_links WHERE lead_id = $2::int ORDER BY sent_at DESC LIMIT 1)
+  RETURNING id
+), b AS (
+  UPDATE leads SET status = 'booked', updated_at = now()
+   WHERE id = $2::int AND $1 = 'booked' RETURNING id
+)
+SELECT $1 AS action,
+       (SELECT count(*) FROM p) + (SELECT count(*) FROM r) + (SELECT count(*) FROM b) AS leads_changed;
+"""
+
+
+def owner_actions():
+    nodes = [
+        {"id": "oa-get", "name": "Action Link", "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+         "position": [0, 0], "webhookId": "b7c1e2d3-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+         "parameters": {"httpMethod": "GET", "path": "owner", "responseMode": "responseNode", "options": {}}},
+        {"id": "oa-post", "name": "Action Confirm", "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+         "position": [0, 200], "webhookId": "c8d2f3e4-5a6b-4c7d-9e8f-0a1b2c3d4e5f",
+         "parameters": {"httpMethod": "POST", "path": "owner", "responseMode": "responseNode", "options": {}}},
+        {"id": "oa-verify", "name": "Verify", "type": "n8n-nodes-base.code", "typeVersion": 2,
+         "position": [240, 100], "parameters": {"jsCode": OWNER_VERIFY_JS.strip()}},
+        switch("Route", [460, 100], "route", ["apply", "confirm", "deny"]),
+        pg_node("Apply Action", [680, -40], OWNER_APPLY_SQL, "={{ [$json.a, $json.l] }}"),
+        respond("Respond Done", [900, -40], "={{ $('Verify').first().json.html }}"),
+        respond("Respond Confirm", [680, 100], "={{ $json.html }}"),
+        respond("Respond Denied", [680, 240], "={{ $json.html }}", code=403),
+    ]
+    conns = conn(("Action Link", "Verify"), ("Action Confirm", "Verify"), ("Verify", "Route"),
+                 ("Apply Action", "Respond Done"))
+    conns["Route"] = {"main": [[{"node": "Apply Action", "type": "main", "index": 0}],
+                               [{"node": "Respond Confirm", "type": "main", "index": 0}],
+                               [{"node": "Respond Denied", "type": "main", "index": 0}]]}
+    return {"id": WF_IDS["owner-actions"], "name": "Owner Actions", "active": False,
+            "versionId": "00000000-0000-4000-8000-00000000d005",
+            "nodes": nodes, "connections": conns, "settings": dict(SETTINGS)}
+
+
+# ---------------------------------------------------------------------------
+# Link Redirect — GET /webhook/go?c=<short code>  (go.looplogicsystems.com/<code>
+# forwards here through a Cloudflare Worker). Records a click, then 302s to the
+# studio's real booking page. Unknown code -> plain 404.
+#
+# Preview robots are NOT counted: Instagram builds the link preview by fetching
+# the URL with Meta's crawler, so without this every link would read "clicked"
+# before the lead touched it. NOTE: "Instagram" itself is deliberately NOT in the
+# list — a real person tapping the link inside Instagram's in-app browser sends a
+# user agent containing "Instagram", and excluding it would drop every real click.
+
+CLASSIFY_JS = r"""
+const j = $input.first().json;
+const code = String((j.query || {}).c || '');
+const ua = String((j.headers || {})['user-agent'] || '');
+const crawler = /facebookexternalhit|facebot|meta-externalagent|meta-externalfetcher|twitterbot|slackbot|linkedinbot|discordbot|telegrambot|whatsapp|googlebot|bingbot|applebot|crawler|spider|\bbot\b|preview/i.test(ua)
+  || ua === '';
+return [{ json: { code: /^[A-Za-z0-9_-]{4,16}$/.test(code) ? code : '', crawler } }];
+"""
+
+REDIRECT_SQL = """
+-- Always exactly one row: target_url is NULL for an unknown code.
+WITH hit AS (
+  UPDATE booking_links
+     SET click_count = click_count + 1,
+         clicked_at  = COALESCE(clicked_at, now())
+   WHERE short_code = $1 AND NOT $2::boolean
+  RETURNING target_url
+)
+SELECT COALESCE((SELECT target_url FROM hit),
+                (SELECT target_url FROM booking_links WHERE short_code = $1)) AS target_url;
+"""
+
+NOT_FOUND_HTML = ("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' "
+                  "content='width=device-width, initial-scale=1'><title>Link not found</title></head>"
+                  "<body style='font-family:-apple-system,Arial,sans-serif;text-align:center;margin-top:20vh'>"
+                  "<h1>Link not found</h1><p>This booking link isn't valid any more. Message the studio and "
+                  "they'll send you a new one.</p></body></html>")
+
+
+def link_redirect():
+    nodes = [
+        {"id": "lr-hook", "name": "Link Opened", "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+         "position": [0, 0], "webhookId": "d9e3a4f5-6b7c-4d8e-8f9a-1b2c3d4e5f60",
+         "parameters": {"httpMethod": "GET", "path": "go", "responseMode": "responseNode", "options": {}}},
+        {"id": "lr-classify", "name": "Classify", "type": "n8n-nodes-base.code", "typeVersion": 2,
+         "position": [220, 0], "parameters": {"jsCode": CLASSIFY_JS.strip()}},
+        pg_node("Look Up & Count", [440, 0], REDIRECT_SQL, "={{ [$json.code, $json.crawler] }}",
+                alwaysOutputData=True),
+        {"id": "lr-found", "name": "Found?", "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+         "position": [660, 0],
+         "parameters": {"conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
+                                                   "typeValidation": "loose"},
+                                       "conditions": [{"id": "has-target", "leftValue": "={{ $json.target_url }}",
+                                                       "rightValue": "",
+                                                       "operator": {"type": "string", "operation": "notEmpty",
+                                                                    "singleValue": True}}],
+                                       "combinator": "and"}, "options": {}}},
+        respond("Redirect", [880, -80], "=", code=302, ctype="text/plain",
+                extra_headers=[{"name": "Location", "value": "={{ $json.target_url }}"}]),
+        respond("Not Found", [880, 80], NOT_FOUND_HTML, code=404),
+    ]
+    redirect = nodes[4]
+    redirect["parameters"]["respondWith"] = "noData"     # a 302 carries no body
+    redirect["parameters"].pop("responseBody", None)
+    conns = conn(("Link Opened", "Classify"), ("Classify", "Look Up & Count"), ("Look Up & Count", "Found?"))
+    conns["Found?"] = {"main": [[{"node": "Redirect", "type": "main", "index": 0}],
+                                [{"node": "Not Found", "type": "main", "index": 0}]]}
+    return {"id": WF_IDS["link-redirect"], "name": "Link Redirect", "active": False,
+            "versionId": "00000000-0000-4000-8000-00000000d006",
+            "nodes": nodes, "connections": conns, "settings": dict(SETTINGS)}
+
+
 def main():
     scratch = sys.argv[1]
     os.makedirs(scratch, exist_ok=True)
@@ -418,11 +640,18 @@ def main():
     for wf, filename in [(send_email(), "send-email.json"),
                          (ops_test_email(), "ops-test-email.json"),
                          (demo_booking_page(), "demo-booking-page.json"),
-                         (ops_voice_lab(), "ops-voice-lab.json")]:
+                         (ops_voice_lab(), "ops-voice-lab.json"),
+                         (owner_actions(), "owner-actions.json"),
+                         (link_redirect(), "link-redirect.json")]:
         redacted = json.dumps(wf, indent=2, ensure_ascii=False)
         with open(os.path.join(repo, "workflows", filename), "w") as f:
             f.write(redacted + "\n")
 
+        incoming = {c["node"] for outs in wf["connections"].values() for kind in outs.values()
+                    for out in kind for c in out}
+        orphans = [n["name"] for n in wf["nodes"] if n["name"] not in incoming
+                   and not any(t in n["type"] for t in ("Trigger", "webhook", "manualTrigger"))]
+        assert not orphans, f"{wf['name']}: nodes with nothing feeding them: {orphans}"
         mapping = {**CREDS, **links}
         missing = [p for p, real in mapping.items() if real is None and p in redacted]
         if missing:
