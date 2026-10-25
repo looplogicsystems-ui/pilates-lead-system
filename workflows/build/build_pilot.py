@@ -87,8 +87,10 @@ const out = [];
 for (const item of $input.all()) {
   const j = item.json || {};
 
-  let to = String(j.to || '').trim();
-  if (to === 'founders') to = String($env.FOUNDER_ALERT_EMAILS || '').trim();
+  // "founders" may appear on its own or in a list ("sarah@studio.com, founders").
+  const to = String(j.to || '').split(',').map((a) => a.trim()).filter(Boolean)
+    .flatMap((a) => a === 'founders' ? String($env.FOUNDER_ALERT_EMAILS || '').split(',') : [a])
+    .map((a) => a.trim()).filter(Boolean).join(', ');
   if (!to) throw new Error(`Send Email: no recipient (to="${j.to}")`);
   if (!j.subject) throw new Error('Send Email: no subject');
 
