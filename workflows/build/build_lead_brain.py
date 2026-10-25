@@ -395,8 +395,8 @@ node("AI Agent", "@n8n/n8n-nodes-langchain.agent", 3.1, [1300, 200], {
 connect("Build Context", "AI Agent")
 
 node("OpenAI Chat Model", "@n8n/n8n-nodes-langchain.lmChatOpenAi", 1.3, [1240, 400], {
-    "model": {"__rl": True, "value": "gpt-5.4-mini", "mode": "list",
-              "cachedResultName": "gpt-5.4-mini"},
+    "model": {"__rl": True, "value": "gpt-5.4", "mode": "list",
+              "cachedResultName": "gpt-5.4"},
     "builtInTools": {}, "options": {}},
      credentials={"openAiApi": {"id": "OPENAI_CRED_ID", "name": "OpenAI account"}})
 connect("OpenAI Chat Model", "AI Agent", kind="ai_languageModel")
