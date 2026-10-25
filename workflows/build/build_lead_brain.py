@@ -335,7 +335,8 @@ v.beginner_policy ? `- Beginners: ${v.beginner_policy}` : '',
 `HOW BOOKING WORKS — you never book anything:`,
 `- Recommend ONE specific class from the list that fits what she said, by day, time and name.`,
 `- You do NOT know live availability; the booking page shows the live spots. NEVER say she is booked, in, confirmed, reserved or that a spot is held.`,
-`- When she wants to book — she picks a class, says yes to your suggestion, or asks how to book — use intent "send_booking_link" with that class's slot id. The system adds the booking link to your message itself: NEVER type a link, URL or web address.`,
+`- Use intent "send_booking_link" ONLY once she has already said yes to a class or asked how/where to book. Then the system adds the booking link to your message itself: NEVER type a link, URL or web address.`,
+`- If you are suggesting a class, asking which one suits her, or offering to send the link ("want me to send the link?"), that is intent "continue" — nothing gets attached until she says yes.`,
 v.booking_steps ? `- In that message, tell her the next step in one short line: ${v.booking_steps}` : '',
 `- If she says she has booked, bought the pass or signed up, use intent "lead_booked".`,
 ``,
@@ -420,6 +421,13 @@ if (!ai || !reply) { intent = 'escalate'; reason = reason || 'the AI produced no
 if (!ctx.ready) { intent = 'escalate'; reason = 'studio setup incomplete: ' + ctx.missing.join('; '); }
 
 // --- validate the class it picked -----------------------------------------
+// Safety net: if the model ASKS whether to send the link, it hasn't been agreed
+// yet — attaching it anyway contradicts its own question (seen live 2026-10-25).
+if (intent === 'send_booking_link'
+    && /\b(want|would you like|shall|should|can|do you want)\b[^?]{0,40}\b(send|share|drop|pass)\b[^?]{0,40}\blink\b[^?]*\?/i.test(reply)) {
+  intent = 'continue';
+}
+
 const slot = (ai && ai.slot) ? (ctx.slots || []).find((s) => s.id === String(ai.slot).trim().toUpperCase()) || null : null;
 const returning = !!(ai && ai.returning_client === true);
 
