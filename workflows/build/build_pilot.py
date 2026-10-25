@@ -36,7 +36,7 @@ WF_IDS = {
 # placeholder -> live credential id. None = credential not created on the mini yet;
 # workflows that need it are written redacted but skipped for the live build.
 CREDS = {
-    "RESEND_CRED_ID": None,   # n8n Header Auth: Authorization: Bearer <Resend API key>
+    "RESEND_CRED_ID": "VAp4NUeGTiCv51IF",   # n8n Header Auth: Authorization: Bearer <Resend API key>
 }
 
 ERROR_HANDLER_ID = "4L4K72aSSwiBcnjX"
