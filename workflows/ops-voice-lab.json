@@ -1,0 +1,209 @@
+{
+  "id": "EeLbVJcxMU52wHen",
+  "name": "Ops: Voice Lab",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000d004",
+  "nodes": [
+    {
+      "id": "vl-hook",
+      "name": "Voice Lab Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "8a1f2c3d-4e5b-46a7-9c8d-0e1f2a3b4c5d",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ops/voice-lab",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "vl-gate",
+      "name": "Check Token",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst h = $input.first().json;\nconst token = String((h.headers || {})['x-voice-lab-token'] || '');\nconst digest = crypto.createHash('sha256').update(token).digest('hex');\nconst expected = '124df4a67bfe4d1d2a19b855935999c32f3e09109213981958ce165f7dd33a2b';\nconst ok = token.length > 20 && digest.length === expected.length\n  && crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(expected));\nconst b = h.body || {};\nif (!ok || !b.lead || !b.message) return [{ json: { allowed: false } }];\nreturn [{ json: { allowed: true, inbound: {\n  channel: 'test', account_ref: 'voice-lab',\n  external_id: 'lab-' + String(b.lead).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40),\n  name: b.name || null, message: String(b.message).slice(0, 2000),\n  provider_message_id: 'lab-' + crypto.randomBytes(8).toString('hex'),\n  received_at: new Date().toISOString(),\n} } }];"
+      }
+    },
+    {
+      "id": "vl-if",
+      "name": "Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "ok",
+              "leftValue": "={{ $json.allowed }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "vl-in",
+      "name": "Inbound",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        -100
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: $input.first().json.inbound }];"
+      }
+    },
+    {
+      "id": "vl-brain",
+      "name": "Lead Brain",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        880,
+        -100
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "fvHhAUDCbVN9ELb0"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "vl-ok",
+      "name": "Respond Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1100,
+        -100
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "vl-no",
+      "name": "Respond Forbidden",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        660,
+        120
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "options": {
+          "responseCode": 403
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Voice Lab Request": {
+      "main": [
+        [
+          {
+            "node": "Check Token",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Token": {
+      "main": [
+        [
+          {
+            "node": "Allowed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Inbound": {
+      "main": [
+        [
+          {
+            "node": "Lead Brain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead Brain": {
+      "main": [
+        [
+          {
+            "node": "Respond Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed?": {
+      "main": [
+        [
+          {
+            "node": "Inbound",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Forbidden",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

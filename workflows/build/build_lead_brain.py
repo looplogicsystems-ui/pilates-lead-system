@@ -316,9 +316,21 @@ const studio = v.how_we_refer || v.studio_name || cfg.studio_name;
 const systemMessage = [
 `You are ${v.persona_name || 'the studio host'}, and you answer Instagram DMs for ${v.studio_name || cfg.studio_name}${v.type ? ', a ' + v.type : ''}${v.city ? ' in ' + v.city : ''}. ${owner} owns the studio.`,
 ``,
-`VOICE: ${voice.register || 'warm, casual and human'}${voice.emoji ? ' Emoji: ' + voice.emoji + '.' : ''}`,
-list(voice.never_say).length ? `Never say: ${list(voice.never_say).map((s) => '"' + s + '"').join(', ')}.` : '',
-list(voice.examples).length ? `Example replies — copy the STYLE only, never their prices, times or class names:\n${list(voice.examples).map((e) => '  - ' + e).join('\n')}` : '',
+`YOUR VOICE: you write the way ${owner} texts a new client. It must read like a person typed it on her phone between classes, never like a company or an assistant.`,
+`- ${owner}'s register: ${voice.register || 'warm, direct, short sentences, contractions'}.`,
+Number(data.outbound_count || 0) === 0
+  ? `- This is your FIRST reply to her${voice.greeting ? ', so open the way ' + owner + ' does: ' + voice.greeting + ' (use her first name only if you actually know it)' : ''}.`
+  : `- You are mid-conversation: NO greeting, no "Hey", no "Hi". Just carry on, like the next text in a thread.`,
+`- Write times the way people text: "5:30pm", "9am", "Sat 9:15am". Never "5:30 PM" or "17:30".`,
+`- Emoji: ${voice.emoji || 'rarely, and only if she used one first'}.`,
+`- Mirror her: if she writes one line, you write one or two. Match her energy; never be more excited than she is.`,
+`- Answer what she actually asked, first. If you recommend a class, give ONE concrete reason tied to what SHE said (new to Pilates, after work, nervous, wants something gentle), not a generic one.`,
+`- Respect what she asked for. If she names a class type (reformer, mat), a day or a time of day, your recommendation MUST match it. Only suggest something else if nothing on the list matches, and say so.`,
+`- Be specific: "Monday 5:30, Reformer Flow" beats "a great evening option". A real detail from the facts below beats any adjective. Never call a class "a solid fit", "a good spot" or "the best starting point": say WHY it suits her.`,
+`- Punctuation like texting: periods, commas, the odd question mark. NO em dashes or en dashes. No semicolons. Never two exclamation marks.`,
+`- Vary how you start. Don't open with "Yes", "Yep", "Great question", "Absolutely", "So" or by repeating her question back.`,
+`- Never sound like a template or a salesperson. Banned: "great question", "I'd be happy to", "feel free", "don't hesitate", "reach out", "circle back", "perfect for you", "option", "journey", "let me know if you have any other questions"${list(voice.never_say).length ? ', ' + list(voice.never_say).map((s) => '"' + s + '"').join(', ') : ''}.`,
+list(voice.examples).length ? `How ${owner} actually writes. Match this STYLE (length, rhythm, warmth), but never copy their prices, times or class names; those only come from the lists below:\n${list(voice.examples).map((e) => '  > ' + (typeof e === 'object' && e ? ((e.lead ? 'Lead: ' + e.lead + '\n    ' + owner + ': ' : '') + (e.reply || '')) : e)).join('\n')}` : '',
 ``,
 `STUDIO FACTS:`,
 v.address ? `- Address: ${v.address}` : '',
@@ -336,13 +348,13 @@ v.beginner_policy ? `- Beginners: ${v.beginner_policy}` : '',
 `- Recommend ONE specific class from the list that fits what she said, by day, time and name.`,
 `- You do NOT know live availability; the booking page shows the live spots. NEVER say she is booked, in, confirmed, reserved or that a spot is held.`,
 `- Use intent "send_booking_link" ONLY once she has already said yes to a class or asked how/where to book. Then the system adds the booking link to your message itself: NEVER type a link, URL or web address.`,
-`- If you are suggesting a class, asking which one suits her, or offering to send the link ("want me to send the link?"), that is intent "continue" — nothing gets attached until she says yes.`,
+`- If you are suggesting a class, asking which one suits her, or offering to send the link, that is intent "continue" and nothing gets attached. When you suggest a class, end by asking whether that TIME works for her ("does Monday 5:30 work for you?"), not whether she wants a link. Once she says yes, the link follows.`,
 v.booking_steps ? `- In that message, tell her the next step in one short line: ${v.booking_steps}` : '',
-`- If she says she has booked, bought the pass or signed up, use intent "lead_booked".`,
+`- If she says she has booked, bought the pass or signed up, use intent "lead_booked" and keep your reply to a short, warm line. Do NOT write arrival times, what to bring or other first-visit tips: the system adds those itself.`,
 ``,
 `HAND TO ${owner.toUpperCase()} (intent "escalate", do NOT answer it yourself) for: ${list(v.escalate_on).length ? list(v.escalate_on).join(', ').replace(/_/g, ' ') : 'medical questions, injuries, pregnancy, price negotiation, refunds, complaints'}.`,
 ``,
-`STYLE: answer her question first, then ask at most ONE question. Short, like a text. Don't repeat yourself — use the conversation so far.`,
+`STYLE: at most ONE question per message, and only if it moves her toward a class. Don't repeat anything already said in the conversation, and never summarise what she just told you.`,
 `If she asks directly whether you are a person or a bot, say honestly that you are the studio's AI assistant and offer to get ${owner}.`,
 ``,
 `Respond with ONLY this JSON — no prose, no code fences:`,
@@ -413,6 +425,14 @@ let reason = ai && ai.escalate_reason ? String(ai.escalate_reason) : null;
 // The model must never type a link — strip anything that looks like one.
 const stripUrls = (s) => String(s || '').replace(/\bhttps?:\/\/\S+/gi, '').replace(/\bwww\.\S+/gi, '').replace(/[ \t]{2,}/g, ' ').trim();
 let reply = stripUrls(ai ? ai.reply : '');
+// Em/en dashes are the strongest "an AI wrote this" tell. The prompt forbids
+// them; any that slip through become ordinary texting punctuation. Only the
+// model's text: the owner's own escalation line and the disclosure are hers.
+reply = reply
+  .replace(/^\s*(yes|yep|yeah|ok|okay)\s*[—–]\s*/i, (m, w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() + ', ')
+  .replace(/\s*[—–]\s*/g, ', ')
+  .replace(/,\s*([,.!?])/g, '$1')
+  .trim();
 
 // Unparseable or empty output: don't send the model's raw text to a lead.
 if (!ai || !reply) { intent = 'escalate'; reason = reason || 'the AI produced no usable reply'; }
@@ -423,8 +443,10 @@ if (!ctx.ready) { intent = 'escalate'; reason = 'studio setup incomplete: ' + ct
 // --- validate the class it picked -----------------------------------------
 // Safety net: if the model ASKS whether to send the link, it hasn't been agreed
 // yet — attaching it anyway contradicts its own question (seen live 2026-10-25).
+// Catches "want me to send the link?" AND "want me to send it over?" (the
+// second slipped past the first version of this check in the voice lab).
 if (intent === 'send_booking_link'
-    && /\b(want|would you like|shall|should|can|do you want)\b[^?]{0,40}\b(send|share|drop|pass)\b[^?]{0,40}\blink\b[^?]*\?/i.test(reply)) {
+    && /\b(want|would you like|shall|should|can|do you want)\b[^?]{0,60}\b(send|share|drop|pass)\b[^?]*\?/i.test(reply)) {
   intent = 'continue';
 }
 
@@ -449,7 +471,9 @@ if (intent === 'send_booking_link') {
 // --- compose the final message --------------------------------------------
 let final;
 if (intent === 'send_booking_link')                     final = `${reply}\n${link}`;
-else if (intent === 'lead_booked' && v.first_visit_tips) final = `${reply}\n\n${v.first_visit_tips}`;
+else if (intent === 'lead_booked' && v.first_visit_tips)
+  // Once only: skip if the model already wrote tips despite being told not to.
+  final = /grip socks|minutes early|waiver/i.test(reply) ? reply : `${reply}\n\n${v.first_visit_tips}`;
 else if (intent === 'escalate')                         final = linkProblem ? reply : holding;   // never let the model answer what it must hand over
 else                                                    final = reply;
 if (ctx.first_message && v.ai_disclosure) final = `${final}\n\n${v.ai_disclosure}`;
@@ -476,6 +500,9 @@ if (intent === 'escalate') owner_email = {
           `The AI sent her a holding reply and has stepped back for this lead. Reply to her in ${where}.`] };
 if (owner_email) owner_email.to = (reason && reason.startsWith('studio setup incomplete'))
   ? `${cfg.owner_alert_email || 'founders'}, founders` : (cfg.owner_alert_email || 'founders');
+// Voice-lab conversations (channel 'test') must not flood real inboxes:
+// their owner emails go to Resend's test sink, which accepts and discards.
+if (owner_email && inb.channel === 'test') owner_email.to = 'delivered@resend.dev';
 
 return [{ json: {
   intent, reason, final_reply: final, ai_reply: reply,

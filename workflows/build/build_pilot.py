@@ -32,13 +32,19 @@ WF_IDS = {
     "send-email":     "PQWBdER3x291uWeU",
     "ops-test-email": "oh01IIck8xhZWADI",
     "demo-booking-page": "nxW4e7Mbf1dT3lqH",
+    "ops-voice-lab":  "EeLbVJcxMU52wHen",
 }
+
+LEAD_BRAIN_ID = "fvHhAUDCbVN9ELb0"
+# sha256 of the voice-lab token. The token itself lives only in
+# ~/.config/looplogic/voicelab.token on the build machine (mode 600).
+VOICE_LAB_TOKEN_SHA256 = "124df4a67bfe4d1d2a19b855935999c32f3e09109213981958ce165f7dd33a2b"
 
 # placeholder -> live credential id. None = credential not created on the mini yet;
 # workflows that need it are written redacted but skipped for the live build.
 CREDS = {
-    "RESEND_CRED_ID": "VAp4NUeGTiCv51IF",
-    "POSTGRES_CRED_ID": "VVIxtEmT1GWsEZn9",   # n8n Header Auth: Authorization: Bearer <Resend API key>
+    "RESEND_CRED_ID": "VAp4NUeGTiCv51IF",     # n8n Header Auth: Authorization: Bearer <Resend API key>
+    "POSTGRES_CRED_ID": "VVIxtEmT1GWsEZn9",
 }
 
 ERROR_HANDLER_ID = "4L4K72aSSwiBcnjX"
@@ -330,6 +336,75 @@ def demo_booking_page():
             "settings": dict(SETTINGS)}
 
 
+# ---------------------------------------------------------------------------
+# Ops: Voice Lab — POST /webhook/ops/voice-lab   (header X-Voice-Lab-Token)
+#
+# Runs a message through the REAL Lead Brain as a lead on the 'test' channel
+# (channel_accounts: test / voice-lab -> the demo studio) and returns its
+# result, so the AI's voice can be tuned over whole conversations without
+# anyone sending DMs. Owner emails for 'test' leads go to Resend's sink
+# (Lead Brain Decide). Locked by a token whose sha256 is the only thing here.
+
+VOICE_LAB_GATE_JS = r"""
+const crypto = require('crypto');
+const h = $input.first().json;
+const token = String((h.headers || {})['x-voice-lab-token'] || '');
+const digest = crypto.createHash('sha256').update(token).digest('hex');
+const expected = '__TOKEN_SHA256__';
+const ok = token.length > 20 && digest.length === expected.length
+  && crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(expected));
+const b = h.body || {};
+if (!ok || !b.lead || !b.message) return [{ json: { allowed: false } }];
+return [{ json: { allowed: true, inbound: {
+  channel: 'test', account_ref: 'voice-lab',
+  external_id: 'lab-' + String(b.lead).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40),
+  name: b.name || null, message: String(b.message).slice(0, 2000),
+  provider_message_id: 'lab-' + crypto.randomBytes(8).toString('hex'),
+  received_at: new Date().toISOString(),
+} } }];
+"""
+
+
+def ops_voice_lab():
+    nodes = [
+        {"id": "vl-hook", "name": "Voice Lab Request", "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+         "position": [0, 0], "webhookId": "8a1f2c3d-4e5b-46a7-9c8d-0e1f2a3b4c5d",
+         "parameters": {"httpMethod": "POST", "path": "ops/voice-lab", "responseMode": "responseNode",
+                        "options": {}}},
+        {"id": "vl-gate", "name": "Check Token", "type": "n8n-nodes-base.code", "typeVersion": 2,
+         "position": [220, 0],
+         "parameters": {"jsCode": VOICE_LAB_GATE_JS.strip().replace("__TOKEN_SHA256__", VOICE_LAB_TOKEN_SHA256)}},
+        {"id": "vl-if", "name": "Allowed?", "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+         "position": [440, 0],
+         "parameters": {"conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
+                                                   "typeValidation": "loose"},
+                                       "conditions": [{"id": "ok", "leftValue": "={{ $json.allowed }}",
+                                                       "rightValue": "true",
+                                                       "operator": {"type": "boolean", "operation": "true",
+                                                                    "singleValue": True}}],
+                                       "combinator": "and"}, "options": {}}},
+        {"id": "vl-in", "name": "Inbound", "type": "n8n-nodes-base.code", "typeVersion": 2,
+         "position": [660, -100], "parameters": {"jsCode": "return [{ json: $input.first().json.inbound }];"}},
+        {"id": "vl-brain", "name": "Lead Brain", "type": "n8n-nodes-base.executeWorkflow", "typeVersion": 1.2,
+         "position": [880, -100],
+         "parameters": {"workflowId": {"__rl": True, "mode": "id", "value": LEAD_BRAIN_ID},
+                        "options": {"waitForSubWorkflow": True}}},
+        {"id": "vl-ok", "name": "Respond Result", "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.5,
+         "position": [1100, -100],
+         "parameters": {"respondWith": "json", "responseBody": "={{ JSON.stringify($json) }}", "options": {}}},
+        {"id": "vl-no", "name": "Respond Forbidden", "type": "n8n-nodes-base.respondToWebhook", "typeVersion": 1.5,
+         "position": [660, 120],
+         "parameters": {"respondWith": "text", "responseBody": "Forbidden", "options": {"responseCode": 403}}},
+    ]
+    conns = conn(("Voice Lab Request", "Check Token"), ("Check Token", "Allowed?"),
+                 ("Inbound", "Lead Brain"), ("Lead Brain", "Respond Result"))
+    conns["Allowed?"] = {"main": [[{"node": "Inbound", "type": "main", "index": 0}],
+                                  [{"node": "Respond Forbidden", "type": "main", "index": 0}]]}
+    return {"id": WF_IDS["ops-voice-lab"], "name": "Ops: Voice Lab", "active": False,
+            "versionId": "00000000-0000-4000-8000-00000000d004",
+            "nodes": nodes, "connections": conns, "settings": dict(SETTINGS)}
+
+
 def main():
     scratch = sys.argv[1]
     os.makedirs(scratch, exist_ok=True)
@@ -342,7 +417,8 @@ def main():
 
     for wf, filename in [(send_email(), "send-email.json"),
                          (ops_test_email(), "ops-test-email.json"),
-                         (demo_booking_page(), "demo-booking-page.json")]:
+                         (demo_booking_page(), "demo-booking-page.json"),
+                         (ops_voice_lab(), "ops-voice-lab.json")]:
         redacted = json.dumps(wf, indent=2, ensure_ascii=False)
         with open(os.path.join(repo, "workflows", filename), "w") as f:
             f.write(redacted + "\n")
