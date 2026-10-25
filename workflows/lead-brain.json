@@ -28,7 +28,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Route the message to its studio. `account_ref` is the account the lead\n-- messaged (IG entry.id / Slack channel id), NOT the lead's own id.\n--\n-- LEFT JOINs from a one-row source so this ALWAYS returns exactly one row:\n-- an unmatched account comes back with studio_id NULL rather than an empty\n-- result set. An inner join returned zero rows, which meant the node emitted\n-- no item at all and every downstream node — including the dead-letter branch\n-- that is supposed to catch exactly this case — was silently skipped.\nSELECT (s.id IS NOT NULL) AS studio_found,   -- explicit: see note below\n       s.id  AS studio_id,\n       s.name AS studio_name,\n       s.timezone,\n       s.class_capacity,\n       s.booking_duration_minutes,\n       s.gcal_schedule_id,\n       s.gcal_booking_id,\n       s.slack_lead_channel_id,\n       s.slack_owner_channel_id,\n       s.prompt_vars,\n       s.offers,\n       ca.credential_ref\n  FROM (SELECT 1) AS anchor\n  LEFT JOIN channel_accounts ca\n         ON ca.channel = $1 AND ca.account_ref = $2 AND ca.active\n  LEFT JOIN studios s\n         ON s.id = ca.studio_id AND s.active\n LIMIT 1;",
+        "query": "-- Route the message to its studio. `account_ref` is the account the lead\n-- messaged (IG entry.id / Slack channel id), NOT the lead's own id.\n--\n-- LEFT JOINs from a one-row source so this ALWAYS returns exactly one row:\n-- an unmatched account comes back with studio_found = false rather than an\n-- empty result set (zero rows skipped every downstream node, including the\n-- dead-letter branch built to catch exactly this case).\nSELECT (s.id IS NOT NULL) AS studio_found,\n       s.id  AS studio_id,\n       s.name AS studio_name,\n       s.timezone,\n       s.prompt_vars,\n       s.booking_url,\n       s.owner_name,\n       s.owner_alert_email,\n       s.links_ok,\n       ca.credential_ref\n  FROM (SELECT 1) AS anchor\n  LEFT JOIN channel_accounts ca\n         ON ca.channel = $1 AND ca.account_ref = $2 AND ca.active\n  LEFT JOIN studios s\n         ON s.id = ca.studio_id AND s.active\n LIMIT 1;",
         "options": {
           "queryReplacement": "={{ [$json.channel, $json.account_ref] }}"
         }
@@ -83,7 +83,7 @@
       "typeVersion": 2.6,
       "position": [
         200,
-        480
+        520
       ],
       "parameters": {
         "operation": "executeQuery",
@@ -99,35 +99,43 @@
         }
       },
       "onError": "continueRegularOutput",
-      "retryOnFail": true
+      "retryOnFail": true,
+      "alwaysOutputData": true
     },
     {
-      "id": "alert-ops-unknown-account",
-      "name": "Alert Ops: Unknown Account",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 2.3,
+      "id": "email-unknown-account",
+      "name": "Email: Unknown Account",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
         420,
-        480
+        520
       ],
       "parameters": {
-        "select": "channel",
-        "channelId": {
+        "jsCode": "const inb = $('When Called').first().json;\nreturn [{ json: {\n  to: 'founders',\n  subject: 'Unrecognised account — a message was dropped',\n  heading: 'A message arrived on an account no studio is connected to.',\n  lines: [\n    `Channel: ${inb.channel}`,\n    `Account it was sent to: ${inb.account_ref}`,\n    `Message: \"${String(inb.message || '').slice(0, 300)}\"`,\n    'Nothing was sent back and no studio was guessed. It is saved in dead_letters. ' +\n    'If this account belongs to a studio, add a channel_accounts row for it.',\n  ],\n} }];"
+      }
+    },
+    {
+      "id": "send-unknown-account",
+      "name": "Send: Unknown Account",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        640,
+        520
+      ],
+      "parameters": {
+        "workflowId": {
           "__rl": true,
-          "value": "={{ $env.OPS_SLACK_CHANNEL_ID }}",
-          "mode": "id"
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
         },
-        "text": "=:no_entry: *Unrecognised account* — message dropped, no studio matched.\nChannel: {{ $('When Called').first().json.channel }}\nAccount ref: {{ $('When Called').first().json.account_ref }}\nFrom: {{ $('When Called').first().json.external_id }}\nDead-lettered. Add a `channel_accounts` row to route this account.",
-        "otherOptions": {}
-      },
-      "credentials": {
-        "slackApi": {
-          "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Owner Alerts Bot (Slack)"
+        "options": {
+          "waitForSubWorkflow": true
         }
       },
       "onError": "continueRegularOutput",
-      "retryOnFail": true
+      "alwaysOutputData": true
     },
     {
       "id": "return-unknown-account",
@@ -135,8 +143,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        640,
-        480
+        860,
+        520
       ],
       "parameters": {
         "assignments": {
@@ -187,9 +195,9 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Idempotent per (channel, external_id). The status CASE is the lifecycle:\n--   cold/new  -> engaged   (a returning lead re-enters the funnel; previously\n--                           a cold lead was stuck cold forever)\n--   escalated -> escalated (stays with the human until they resolve it)\n--   booked    -> booked    (already converted; must not re-enter nudging)\n-- and nothing moves at all while ai_paused is set.\nINSERT INTO leads (external_id, channel, name, studio_id, status, source_offer, created_at, updated_at)\nVALUES ($1, $2, $3, $4, 'engaged', $5, now(), now())\nON CONFLICT (channel, external_id) DO UPDATE SET\n    name         = COALESCE(EXCLUDED.name, leads.name),\n    source_offer = COALESCE(leads.source_offer, EXCLUDED.source_offer),\n    status       = CASE\n                     WHEN leads.ai_paused              THEN leads.status\n                     WHEN leads.status IN ('cold','new') THEN 'engaged'\n                     ELSE leads.status\n                   END,\n    updated_at   = now()\nRETURNING id, status, ai_paused;",
+        "query": "-- Idempotent per (channel, external_id). The status CASE is the lifecycle:\n--   cold/new  -> engaged   (a returning lead re-enters the funnel)\n--   escalated -> escalated (stays with the human until they resolve it)\n--   booked / link_sent     (kept: the conversation continues, the state stands)\n-- and nothing moves at all while ai_paused is set.\nINSERT INTO leads (external_id, channel, name, studio_id, status, created_at, updated_at)\nVALUES ($1, $2, $3, $4, 'engaged', now(), now())\nON CONFLICT (channel, external_id) DO UPDATE SET\n    name       = COALESCE(EXCLUDED.name, leads.name),\n    status     = CASE\n                   WHEN leads.ai_paused                THEN leads.status\n                   WHEN leads.status IN ('cold','new') THEN 'engaged'\n                   ELSE leads.status\n                 END,\n    updated_at = now()\nRETURNING id, status, ai_paused;",
         "options": {
-          "queryReplacement": "={{ [$('When Called').first().json.external_id, $('When Called').first().json.channel, $('When Called').first().json.name, $('Resolve Studio').first().json.studio_id, $('Resolve Studio').first().json.offers] }}"
+          "queryReplacement": "={{ [$('When Called').first().json.external_id, $('When Called').first().json.channel, $('When Called').first().json.name, $('Resolve Studio').first().json.studio_id] }}"
         }
       },
       "credentials": {
@@ -211,7 +219,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO messages (lead_id, direction, channel, body, created_at)\nVALUES ($1, 'inbound', $2, $3, now());",
+        "query": "INSERT INTO messages (lead_id, direction, channel, body, author, created_at)\nVALUES ($1, 'inbound', $2, $3, 'lead', now());",
         "options": {
           "queryReplacement": "={{ [$json.id, $('When Called').first().json.channel, $('When Called').first().json.message] }}"
         }
@@ -261,32 +269,39 @@
       }
     },
     {
-      "id": "notify-owner-paused-lead",
-      "name": "Notify Owner: Paused Lead",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 2.3,
+      "id": "email-paused-lead",
+      "name": "Email: Paused Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
         860,
-        440
+        460
       ],
       "parameters": {
-        "select": "channel",
-        "channelId": {
+        "jsCode": "const leadLabel = (inb) => inb.name ? String(inb.name)\n  : (inb.channel === 'instagram' ? 'An Instagram lead' : `A ${inb.channel} lead`);\n\nconst inb = $('When Called').first().json;\nconst cfg = $('Resolve Studio').first().json;\nreturn [{ json: {\n  to: cfg.owner_alert_email || 'founders',\n  subject: `${leadLabel(inb)} replied — the AI is paused for her`,\n  heading: `${leadLabel(inb)} sent a new message. The AI did not answer, because you took this conversation over.`,\n  lines: [`Her message: \"${String(inb.message || '').slice(0, 500)}\"`,\n          `Reply to her in your ${inb.channel === 'instagram' ? 'Instagram DMs' : inb.channel}.`],\n} }];"
+      }
+    },
+    {
+      "id": "send-paused-lead",
+      "name": "Send: Paused Lead",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1080,
+        460
+      ],
+      "parameters": {
+        "workflowId": {
           "__rl": true,
-          "value": "={{ $('Resolve Studio').first().json.slack_owner_channel_id }}",
-          "mode": "id"
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
         },
-        "text": "=:raising_hand: *Lead you took over just replied* — AI is paused, so nothing was sent.\nLead: {{ $('When Called').first().json.external_id }} ({{ $('When Called').first().json.channel }})\nThey said: \"{{ $('When Called').first().json.message }}\"",
-        "otherOptions": {}
-      },
-      "credentials": {
-        "slackApi": {
-          "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Owner Alerts Bot (Slack)"
+        "options": {
+          "waitForSubWorkflow": true
         }
       },
       "onError": "continueRegularOutput",
-      "retryOnFail": true
+      "alwaysOutputData": true
     },
     {
       "id": "return-paused",
@@ -294,8 +309,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1080,
-        440
+        1300,
+        460
       ],
       "parameters": {
         "assignments": {
@@ -348,41 +363,33 @@
       }
     },
     {
-      "id": "get-schedule",
-      "name": "Get Schedule",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.3,
+      "id": "load-studio-data",
+      "name": "Load Studio Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
       "position": [
         860,
         200
       ],
       "parameters": {
-        "operation": "getAll",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $('Resolve Studio').first().json.gcal_schedule_id }}",
-          "mode": "id"
-        },
-        "returnAll": true,
+        "operation": "executeQuery",
+        "query": "-- Always exactly one row (scalar subqueries), even for a brand-new studio.\nSELECT\n  (SELECT json_agg(json_build_object('id', c.id, 'name', c.name, 'weekday', c.weekday,\n                                     'time', to_char(c.start_local, 'HH24:MI'),\n                                     'minutes', c.duration_minutes, 'level', c.level,\n                                     'url', c.booking_url)\n                   ORDER BY c.weekday, c.start_local)\n     FROM studio_classes c WHERE c.studio_id = $1 AND c.active)                AS classes,\n  (SELECT json_agg(json_build_object('id', o.id, 'kind', o.kind, 'name', o.name, 'price', o.price,\n                                     'currency', o.currency, 'details', o.details, 'url', o.url,\n                                     'for_new_clients', o.for_new_clients)\n                   ORDER BY o.sort_order, o.id)\n     FROM studio_offers o WHERE o.studio_id = $1 AND o.active)                  AS offers,\n  -- The real conversation (staff replies included once auto-pause logs them),\n  -- replacing n8n's separate chat memory. Newest 20, returned oldest-first.\n  (SELECT json_agg(t ORDER BY t.created_at)\n     FROM (SELECT direction, author, body, created_at FROM messages\n            WHERE lead_id = $2 ORDER BY created_at DESC LIMIT 20) t)            AS thread,\n  (SELECT count(*) FROM messages WHERE lead_id = $2 AND direction = 'outbound') AS outbound_count;",
         "options": {
-          "timeMin": "={{ $now.setZone($('Resolve Studio').first().json.timezone).toISO() }}",
-          "timeMax": "={{ $now.setZone($('Resolve Studio').first().json.timezone).plus({ days: 14 }).toISO() }}",
-          "recurringEventHandling": "expand"
+          "queryReplacement": "={{ [$('Resolve Studio').first().json.studio_id, $('Upsert Lead').first().json.id] }}"
         }
       },
       "credentials": {
-        "googleCalendarOAuth2Api": {
-          "id": "GOOGLE_CAL_CRED_ID",
-          "name": "Google Calendar account"
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
         }
       },
-      "onError": "continueRegularOutput",
       "alwaysOutputData": true,
       "retryOnFail": true
     },
     {
-      "id": "format-schedule",
-      "name": "Format Schedule",
+      "id": "build-context",
+      "name": "Build Context",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -390,20 +397,7 @@
         200
       ],
       "parameters": {
-        "jsCode": "\n// Turn raw calendar events into the seats-left list the agent is allowed to\n// offer from. Capacity and timezone come from studio config, not constants.\nconst cfg = $('Resolve Studio').first().json;\nconst CAP  = Number(cfg.class_capacity) || 8;\nconst ZONE = cfg.timezone || 'UTC';\n\n// A 'Trial:' booking counts against the class it belongs to. Matching on exact\n// start-timestamp equality meant a 09:05 booking never decremented the 09:00\n// class, so classes looked emptier than they were. Match within a window.\nconst TOLERANCE_MS = 15 * 60 * 1000;\n\nconst now = Date.now();\nconst classes = [];\nconst trials  = [];\n\nfor (const it of $input.all()) {\n  const j = it.json || {};\n  const s = j.start && (j.start.dateTime || j.start.date);\n  if (!s) continue;\n  const t = new Date(s).getTime();\n  if (!Number.isFinite(t)) continue;\n  if (t < now) continue;                       // never offer a class in the past\n  const summary = String(j.summary || '').trim();\n  if (/^trial/i.test(summary)) trials.push(t);\n  else classes.push({ summary, start: s, t, id: j.id });\n}\n\n// De-duplicate: Get Schedule can return the same event more than once.\nconst seen = new Set();\nconst unique = classes.filter((c) => {\n  const k = c.id || (c.summary + '@' + c.t);\n  if (seen.has(k)) return false;\n  seen.add(k);\n  return true;\n});\n\nconst seatsLeft = (c) => {\n  const taken = trials.filter((t) => Math.abs(t - c.t) <= TOLERANCE_MS).length;\n  return Math.max(CAP - taken, 0);\n};\n\nconst fmt = (iso) => DateTime.fromISO(iso, { zone: ZONE }).toFormat('cccc dd LLL, h:mm a');\n\nconst lines = unique\n  .sort((a, b) => a.t - b.t)\n  .map((c) => {\n    const left = seatsLeft(c);\n    return '- ' + c.summary + ' — ' + fmt(c.start) + ' — ' + (left > 0 ? left + ' seats left' : 'FULL');\n  });\n\nreturn [{ json: {\n  scheduleText: lines.length ? lines.join('\\n') : '(no upcoming classes on the schedule right now)',\n  classCount: unique.length,\n} }];\n"
-      }
-    },
-    {
-      "id": "build-agent-prompt",
-      "name": "Build Agent Prompt",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1300,
-        200
-      ],
-      "parameters": {
-        "jsCode": "\n// Everything the persona says about itself now comes from studios.prompt_vars.\n// Previously the studio name, city, offer and class list were string literals\n// inside the system message, so a second studio meant a second workflow.\nconst cfg = $('Resolve Studio').first().json;\nconst inb = $('When Called').first().json;\nconst v   = (typeof cfg.prompt_vars === 'string')\n              ? JSON.parse(cfg.prompt_vars) : (cfg.prompt_vars || {});\n\nconst ZONE = cfg.timezone || 'UTC';\nconst tzLabel = v.timezone_label || ZONE;\nconst nowLocal = DateTime.now().setZone(ZONE).toFormat('cccc yyyy-MM-dd HH:mm');\n\nconst systemMessage = [\n`You are ${v.persona_name || 'the studio host'}, ${v.persona_role || 'the owner'} of ${v.studio_name || cfg.studio_name}, a ${v.studio_type || 'fitness studio'} in ${v.city || v.location || ''}. You personally reply to inbound leads who message the studio — ${v.voice || 'warm, casual and human'}.`,\n``,\n`Studio facts you can use:`,\n`- Classes: ${v.classes || 'see the schedule below'} (small groups, max ${cfg.class_capacity}).`,\n`- Intro offer: ${v.offer || cfg.offers || ''}.`,\n`- Location: ${v.location || ''}.${v.amenities ? ' ' + v.amenities + '.' : ''}`,\n`- Studio timezone: ${tzLabel}.`,\n``,\n`Availability rules — the calendar is the single source of truth:`,\n`- ONLY offer or confirm a class that appears in the real schedule shown in the user message, with the seats remaining given there.`,\n`- NEVER invent a class, day or time, and never claim a class exists unless it is in that list. If nothing fits, say you will check and follow up.`,\n`- A class showing FULL has no seats left: do not offer it, and offer the next open class instead.`,\n``,\n`How you talk:`,\n`- Sound like a real person, never a template. No 'Hi [NAME], thanks for your interest!'.`,\n`- Keep it short — a line or two. Ask exactly ONE question that moves toward booking a class.`,\n`- Use the conversation history; adapt to what the lead actually says. Don't repeat yourself.`,\n`- Goal: get them booked into a specific class. Gently keep steering toward a day and time.`,\n`- If they give a day/time that exists on the schedule and has seats, confirm it back and treat it as a booking.`,\n`- ESCALATE (don't answer) medical/injury questions or price negotiation.`,\n``,\n`You MUST respond with ONLY a JSON object — no prose, no code fences:`,\n`{`,\n`  \"reply\": \"<message to send the lead>\",`,\n`  \"intent\": \"continue\" | \"booking\" | \"escalate\",`,\n`  \"booking\": { \"class_type\": \"...\", \"start_time\": \"YYYY-MM-DDTHH:MM:SS\", \"end_time\": \"YYYY-MM-DDTHH:MM:SS\" } | null,`,\n`  \"escalate\": { \"reason\": \"...\" } | null`,\n`}`,\n`Set intent to 'booking' ONLY when a specific date and time are agreed, and include the booking object (class_type from the classes above; default a ${cfg.booking_duration_minutes}-minute duration if the lead doesn't specify). Output booking start_time/end_time as the studio's LOCAL wall-clock time in the format YYYY-MM-DDTHH:MM:SS with NO 'Z' and NO timezone offset. Always resolve dates against the current date and time given at the top of the user's message, output a FUTURE date in the correct current year, and NEVER use a past year. Set intent to 'escalate' for medical/injury or price-negotiation, include escalate.reason, and put a brief friendly holding message in reply. Otherwise intent is 'continue' with booking and escalate set to null.`,\n].join('\\n');\n\nconst userMessage = [\n`Current date and time: ${nowLocal} (${tzLabel}). Resolve any relative or unspecified dates against this, and NEVER schedule a booking in the past.`,\n``,\n`The studio's REAL upcoming classes (with seats remaining) — only ever offer or confirm a class from THIS list, and never one marked FULL:`,\n$('Format Schedule').first().json.scheduleText,\n``,\n`Lead's message: ${inb.message}`,\n].join('\\n');\n\nreturn [{ json: { systemMessage, userMessage } }];\n"
+        "jsCode": "// Turns the studio's tables into (1) a numbered list of REAL upcoming classes,\n// (2) the ONLY prices the AI may quote, (3) the prompt, (4) a readiness check.\nconst cfg  = $('Resolve Studio').first().json;\nconst inb  = $('When Called').first().json;\nconst data = $('Load Studio Data').first().json;\nconst v    = (typeof cfg.prompt_vars === 'string') ? JSON.parse(cfg.prompt_vars) : (cfg.prompt_vars || {});\nconst ZONE = cfg.timezone || 'UTC';\nconst now  = DateTime.now().setZone(ZONE);\n\nconst classes = Array.isArray(data.classes) ? data.classes : [];\nconst offers  = Array.isArray(data.offers)  ? data.offers  : [];\nconst thread  = Array.isArray(data.thread)  ? data.thread  : [];\n\n// --- (1) next 7 days of real classes, as slot ids S1..Sn -----------------\n// Weekly rows are LOCAL wall-clock times; Luxon applies the studio's zone, so a\n// 6pm class stays 6pm across a clock change. Classes starting within 60 min are\n// left out: nobody can buy a pass and get there in time.\nconst slots = [];\nfor (let d = 0; d < 7; d++) {\n  const day = now.startOf('day').plus({ days: d });\n  for (const c of classes) {\n    if (Number(c.weekday) !== day.weekday) continue;\n    const [h, m] = String(c.time).split(':').map(Number);\n    const at = day.set({ hour: h, minute: m });\n    if (at < now.plus({ minutes: 60 })) continue;\n    slots.push({ id: `S${slots.length + 1}`, class_id: c.id, name: c.name, level: c.level || '',\n                 minutes: c.minutes, url: c.url || null, iso: at.toISO(),\n                 label: `${at.toFormat('ccc d LLL, h:mm a')} — ${c.name}` });\n  }\n}\n\n// --- (2) the only prices the AI may quote ----------------------------------\nconst money = (o) => o.price == null ? 'price on request (ask the studio)'\n  : `${o.currency === 'USD' || !o.currency ? '$' : o.currency + ' '}${Number(o.price) % 1 ? Number(o.price).toFixed(2) : Number(o.price).toFixed(0)}`;\nconst intro = offers.find((o) => o.kind === 'intro' && o.for_new_clients) || offers.find((o) => o.kind === 'intro') || null;\n\n// --- (4) readiness: never improvise for a half-set-up studio --------------\nconst missing = [];\nif (!classes.length) missing.push('no active classes in studio_classes');\nif (!intro) missing.push('no intro offer in studio_offers');\nif (!(intro && intro.url) && !cfg.booking_url) missing.push('no booking link (intro offer url or studios.booking_url)');\nconst ready = missing.length === 0;\n\n// --- (3) the prompt ---------------------------------------------------------\nconst voice = (v.voice && typeof v.voice === 'object') ? v.voice : { register: v.voice || 'warm, casual and human' };\nconst list = (a) => (Array.isArray(a) ? a : []).filter(Boolean);\nconst faq = (v.faq && typeof v.faq === 'object') ? Object.entries(v.faq).map(([k, a]) => `- ${k.replace(/_/g, ' ')}: ${a}`) : [];\nconst owner = cfg.owner_name || 'the owner';\nconst studio = v.how_we_refer || v.studio_name || cfg.studio_name;\n\nconst systemMessage = [\n`You are ${v.persona_name || 'the studio host'}, and you answer Instagram DMs for ${v.studio_name || cfg.studio_name}${v.type ? ', a ' + v.type : ''}${v.city ? ' in ' + v.city : ''}. ${owner} owns the studio.`,\n``,\n`VOICE: ${voice.register || 'warm, casual and human'}${voice.emoji ? ' Emoji: ' + voice.emoji + '.' : ''}`,\nlist(voice.never_say).length ? `Never say: ${list(voice.never_say).map((s) => '\"' + s + '\"').join(', ')}.` : '',\nlist(voice.examples).length ? `Example replies — copy the STYLE only, never their prices, times or class names:\\n${list(voice.examples).map((e) => '  - ' + e).join('\\n')}` : '',\n``,\n`STUDIO FACTS:`,\nv.address ? `- Address: ${v.address}` : '',\nv.beginner_policy ? `- Beginners: ${v.beginner_policy}` : '',\n...list(v.prerequisites).map((p) => `- First visit: ${p}`),\n...faq,\n``,\n`PRICES — the ONLY prices you may ever quote. If something is not on this list, say ${owner} will confirm rather than guessing:`,\n...(offers.length ? offers.map((o) => `- ${o.name}: ${money(o)}${o.details ? ' (' + o.details + ')' : ''}${o.kind === 'intro' ? '  ← the starting point for anyone new' : ''}`) : ['- (none listed — do not quote any price)']),\n``,\n`UPCOMING CLASSES (next 7 days, ${ZONE}) — the ONLY classes you may recommend, each with its slot id:`,\n...(slots.length ? slots.map((s) => `- ${s.id}: ${s.label}${s.level ? ' (' + s.level + ')' : ''}`) : ['- (none — do not recommend any time; say ' + owner + ' will help)']),\n``,\n`HOW BOOKING WORKS — you never book anything:`,\n`- Recommend ONE specific class from the list that fits what she said, by day, time and name.`,\n`- You do NOT know live availability; the booking page shows the live spots. NEVER say she is booked, in, confirmed, reserved or that a spot is held.`,\n`- When she wants to book — she picks a class, says yes to your suggestion, or asks how to book — use intent \"send_booking_link\" with that class's slot id. The system adds the booking link to your message itself: NEVER type a link, URL or web address.`,\nv.booking_steps ? `- In that message, tell her the next step in one short line: ${v.booking_steps}` : '',\n`- If she says she has booked, bought the pass or signed up, use intent \"lead_booked\".`,\n``,\n`HAND TO ${owner.toUpperCase()} (intent \"escalate\", do NOT answer it yourself) for: ${list(v.escalate_on).length ? list(v.escalate_on).join(', ').replace(/_/g, ' ') : 'medical questions, injuries, pregnancy, price negotiation, refunds, complaints'}.`,\n``,\n`STYLE: answer her question first, then ask at most ONE question. Short, like a text. Don't repeat yourself — use the conversation so far.`,\n`If she asks directly whether you are a person or a bot, say honestly that you are the studio's AI assistant and offer to get ${owner}.`,\n``,\n`Respond with ONLY this JSON — no prose, no code fences:`,\n`{\"reply\": \"<your message>\", \"intent\": \"continue\" | \"send_booking_link\" | \"lead_booked\" | \"escalate\", \"slot\": \"<slot id like S3, or null>\", \"returning_client\": <true only if she says she has been before or has a membership>, \"escalate_reason\": \"<short reason, or null>\"}`,\n].filter((l) => l !== '').join('\\n');\n\nconst who = (m) => m.direction === 'inbound' ? 'Lead' : (m.author === 'human' ? 'Studio staff' : 'You');\n// The newest row is normally this very message (just logged); show it once, as \"latest\".\nconst past = (thread.length && thread[thread.length - 1].direction === 'inbound'\n              && String(thread[thread.length - 1].body) === String(inb.message)) ? thread.slice(0, -1) : thread;\nconst history = past.map((m) => `${who(m)}: ${String(m.body || '').replace(/\\s+/g, ' ').slice(0, 600)}`);\n\nconst userMessage = [\n`Current date and time at the studio: ${now.toFormat('cccc d LLLL yyyy, h:mm a')} (${ZONE}).`,\n``,\nhistory.length ? `Conversation so far:\\n${history.join('\\n')}` : 'This is the first message from this lead.',\n``,\n`Her latest message: ${inb.message}`,\n].join('\\n');\n\nreturn [{ json: {\n  systemMessage, userMessage, ready, missing,\n  slots, intro: intro ? { name: intro.name, url: intro.url || null } : null,\n  first_message: Number(data.outbound_count || 0) === 0,\n} }];"
       }
     },
     {
@@ -412,7 +406,7 @@
       "type": "@n8n/n8n-nodes-langchain.agent",
       "typeVersion": 3.1,
       "position": [
-        1520,
+        1300,
         200
       ],
       "parameters": {
@@ -432,7 +426,7 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
       "typeVersion": 1.3,
       "position": [
-        1460,
+        1240,
         400
       ],
       "parameters": {
@@ -453,37 +447,16 @@
       }
     },
     {
-      "id": "postgres-chat-memory",
-      "name": "Postgres Chat Memory",
-      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
-      "typeVersion": 1.3,
-      "position": [
-        1620,
-        400
-      ],
-      "parameters": {
-        "sessionIdType": "customKey",
-        "sessionKey": "={{ $('When Called').first().json.channel + ':' + $('When Called').first().json.external_id }}"
-      },
-      "credentials": {
-        "postgres": {
-          "id": "POSTGRES_CRED_ID",
-          "name": "Postgres account"
-        }
-      }
-    },
-    {
-      "id": "parse-agent-json",
-      "name": "Parse Agent JSON",
+      "id": "decide",
+      "name": "Decide",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1740,
+        1520,
         200
       ],
       "parameters": {
-        "mode": "runOnceForEachItem",
-        "jsCode": "\nconst raw = $json.output ?? $json.text ?? '';\nlet data;\ntry {\n  const m = String(raw).match(/\\{[\\s\\S]*\\}/);\n  data = JSON.parse(m ? m[0] : raw);\n} catch (e) {\n  data = { reply: String(raw), intent: 'continue' };\n}\n\n// Timezone comes from studio config; it used to be a hardcoded ZONE constant.\nconst ZONE = $('Resolve Studio').first().json.timezone || 'UTC';\nconst toZoned = (s) => {\n  try {\n    if (typeof s !== 'string' || !s) return s;\n    const naive = s.replace(/(?:Z|[+-]\\d{2}:?\\d{2})$/, '');\n    const dt = DateTime.fromISO(naive, { zone: ZONE });\n    return dt.isValid ? dt.toISO() : naive;\n  } catch (e) { return s; }\n};\n\nlet booking = data.booking ?? null;\nif (booking && typeof booking === 'object') {\n  booking = { ...booking, start_time: toZoned(booking.start_time), end_time: toZoned(booking.end_time) };\n}\nreturn { json: {\n  reply: data.reply ?? '',\n  intent: data.intent ?? 'continue',\n  booking,\n  escalate: data.escalate ?? null,\n} };\n"
+        "jsCode": "const leadLabel = (inb) => inb.name ? String(inb.name)\n  : (inb.channel === 'instagram' ? 'An Instagram lead' : `A ${inb.channel} lead`);\n\nconst crypto = require('crypto');\nconst cfg = $('Resolve Studio').first().json;\nconst inb = $('When Called').first().json;\nconst ctx = $('Build Context').first().json;\nconst v   = (typeof cfg.prompt_vars === 'string') ? JSON.parse(cfg.prompt_vars) : (cfg.prompt_vars || {});\nconst owner = cfg.owner_name || 'the owner';\n\n// --- parse the model's JSON (tolerate code fences / stray prose) ----------\nconst raw = String($json.output ?? $json.text ?? '');\nlet ai = null;\ntry { const m = raw.match(/\\{[\\s\\S]*\\}/); ai = JSON.parse(m ? m[0] : raw); } catch (e) { ai = null; }\n\nconst holding = v.escalation_line || `Let me get ${owner} to come back to you on that properly.`;\nconst INTENTS = ['continue', 'send_booking_link', 'lead_booked', 'escalate'];\nlet intent = ai && INTENTS.includes(ai.intent) ? ai.intent : 'continue';\nlet reason = ai && ai.escalate_reason ? String(ai.escalate_reason) : null;\n\n// The model must never type a link — strip anything that looks like one.\nconst stripUrls = (s) => String(s || '').replace(/\\bhttps?:\\/\\/\\S+/gi, '').replace(/\\bwww\\.\\S+/gi, '').replace(/[ \\t]{2,}/g, ' ').trim();\nlet reply = stripUrls(ai ? ai.reply : '');\n\n// Unparseable or empty output: don't send the model's raw text to a lead.\nif (!ai || !reply) { intent = 'escalate'; reason = reason || 'the AI produced no usable reply'; }\n\n// --- the studio isn't fully set up: never improvise ------------------------\nif (!ctx.ready) { intent = 'escalate'; reason = 'studio setup incomplete: ' + ctx.missing.join('; '); }\n\n// --- validate the class it picked -----------------------------------------\nconst slot = (ai && ai.slot) ? (ctx.slots || []).find((s) => s.id === String(ai.slot).trim().toUpperCase()) || null : null;\nconst returning = !!(ai && ai.returning_client === true);\n\n// --- choose the link (code, not the model) --------------------------------\nlet link = null, kind = null, linkProblem = false;\nif (intent === 'send_booking_link') {\n  if (!returning && ctx.intro && ctx.intro.url) { link = ctx.intro.url; kind = 'new_client'; }\n  else if (returning && slot && slot.url)       { link = slot.url;       kind = 'class'; }\n  else if (cfg.booking_url)                     { link = cfg.booking_url; kind = 'main'; }\n  if (!link || cfg.links_ok === false) {\n    // No working link: a human has to send it. Honest holding line + alert.\n    intent = 'escalate'; linkProblem = true;\n    link = null; kind = null;   // nothing is sent, so nothing is recorded or coded\n    reason = cfg.links_ok === false ? 'booking link marked broken by the daily check' : 'no booking link configured';\n    reply = `${reply}\\n\\n${owner} will send you the booking link shortly.`.trim();\n  }\n}\n\n// --- compose the final message --------------------------------------------\nlet final;\nif (intent === 'send_booking_link')                     final = `${reply}\\n${link}`;\nelse if (intent === 'lead_booked' && v.first_visit_tips) final = `${reply}\\n\\n${v.first_visit_tips}`;\nelse if (intent === 'escalate')                         final = linkProblem ? reply : holding;   // never let the model answer what it must hand over\nelse                                                    final = reply;\nif (ctx.first_message && v.ai_disclosure) final = `${final}\\n\\n${v.ai_disclosure}`;\n\n// --- the owner email for this outcome (built here, sent once downstream) ---\nconst who = leadLabel(inb);\nconst where = inb.channel === 'instagram' ? 'your Instagram DMs' : inb.channel;\nconst theirMsg = `Her message: \"${String(inb.message || '').slice(0, 500)}\"`;\nlet owner_email = null;\nif (intent === 'send_booking_link') owner_email = {\n  subject: `${who} is heading to book${slot ? ' — ' + slot.label : ''}`,\n  heading: `${who} wants to book, and was sent your booking link.`,\n  lines: [slot ? `Recommended class: ${slot.label}` : 'No specific class was picked yet.',\n          `Link sent: ${link}`, theirMsg,\n          'She books herself on your booking page. Look out for a new intro purchase or booking.'] };\nif (intent === 'lead_booked') owner_email = {\n  subject: `${who} says she's booked`,\n  heading: `${who} says she has booked or bought the pass.`,\n  lines: [theirMsg, 'Please check she shows up in your booking system.'] };\nif (intent === 'escalate') owner_email = {\n  subject: `${who} needs you — ${reason || 'a question for you'}`,\n  heading: `${who} asked something the AI handed to you.`,\n  lines: [`Why: ${reason || 'not specified'}`, theirMsg,\n          `The AI sent her a holding reply and has stepped back for this lead. Reply to her in ${where}.`] };\nif (owner_email) owner_email.to = (reason && reason.startsWith('studio setup incomplete'))\n  ? `${cfg.owner_alert_email || 'founders'}, founders` : (cfg.owner_alert_email || 'founders');\n\nreturn [{ json: {\n  intent, reason, final_reply: final, ai_reply: reply,\n  slot_id: slot ? slot.id : null, class_id: slot ? slot.class_id : null, slot_label: slot ? slot.label : null,\n  link, link_kind: kind, short_code: link ? crypto.randomBytes(6).toString('base64url') : null,\n  returning_client: returning, owner_email,\n} }];"
       }
     },
     {
@@ -492,7 +465,7 @@
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3.4,
       "position": [
-        1960,
+        1740,
         200
       ],
       "parameters": {
@@ -508,9 +481,9 @@
                 },
                 "conditions": [
                   {
-                    "id": "r-booking",
+                    "id": "r-send_booking_link",
                     "leftValue": "={{ $json.intent }}",
-                    "rightValue": "booking",
+                    "rightValue": "send_booking_link",
                     "operator": {
                       "type": "string",
                       "operation": "equals"
@@ -520,7 +493,31 @@
                 "combinator": "and"
               },
               "renameOutput": true,
-              "outputKey": "booking"
+              "outputKey": "send_booking_link"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "r-lead_booked",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "lead_booked",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "lead_booked"
             },
             {
               "conditions": {
@@ -554,84 +551,19 @@
       }
     },
     {
-      "id": "create-calendar-event",
-      "name": "Create Calendar Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.3,
-      "position": [
-        2180,
-        60
-      ],
-      "parameters": {
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $('Resolve Studio').first().json.gcal_booking_id }}",
-          "mode": "id"
-        },
-        "start": "={{ $('Parse Agent JSON').first().json.booking.start_time }}",
-        "end": "={{ $('Parse Agent JSON').first().json.booking.end_time }}",
-        "additionalFields": {
-          "summary": "={{ 'Trial: ' + ($('Parse Agent JSON').first().json.booking.class_type || 'Class') }}",
-          "description": "=Booked via AI for lead {{ $('When Called').first().json.external_id }} ({{ $('When Called').first().json.channel }})"
-        }
-      },
-      "credentials": {
-        "googleCalendarOAuth2Api": {
-          "id": "GOOGLE_CAL_CRED_ID",
-          "name": "Google Calendar account"
-        }
-      },
-      "onError": "continueErrorOutput",
-      "retryOnFail": true
-    },
-    {
-      "id": "event-really-created",
-      "name": "Event Really Created?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        2400,
-        -60
-      ],
-      "parameters": {
-        "conditions": {
-          "options": {
-            "version": 2,
-            "leftValue": "",
-            "caseSensitive": true,
-            "typeValidation": "loose"
-          },
-          "conditions": [
-            {
-              "id": "has-event-id",
-              "leftValue": "={{ $json.id }}",
-              "rightValue": "",
-              "operator": {
-                "type": "string",
-                "operation": "notEmpty",
-                "singleValue": true
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      }
-    },
-    {
-      "id": "insert-booking",
-      "name": "Insert Booking",
+      "id": "record-link-sent",
+      "name": "Record Link Sent",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
       "position": [
-        2620,
-        -160
+        1960,
+        0
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO bookings (lead_id, class_type, start_time, end_time, gcal_event_id, status, created_at)\nVALUES ($1, $2, $3, $4, $5, 'confirmed', now());",
+        "query": "WITH link AS (\n  INSERT INTO booking_links (lead_id, studio_id, class_id, kind, target_url, short_code)\n  VALUES ($1, $2, $3, $4, $5, $6)\n  RETURNING id\n)\nUPDATE leads SET status = CASE WHEN status IN ('booked', 'escalated') THEN status ELSE 'link_sent' END,\n                 updated_at = now()\n WHERE id = $1\nRETURNING (SELECT id FROM link) AS booking_link_id;",
         "options": {
-          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Parse Agent JSON').first().json.booking.class_type, $('Parse Agent JSON').first().json.booking.start_time, $('Parse Agent JSON').first().json.booking.end_time, $json.id] }}"
+          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Resolve Studio').first().json.studio_id, $('Decide').first().json.class_id, $('Decide').first().json.link_kind, $('Decide').first().json.link, $('Decide').first().json.short_code] }}"
         }
       },
       "credentials": {
@@ -643,17 +575,17 @@
       "retryOnFail": true
     },
     {
-      "id": "mark-lead-booked",
-      "name": "Mark Lead Booked",
+      "id": "record-lead-booked",
+      "name": "Record Lead Booked",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
       "position": [
-        2840,
-        -160
+        1960,
+        160
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE leads SET status = 'booked', updated_at = now() WHERE id = $1;",
+        "query": "-- One statement (a parameterised query can't hold two): mark the latest\n-- link as booked-by-the-lead, then the lead.\nWITH latest AS (\n  UPDATE booking_links SET lead_said_booked_at = COALESCE(lead_said_booked_at, now())\n   WHERE id = (SELECT id FROM booking_links WHERE lead_id = $1 ORDER BY sent_at DESC LIMIT 1)\n  RETURNING id\n)\nUPDATE leads SET status = 'booked', updated_at = now()\n WHERE id = $1\nRETURNING (SELECT id FROM latest) AS booking_link_id;",
         "options": {
           "queryReplacement": "={{ [$('Upsert Lead').first().json.id] }}"
         }
@@ -664,93 +596,8 @@
           "name": "Postgres account"
         }
       },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true
-    },
-    {
-      "id": "notify-owner---booking",
-      "name": "Notify Owner - Booking",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 2.3,
-      "position": [
-        3060,
-        -160
-      ],
-      "parameters": {
-        "select": "channel",
-        "channelId": {
-          "__rl": true,
-          "value": "={{ $('Resolve Studio').first().json.slack_owner_channel_id }}",
-          "mode": "id"
-        },
-        "text": "=:tada: New trial booked at {{ $('Resolve Studio').first().json.studio_name }}: {{ $('Parse Agent JSON').first().json.booking.class_type }} at {{ $('Parse Agent JSON').first().json.booking.start_time }} (lead {{ $('When Called').first().json.external_id }} via {{ $('When Called').first().json.channel }})",
-        "otherOptions": {}
-      },
-      "credentials": {
-        "slackApi": {
-          "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Owner Alerts Bot (Slack)"
-        }
-      },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true
-    },
-    {
-      "id": "alert-owner---booking-failed",
-      "name": "Alert Owner - Booking Failed",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 2.3,
-      "position": [
-        2620,
-        120
-      ],
-      "parameters": {
-        "select": "channel",
-        "channelId": {
-          "__rl": true,
-          "value": "={{ $('Resolve Studio').first().json.slack_owner_channel_id }}",
-          "mode": "id"
-        },
-        "text": "=:warning: *Booking could NOT be placed on the calendar* — needs you.\nLead: {{ $('When Called').first().json.external_id }} ({{ $('When Called').first().json.channel }})\nWanted: {{ $('Parse Agent JSON').first().json.booking && $('Parse Agent JSON').first().json.booking.class_type }} at {{ $('Parse Agent JSON').first().json.booking && $('Parse Agent JSON').first().json.booking.start_time }}\nNo booking was recorded and the lead was NOT told they are booked.",
-        "otherOptions": {}
-      },
-      "credentials": {
-        "slackApi": {
-          "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Owner Alerts Bot (Slack)"
-        }
-      },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true
-    },
-    {
-      "id": "soft-fail-reply",
-      "name": "Soft-fail Reply",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
-      "position": [
-        2840,
-        120
-      ],
-      "parameters": {
-        "assignments": {
-          "assignments": [
-            {
-              "id": "sf1",
-              "name": "final_reply",
-              "type": "string",
-              "value": "=Let me just double-check that slot with the studio and come straight back to you — give me a few minutes."
-            },
-            {
-              "id": "sf2",
-              "name": "booking_failed",
-              "type": "boolean",
-              "value": "={{ true }}"
-            }
-          ]
-        },
-        "options": {}
-      }
+      "retryOnFail": true,
+      "alwaysOutputData": true
     },
     {
       "id": "insert-escalation",
@@ -758,14 +605,14 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
       "position": [
-        2180,
-        300
+        1960,
+        320
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO escalations (lead_id, reason, resolved, created_at)\nVALUES ($1, $2, false, now());",
+        "query": "WITH e AS (\n  INSERT INTO escalations (lead_id, reason, resolved, created_at)\n  VALUES ($1, $2, false, now())\n  RETURNING id\n)\nUPDATE leads SET status = 'escalated', updated_at = now()\n WHERE id = $1\nRETURNING (SELECT id FROM e) AS escalation_id;",
         "options": {
-          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, ($('Parse Agent JSON').first().json.escalate && $('Parse Agent JSON').first().json.escalate.reason) || 'unspecified'] }}"
+          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Decide').first().json.reason || 'unspecified'] }}"
         }
       },
       "credentials": {
@@ -775,71 +622,43 @@
         }
       },
       "onError": "continueRegularOutput",
-      "retryOnFail": true
+      "retryOnFail": true,
+      "alwaysOutputData": true
     },
     {
-      "id": "mark-lead-escalated",
-      "name": "Mark Lead Escalated",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.6,
+      "id": "owner-email",
+      "name": "Owner Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2180,
+        160
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: $('Decide').first().json.owner_email }];"
+      }
+    },
+    {
+      "id": "send-owner-email",
+      "name": "Send Owner Email",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
       "position": [
         2400,
-        300
+        160
       ],
       "parameters": {
-        "operation": "executeQuery",
-        "query": "-- Escalation used to leave status = 'engaged', so Find Stale Leads picked the\n-- lead straight back up and nudged someone who had just asked a medical or\n-- pricing question. 'escalated' takes them out of automation.\nUPDATE leads SET status = 'escalated', updated_at = now() WHERE id = $1;",
-        "options": {
-          "queryReplacement": "={{ [$('Upsert Lead').first().json.id] }}"
-        }
-      },
-      "credentials": {
-        "postgres": {
-          "id": "POSTGRES_CRED_ID",
-          "name": "Postgres account"
-        }
-      },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true
-    },
-    {
-      "id": "notify-owner---escalation",
-      "name": "Notify Owner - Escalation",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 2.3,
-      "position": [
-        2620,
-        300
-      ],
-      "parameters": {
-        "select": "channel",
-        "channelId": {
+        "workflowId": {
           "__rl": true,
-          "value": "={{ $('Resolve Studio').first().json.slack_owner_channel_id }}",
-          "mode": "id"
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
         },
-        "text": "=:rotating_light: Lead needs you at {{ $('Resolve Studio').first().json.studio_name }} ({{ $('When Called').first().json.external_id }} via {{ $('When Called').first().json.channel }}): {{ ($('Parse Agent JSON').first().json.escalate && $('Parse Agent JSON').first().json.escalate.reason) || 'unspecified' }}\nAutomation is paused for this lead until you resolve it.",
-        "otherOptions": {}
-      },
-      "credentials": {
-        "slackApi": {
-          "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Owner Alerts Bot (Slack)"
+        "options": {
+          "waitForSubWorkflow": true
         }
       },
       "onError": "continueRegularOutput",
-      "retryOnFail": true
-    },
-    {
-      "id": "continue-(no-action)",
-      "name": "Continue (no action)",
-      "type": "n8n-nodes-base.noOp",
-      "typeVersion": 1,
-      "position": [
-        2180,
-        460
-      ],
-      "parameters": {}
+      "alwaysOutputData": true
     },
     {
       "id": "log-outbound",
@@ -847,14 +666,14 @@
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
       "position": [
-        3300,
-        120
+        2620,
+        300
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO messages (lead_id, direction, channel, body, created_at)\nVALUES ($1, 'outbound', $2, $3, now());",
+        "query": "INSERT INTO messages (lead_id, direction, channel, body, author, created_at)\nVALUES ($1, 'outbound', $2, $3, 'ai', now())\nRETURNING id;",
         "options": {
-          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('When Called').first().json.channel, ($json.final_reply ?? $('Parse Agent JSON').first().json.reply)] }}"
+          "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('When Called').first().json.channel, $('Decide').first().json.final_reply] }}"
         }
       },
       "credentials": {
@@ -873,8 +692,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        3520,
-        120
+        2840,
+        300
       ],
       "parameters": {
         "assignments": {
@@ -883,19 +702,19 @@
               "id": "r1",
               "name": "reply",
               "type": "string",
-              "value": "={{ $('Soft-fail Reply').isExecuted ? $('Soft-fail Reply').first().json.final_reply : $('Parse Agent JSON').first().json.reply }}"
+              "value": "={{ $('Decide').first().json.final_reply }}"
             },
             {
               "id": "r2",
               "name": "intent",
               "type": "string",
-              "value": "={{ $('Parse Agent JSON').first().json.intent }}"
+              "value": "={{ $('Decide').first().json.intent }}"
             },
             {
               "id": "r3",
               "name": "send",
               "type": "boolean",
-              "value": "={{ true }}"
+              "value": "={{ !!$('Decide').first().json.final_reply }}"
             },
             {
               "id": "r4",
@@ -925,13 +744,25 @@
               "id": "r8",
               "name": "booking_created",
               "type": "boolean",
-              "value": "={{ $('Insert Booking').isExecuted }}"
+              "value": "={{ false }}"
             },
             {
               "id": "r9",
               "name": "credential_ref",
               "type": "string",
               "value": "={{ $('Resolve Studio').first().json.credential_ref }}"
+            },
+            {
+              "id": "r10",
+              "name": "link_sent",
+              "type": "boolean",
+              "value": "={{ $('Decide').first().json.intent === 'send_booking_link' }}"
+            },
+            {
+              "id": "r11",
+              "name": "outbound_message_id",
+              "type": "number",
+              "value": "={{ $('Log Outbound').first().json.id }}"
             }
           ]
         },
@@ -984,14 +815,25 @@
       "main": [
         [
           {
-            "node": "Alert Ops: Unknown Account",
+            "node": "Email: Unknown Account",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Alert Ops: Unknown Account": {
+    "Email: Unknown Account": {
+      "main": [
+        [
+          {
+            "node": "Send: Unknown Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send: Unknown Account": {
       "main": [
         [
           {
@@ -1028,21 +870,32 @@
       "main": [
         [
           {
-            "node": "Notify Owner: Paused Lead",
+            "node": "Email: Paused Lead",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Get Schedule",
+            "node": "Load Studio Data",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Notify Owner: Paused Lead": {
+    "Email: Paused Lead": {
+      "main": [
+        [
+          {
+            "node": "Send: Paused Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send: Paused Lead": {
       "main": [
         [
           {
@@ -1053,29 +906,18 @@
         ]
       ]
     },
-    "Get Schedule": {
+    "Load Studio Data": {
       "main": [
         [
           {
-            "node": "Format Schedule",
+            "node": "Build Context",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Format Schedule": {
-      "main": [
-        [
-          {
-            "node": "Build Agent Prompt",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Build Agent Prompt": {
+    "Build Context": {
       "main": [
         [
           {
@@ -1097,29 +939,18 @@
         ]
       ]
     },
-    "Postgres Chat Memory": {
-      "ai_memory": [
-        [
-          {
-            "node": "AI Agent",
-            "type": "ai_memory",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "AI Agent": {
       "main": [
         [
           {
-            "node": "Parse Agent JSON",
+            "node": "Decide",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Parse Agent JSON": {
+    "Decide": {
       "main": [
         [
           {
@@ -1134,7 +965,14 @@
       "main": [
         [
           {
-            "node": "Create Calendar Event",
+            "node": "Record Link Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Lead Booked",
             "type": "main",
             "index": 0
           }
@@ -1148,76 +986,29 @@
         ],
         [
           {
-            "node": "Continue (no action)",
+            "node": "Log Outbound",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Create Calendar Event": {
+    "Record Link Sent": {
       "main": [
         [
           {
-            "node": "Event Really Created?",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Alert Owner - Booking Failed",
+            "node": "Owner Email",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Event Really Created?": {
+    "Record Lead Booked": {
       "main": [
         [
           {
-            "node": "Insert Booking",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Alert Owner - Booking Failed",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Insert Booking": {
-      "main": [
-        [
-          {
-            "node": "Mark Lead Booked",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Mark Lead Booked": {
-      "main": [
-        [
-          {
-            "node": "Notify Owner - Booking",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Alert Owner - Booking Failed": {
-      "main": [
-        [
-          {
-            "node": "Soft-fail Reply",
+            "node": "Owner Email",
             "type": "main",
             "index": 0
           }
@@ -1228,58 +1019,25 @@
       "main": [
         [
           {
-            "node": "Mark Lead Escalated",
+            "node": "Owner Email",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Mark Lead Escalated": {
+    "Owner Email": {
       "main": [
         [
           {
-            "node": "Notify Owner - Escalation",
+            "node": "Send Owner Email",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Notify Owner - Booking": {
-      "main": [
-        [
-          {
-            "node": "Log Outbound",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Soft-fail Reply": {
-      "main": [
-        [
-          {
-            "node": "Log Outbound",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Notify Owner - Escalation": {
-      "main": [
-        [
-          {
-            "node": "Log Outbound",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Continue (no action)": {
+    "Send Owner Email": {
       "main": [
         [
           {

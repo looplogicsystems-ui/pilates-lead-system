@@ -460,7 +460,15 @@ SELECT l.id, l.external_id, l.channel, l.name,
        (SELECT m.body FROM messages m
          WHERE m.lead_id = l.id AND m.direction = 'inbound'
          ORDER BY m.created_at DESC LIMIT 1) AS last_msg,
-       s.id AS studio_id, s.timezone, s.prompt_vars, s.offers, s.class_capacity,
+       s.id AS studio_id, s.timezone, s.prompt_vars, s.class_capacity,
+       -- The intro offer from studio_offers (migration 009), e.g. "2-week unlimited
+       -- intro pass ($89)". studios.offers / prompt_vars.offer are retired by 010.
+       (SELECT o.name || CASE WHEN o.price IS NULL THEN ''
+                              ELSE ' (' || CASE WHEN o.currency = 'USD' THEN '$' ELSE o.currency || ' ' END
+                                        || trim(to_char(o.price, 'FM999999990.##')) || ')' END
+          FROM studio_offers o
+         WHERE o.studio_id = s.id AND o.active AND o.kind = 'intro'
+         ORDER BY o.sort_order LIMIT 1) AS intro_offer,
        s.slack_lead_channel_id, s.slack_owner_channel_id, s.max_nudges,
        (COALESCE(os.n, 0) >= s.max_nudges) AS is_final
   FROM leads l
@@ -502,13 +510,13 @@ const v = (typeof $json.prompt_vars === 'string')
             ? JSON.parse($json.prompt_vars) : ($json.prompt_vars || {});
 const first = $json.name ? (' ' + String($json.name).trim().split(/\s+/)[0]) : '';
 const persona = v.persona_name || 'the studio';
-const offer = v.offer || $json.offers || 'our intro offer';
+const offer = $json.intro_offer || 'our intro offer';
 const cap = $json.class_capacity;
 const isFinal = $json.is_final === true || $json.is_final === 'true';
 
 const msgs = [
   `Hey${first} 😊 no rush at all — I know starting something new can feel a bit daunting, especially if you're not sure it's for you yet. Our beginner classes are small (max ${cap}) and built for total first-timers, so you'd be in really good hands. Your ${offer} is still open — want me to suggest an easy time to come try one class? No commitment, just see how it feels.`,
-  `Hey${first}, just checking in one last time 💛 honestly, most of our members were on the fence before their first class and now they can't imagine their week without it. If you're even a little curious, just tell me which day suits and I'll hold a spot for you — nothing to lose. And if the timing isn't right, no worries at all, I'm here whenever you're ready.`,
+  `Hey${first}, just checking in one last time 💛 honestly, most of our members were on the fence before their first class and now they can't imagine their week without it. If you're even a little curious, just tell me which day suits and I'll point you to an easy class to start with — nothing to lose. And if the timing isn't right, no worries at all, I'm here whenever you're ready.`,
 ];
 
 const systemMessage = [

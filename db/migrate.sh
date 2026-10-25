@@ -12,6 +12,10 @@
 # The lead-system tables live in the `postgres` database on this deployment
 # (n8n's own tables are in `n8n` — do not point this at that one).
 set -euo pipefail
+# Byte-order sorting for the migrations glob below. Under en_US and similar
+# locales "000a_base_schema" sorts BEFORE "000_migrations_table", so a bare
+# database failed on the first file (schema_migrations didn't exist yet).
+export LC_ALL=C
 
 CONTAINER="${PG_CONTAINER:-postgres}"
 DB="${PGDATABASE:-postgres}"
