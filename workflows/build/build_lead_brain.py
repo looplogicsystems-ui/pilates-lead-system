@@ -22,6 +22,8 @@ import json
 import os
 import sys
 
+from ig_common import LEAD_NAME_JS
+
 # --- credential placeholders -> live ids -------------------------------------
 CREDS = {
     "POSTGRES_CRED_ID": "VVIxtEmT1GWsEZn9",
@@ -92,9 +94,13 @@ def if_true(name, pos, expr, cid):
 
 # A readable name for a lead in an owner email. Instagram gives no name, only an
 # id the owner can't use — so point her at the conversation instead.
-LEAD_LABEL_JS = r"""
-const leadLabel = (inb) => inb.name ? String(inb.name)
-  : (inb.channel === 'instagram' ? 'An Instagram lead' : `A ${inb.channel} lead`);
+LEAD_LABEL_JS = LEAD_NAME_JS + r"""
+// The lead as stored (the adapter looks an Instagram profile up only once, so
+// this message alone may not carry the @username).
+const person = () => {
+  const up = $('Upsert Lead').first().json, inb = $('When Called').first().json;
+  return { channel: inb.channel, username: up.username || inb.username || null, name: up.name || inb.name || null };
+};
 // Signed one-tap owner buttons (Owner Actions workflow). Same signature as its
 // Verify node: first 32 hex of HMAC-SHA256(OWNER_LINK_SECRET, "<action>:<lead id>").
 // No secret on the server -> no buttons, rather than buttons that can't work.
@@ -199,18 +205,32 @@ pg("Upsert Lead", [200, 260], """-- Idempotent per (channel, external_id). The s
 --   escalated -> escalated (stays with the human until they resolve it)
 --   booked / link_sent     (kept: the conversation continues, the state stands)
 -- and nothing moves at all while ai_paused is set.
-INSERT INTO leads (external_id, channel, name, studio_id, status, created_at, updated_at)
-VALUES ($1, $2, $3, $4, 'engaged', now(), now())
+WITH prev AS (   -- the row as it was before this message (empty for a new lead)
+  SELECT pause_alerted_at FROM leads WHERE channel = $2 AND external_id = $1
+)
+INSERT INTO leads (external_id, channel, name, username, profile_checked_at, studio_id, status, created_at, updated_at)
+VALUES ($1, $2, $3, $5, CASE WHEN $6::boolean THEN now() END, $4, 'engaged', now(), now())
 ON CONFLICT (channel, external_id) DO UPDATE SET
     name       = COALESCE(EXCLUDED.name, leads.name),
+    username   = COALESCE(EXCLUDED.username, leads.username),
+    profile_checked_at = COALESCE(EXCLUDED.profile_checked_at, leads.profile_checked_at),
     status     = CASE
                    WHEN leads.ai_paused                THEN leads.status
                    WHEN leads.status IN ('cold','new') THEN 'engaged'
                    ELSE leads.status
                  END,
+    -- While paused, the owner hears "she wrote again" at most once per 12h
+    -- (the takeover / escalation email itself sets this too).
+    pause_alerted_at = CASE
+                   WHEN leads.ai_paused AND (leads.pause_alerted_at IS NULL
+                                             OR leads.pause_alerted_at < now() - interval '12 hours')
+                   THEN now() ELSE leads.pause_alerted_at END,
     updated_at = now()
-RETURNING id, status, ai_paused;""",
-   replacement=("={{ [" + f"{IN}.external_id, {IN}.channel, {IN}.name, {CFG}.studio_id" + "] }}"),
+RETURNING id, status, ai_paused, username, name,
+          (ai_paused AND ((SELECT pause_alerted_at FROM prev) IS NULL
+                          OR (SELECT pause_alerted_at FROM prev) < now() - interval '12 hours')) AS pause_alert_due;""",
+   replacement=("={{ [" + f"{IN}.external_id, {IN}.channel, {IN}.name || null, {CFG}.studio_id, "
+                f"{IN}.username || null, !!{IN}.profile_checked" + "] }}"),
    retryOnFail=True)
 connect("Studio Found?", "Upsert Lead", out=0)
 
@@ -224,24 +244,28 @@ if_true("AI Paused?", [640, 260], "={{ $('Upsert Lead').first().json.ai_paused }
 connect("Log Inbound", "AI Paused?")
 
 # --- a human has this lead: log it, tell the owner, send nothing ------------
-code("Email: Paused Lead", [860, 460], LEAD_LABEL_JS + r"""
+code("Email: Paused Lead", [1080, 460], LEAD_LABEL_JS + r"""
 const inb = $('When Called').first().json;
 const cfg = $('Resolve Studio').first().json;
 const leadId = $('Upsert Lead').first().json.id;
+const p = person();
 return [{ json: {
   to: inb.channel === 'test' ? 'delivered@resend.dev' : (cfg.owner_alert_email || 'founders'),
-  subject: `${leadLabel(inb)} replied — the AI is paused for her`,
-  heading: `${leadLabel(inb)} sent a new message. The AI did not answer, because this conversation is with you.`,
+  subject: `${leadLabel(p)} wrote again — the AI is paused for her`,
+  heading: `${leadLabel(p)} sent a new message. The AI did not answer, because this conversation is with you.`,
   lines: [`Her message: "${String(inb.message || '').slice(0, 500)}"`,
-          `Reply to her in your ${inb.channel === 'instagram' ? 'Instagram DMs' : inb.channel}, or tap Resume to hand her back to the AI.`],
-  buttons: [ownerButton('Resume AI', 'resume', leadId)].filter(Boolean),
+          `Reply to her in your ${inb.channel === 'instagram' ? 'Instagram DMs' : inb.channel}, or tap Resume to hand her back to the AI.`,
+          'You get at most one of these emails every 12 hours per lead.'],
+  buttons: [ownerButton('Resume AI', 'resume', leadId), chatButton(p)].filter(Boolean),
 } }];
 """)
-connect("AI Paused?", "Email: Paused Lead", out=0)
-send_email("Send: Paused Lead", [1080, 460])
+if_true("Alert Due?", [860, 380], "={{ $('Upsert Lead').first().json.pause_alert_due }}", "alert-due")
+connect("AI Paused?", "Alert Due?", out=0)
+connect("Alert Due?", "Email: Paused Lead", out=0)
+send_email("Send: Paused Lead", [1300, 460])
 connect("Email: Paused Lead", "Send: Paused Lead")
 
-node("Return: Paused", "n8n-nodes-base.set", 3.4, [1300, 460], {
+node("Return: Paused", "n8n-nodes-base.set", 3.4, [1520, 400], {
     "assignments": {"assignments": [
         {"id": "p1", "name": "reply", "value": "", "type": "string"},
         {"id": "p2", "name": "intent", "value": "paused", "type": "string"},
@@ -252,6 +276,7 @@ node("Return: Paused", "n8n-nodes-base.set", 3.4, [1300, 460], {
         {"id": "p7", "name": "external_id", "value": f"={{{{ {IN}.external_id }}}}", "type": "string"},
     ]}, "options": {}})
 connect("Send: Paused Lead", "Return: Paused")
+connect("Alert Due?", "Return: Paused", out=1)
 
 # ---------------------------------------------------------------------------
 # 3. Studio data — read fresh on EVERY message, so an edit in the database
@@ -501,11 +526,13 @@ else                                                    final = reply;
 if (ctx.first_message && v.ai_disclosure) final = `${final}\n\n${v.ai_disclosure}`;
 
 // --- the owner email for this outcome (built here, sent once downstream) ---
-const who = leadLabel(inb);
+const p = person();
+const who = leadLabel(p);
 const where = inb.channel === 'instagram' ? 'your Instagram DMs' : inb.channel;
 const theirMsg = `Her message: "${String(inb.message || '').slice(0, 500)}"`;
 const leadId = $('Upsert Lead').first().json.id;
 const btn = (label, action) => ownerButton(label, action, leadId);
+const chat = chatButton(p);
 let owner_email = null;
 if (intent === 'send_booking_link') owner_email = {
   subject: `${who} is heading to book${slot ? ' — ' + slot.label : ''}`,
@@ -513,18 +540,18 @@ if (intent === 'send_booking_link') owner_email = {
   lines: [slot ? `Recommended class: ${slot.label}` : 'No specific class was picked yet.',
           `Link sent: ${link}`, theirMsg,
           'She books herself on your booking page. When she shows up in your booking system, tap Mark booked.'],
-  buttons: [btn('Mark booked', 'booked'), btn('Pause AI for her', 'pause')].filter(Boolean) };
+  buttons: [btn('Mark booked', 'booked'), btn('Pause AI for her', 'pause'), chat].filter(Boolean) };
 if (intent === 'lead_booked') owner_email = {
   subject: `${who} says she's booked`,
   heading: `${who} says she has booked or bought the pass.`,
   lines: [theirMsg, 'Please check she shows up in your booking system, then tap Confirm booked.'],
-  buttons: [btn('Confirm booked', 'booked'), btn('Pause AI for her', 'pause')].filter(Boolean) };
+  buttons: [btn('Confirm booked', 'booked'), btn('Pause AI for her', 'pause'), chat].filter(Boolean) };
 if (intent === 'escalate') owner_email = {
   subject: `${who} needs you — ${reason || 'a question for you'}`,
   heading: `${who} asked something the AI handed to you.`,
   lines: [`Why: ${reason || 'not specified'}`, theirMsg,
           `The AI sent her a holding reply and is now PAUSED for this lead, so it won't answer her again. Reply to her in ${where}. When you're done, tap Resume to hand her back to the AI.`],
-  buttons: [btn('Resume AI', 'resume')].filter(Boolean) };
+  buttons: [btn('Resume AI', 'resume'), chat].filter(Boolean) };
 if (owner_email) owner_email.to = (reason && reason.startsWith('studio setup incomplete'))
   ? `${cfg.owner_alert_email || 'founders'}, founders` : (cfg.owner_alert_email || 'founders');
 // Voice-lab conversations (channel 'test') must not flood real inboxes:
@@ -591,7 +618,8 @@ pg("Insert Escalation", [1960, 320], """WITH e AS (
 )
 -- Escalating PAUSES the AI for this lead until the owner taps Resume: the
 -- owner email says it has stepped back, and now it really has.
-UPDATE leads SET status = 'escalated', ai_paused = true, updated_at = now()
+UPDATE leads SET status = 'escalated', ai_paused = true, paused_by = 'escalation',
+                 paused_at = now(), pause_alerted_at = now(), updated_at = now()
  WHERE id = $1
 RETURNING (SELECT id FROM e) AS escalation_id;""",
    replacement=("={{ [$('Upsert Lead').first().json.id, " + f"{DEC}.reason || 'unspecified'] }}}}"),
@@ -634,6 +662,8 @@ node("Return Result", "n8n-nodes-base.set", 3.4, [2840, 300], {
         # so the echo of OUR reply can be told apart from a staff reply (step 6).
         {"id": "r11", "name": "outbound_message_id", "type": "number",
          "value": "={{ $('Log Outbound').first().json.id }}"},
+        # Which studio account to send from (the Instagram adapter loads its token).
+        {"id": "r12", "name": "account_ref", "type": "string", "value": f"={{{{ {IN}.account_ref }}}}"},
     ]}, "options": {}})
 connect("Log Outbound", "Return Result")
 

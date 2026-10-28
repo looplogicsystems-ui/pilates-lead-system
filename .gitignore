@@ -24,3 +24,4 @@ db/seed/local-ids.sql
 
 # Node (if any tooling is added later)
 node_modules/
+__pycache__/

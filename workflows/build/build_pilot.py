@@ -28,6 +28,8 @@ import json
 import os
 import sys
 
+from ig_common import IG_APP_ID, IG_REDIRECT_URI, GRAPH, TOKEN_CRYPTO_JS, GRAPH_JS
+
 WF_IDS = {
     "send-email":     "PQWBdER3x291uWeU",
     "ops-test-email": "oh01IIck8xhZWADI",
@@ -35,6 +37,7 @@ WF_IDS = {
     "ops-voice-lab":  "EeLbVJcxMU52wHen",
     "owner-actions":  "C3KkwuJYPyrwGUZS",
     "link-redirect":  "6Owetg7CkG7wRK2t",
+    "ig-connect":     "C5M1lM4n3FgKO0J1",
 }
 
 LEAD_BRAIN_ID = "fvHhAUDCbVN9ELb0"
@@ -503,11 +506,13 @@ return [{ json: { route, html, a, l } }];
 OWNER_APPLY_SQL = """
 -- One statement. Exactly one branch matches $1, so no row is updated twice.
 WITH p AS (
-  UPDATE leads SET ai_paused = true, updated_at = now()
+  -- pause_alerted_at NULL: her next message still emails the owner once.
+  UPDATE leads SET ai_paused = true, paused_by = 'owner', paused_at = now(),
+                   pause_alerted_at = NULL, updated_at = now()
    WHERE id = $2::int AND $1 = 'pause' RETURNING id
 ), r AS (
   -- Resume hands the lead back: unpause, and an escalated lead re-enters normal flow.
-  UPDATE leads SET ai_paused = false,
+  UPDATE leads SET ai_paused = false, paused_by = NULL, paused_at = NULL, pause_alerted_at = NULL,
                    status = CASE WHEN status = 'escalated' THEN 'engaged' ELSE status END,
                    updated_at = now()
    WHERE id = $2::int AND $1 = 'resume' RETURNING id
@@ -627,6 +632,212 @@ def link_redirect():
             "nodes": nodes, "connections": conns, "settings": dict(SETTINGS)}
 
 
+# ---------------------------------------------------------------------------
+# IG Connect — GET /webhook/ig/connect   (Meta redirects here after she approves)
+#
+# A studio connects her Instagram from her own phone: we send her a connect link
+# (workflows/build/ig_connect_link.py <studio id>), she logs in on Instagram's
+# own screen and taps Allow, and Instagram sends her browser back here with a
+# one-time `code` and our signed `state`. No password is shared and nothing is
+# edited in n8n: the account becomes a channel_accounts row.
+#
+# state = base64url({"s": studio id, "e": expiry (unix s), "n": random nonce})
+#         + "." + first 32 hex of HMAC-SHA256(OWNER_LINK_SECRET, "ig-connect|" + payload)
+# A link works once (ig_connect_uses) and until it expires (7 days by default).
+
+PAGE_JS = r"""
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const page = (title, body) => `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>${esc(title)}</title>
+<style>body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f4f1;color:#1f1d1a}
+main{max-width:440px;margin:12vh auto;padding:28px 24px;background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);text-align:center}
+h1{font-size:21px;margin:0 0 14px} p{color:#5f5953;line-height:1.55;margin:0 0 10px} small{color:#9a938c}</style>
+</head><body><main>${body}<p><small>Loop Logic</small></p></main></body></html>`;
+"""
+
+CHECK_LINK_JS = PAGE_JS + r"""
+const crypto = require('crypto');
+const q = $input.first().json.query || {};
+const stop = (title, msg) => [{ json: { route: 'stop', html: page(title, `<h1>${esc(title)}</h1><p>${esc(msg)}</p>`) } }];
+
+// She tapped "Cancel" / "Not now" on Instagram's screen.
+if (q.error) return stop('Not connected', 'Instagram wasn’t connected. If that was a mistake, just tap the link again.');
+
+const secret = String($env.OWNER_LINK_SECRET || '');
+const [p64, sig] = String(q.state || '').split('.');
+let valid = false, payload = null;
+if (secret && p64 && /^[0-9a-f]{32}$/.test(sig || '')) {
+  const want = Buffer.from(crypto.createHmac('sha256', secret).update(`ig-connect|${p64}`).digest('hex').slice(0, 32));
+  valid = crypto.timingSafeEqual(want, Buffer.from(sig));
+  if (valid) { try { payload = JSON.parse(Buffer.from(p64, 'base64url').toString('utf8')); } catch (e) { valid = false; } }
+}
+if (!valid || !payload || !Number.isInteger(payload.s) || !/^[A-Za-z0-9_-]{16,64}$/.test(String(payload.n || '')))
+  return stop('This link isn’t valid', 'It may have been changed or cut off. Use the link exactly as we sent it, or ask us for a new one.');
+if (Date.now() / 1000 > Number(payload.e))
+  return stop('This link has expired', 'Connect links work for 7 days. Ask us for a new one and it takes a minute.');
+if (!q.code || String(q.code).length > 2000)
+  return stop('Something went wrong', 'Instagram didn’t send back what we expected. Please tap the link again.');
+return [{ json: { route: 'go', studio_id: payload.s, nonce: String(payload.n), code: String(q.code).replace(/#_$/, '') } }];
+"""
+
+LINK_STATUS_SQL = """
+-- Always exactly one row.
+SELECT $1::int AS studio_id, $2::text AS nonce, $3::text AS code,
+       (SELECT name FROM studios WHERE id = $1::int AND active) AS studio_name,
+       EXISTS (SELECT 1 FROM ig_connect_uses WHERE nonce = $2) AS link_used;
+"""
+
+CONNECT_ACCOUNT_JS = TOKEN_CRYPTO_JS + GRAPH_JS + r"""
+const j = $input.first().json;
+const base = { studio_id: j.studio_id, studio_name: j.studio_name, nonce: j.nonce };
+if (!j.studio_name) return [{ json: { ...base, ok: false, outcome: 'no_studio' } }];
+if (j.link_used)    return [{ json: { ...base, ok: false, outcome: 'link_used' } }];
+
+const secret = String($env.IG_APP_SECRET_INSTAGRAM || '');
+try {
+  if (!secret) throw new Error('IG_APP_SECRET_INSTAGRAM is missing on the server');
+  // 1. one-time code -> short-lived token (never retried: the code works once)
+  const short = await graphCall(this, { what: 'code exchange', method: 'POST',
+    url: 'https://api.instagram.com/oauth/access_token',
+    form: { client_id: '__IG_APP_ID__', client_secret: secret, grant_type: 'authorization_code',
+            redirect_uri: '__IG_REDIRECT_URI__', code: j.code } });
+  const s = Array.isArray(short.data) ? short.data[0] : short;
+  const perms = Array.isArray(s.permissions) ? s.permissions : String(s.permissions || '').split(',');
+  if (!perms.map((p) => p.trim()).includes('instagram_business_manage_messages'))
+    return [{ json: { ...base, ok: false, outcome: 'no_message_permission' } }];
+  // 2. short-lived -> long-lived (~60 days)
+  const long = await graphCall(this, { what: 'long-lived token', url: 'https://graph.instagram.com/access_token',
+    qs: { grant_type: 'ig_exchange_token', client_secret: secret, access_token: s.access_token }, tries: 2 });
+  // 3. which account is this? user_id is what webhooks carry as the account id.
+  const me = await graphCall(this, { what: 'account lookup', url: '__GRAPH__/me',
+    qs: { fields: 'user_id,username,name,account_type' }, token: long.access_token, tries: 3 });
+  if (!me.user_id) throw new Error('account lookup: no user_id returned');
+  // 4. deliver this account's DMs to our webhook (the dashboard's per-account toggle)
+  let subscribed = false, subscribe_error = null;
+  try {
+    const sub = await graphCall(this, { what: 'webhook subscription', method: 'POST', url: '__GRAPH__/me/subscribed_apps',
+      qs: { subscribed_fields: 'messages' }, token: long.access_token, tries: 2 });
+    subscribed = !!(sub && sub.success);
+  } catch (e) { subscribe_error = e.message; }
+  return [{ json: { ...base, ok: true, outcome: 'pending_save',
+    account_ref: String(me.user_id), username: me.username || null, name: me.name || null,
+    account_type: me.account_type || null, subscribed, subscribe_error,
+    expires_in: Number(long.expires_in) || 5184000,
+    token_enc: encryptToken(long.access_token) } }];   // ciphertext only, never the token
+} catch (e) {
+  return [{ json: { ...base, ok: false, outcome: 'error', error: String(e.message).slice(0, 400) } }];
+}
+"""
+
+SAVE_ACCOUNT_SQL = """
+-- One statement, always one row. Refuses to move an account that is already
+-- connected to a DIFFERENT studio; re-connecting to the same studio just
+-- replaces the token (that is also how a revoked token is fixed: a new link).
+WITH clash AS (
+  SELECT 1 FROM channel_accounts
+   WHERE channel = 'instagram' AND account_ref = $3 AND studio_id <> $2::int
+), used AS (
+  INSERT INTO ig_connect_uses (nonce, studio_id, account_ref, ig_username)
+  SELECT $1, $2::int, $3, $4 WHERE NOT EXISTS (SELECT 1 FROM clash)
+  ON CONFLICT (nonce) DO NOTHING
+  RETURNING nonce
+), acct AS (
+  INSERT INTO channel_accounts (studio_id, channel, account_ref, access_token_enc, ig_username,
+                                connected_at, token_issued_at, token_expires_at, token_error, active)
+  SELECT $2::int, 'instagram', $3, decode($5, 'base64'), $4,
+         now(), now(), now() + make_interval(secs => $6::int), NULL, true
+   WHERE EXISTS (SELECT 1 FROM used)
+  ON CONFLICT (channel, account_ref) DO UPDATE SET
+         access_token_enc = EXCLUDED.access_token_enc, ig_username = EXCLUDED.ig_username,
+         connected_at = now(), token_issued_at = now(),
+         token_expires_at = EXCLUDED.token_expires_at, token_error = NULL, active = true
+   WHERE channel_accounts.studio_id = EXCLUDED.studio_id
+  RETURNING id
+)
+SELECT CASE WHEN EXISTS (SELECT 1 FROM acct)  THEN 'connected'
+            WHEN EXISTS (SELECT 1 FROM clash) THEN 'other_studio'
+            ELSE 'link_used' END AS outcome;
+"""
+
+RESULT_JS = PAGE_JS + r"""
+const c = $('Connect Account').first().json;
+const outcome = c.ok ? $json.outcome : c.outcome;
+const who = c.username ? `@${c.username}` : 'Your Instagram account';
+const P = {
+  connected:     ['Connected ✓', `${who} is now connected to ${c.studio_name}. You can close this page.`],
+  other_studio:  ['Already connected elsewhere', `${who} is already connected to another studio, so we didn’t change anything. We’ve been told and will be in touch.`],
+  link_used:     ['This link was already used', 'Each connect link works once. If you need to connect again, ask us for a new one.'],
+  no_studio:     ['This link isn’t valid', 'Ask us for a new connect link.'],
+  no_message_permission: ['Almost there', 'Instagram didn’t give us permission to manage messages, which is what replies need. Tap the link again and leave every permission switched on.'],
+  error:         ['Something went wrong', 'We couldn’t finish connecting. Nothing was changed on your account. We’ve been told and will send you a new link.'],
+};
+const [title, msg] = P[outcome] || P.error;
+const lines = [
+  `Studio: ${c.studio_name || '(unknown)'} (id ${c.studio_id})`,
+  c.username ? `Account: @${c.username}${c.name ? ' (' + c.name + ')' : ''}, id ${c.account_ref}, type ${c.account_type || '?'}` : null,
+  outcome === 'connected' ? `Token valid until about ${new Date(Date.now() + c.expires_in * 1000).toISOString().slice(0, 10)}; refreshed automatically.` : null,
+  outcome === 'connected' && !c.subscribed ? `WARNING: subscribing this account to message webhooks failed (${c.subscribe_error || 'no success flag'}). Its DMs will not arrive until that is fixed.` : null,
+  c.error ? `Error: ${c.error}` : null,
+].filter(Boolean);
+return [{ json: {
+  html: page(title, `<h1>${esc(title)}</h1><p>${esc(msg)}</p>`),
+  email: { to: 'founders',
+           subject: outcome === 'connected' ? `Instagram connected: ${who} → ${c.studio_name}`
+                                            : `Instagram connect FAILED (${outcome}) for ${c.studio_name || 'studio ' + c.studio_id}`,
+           heading: outcome === 'connected' ? `${who} connected through a connect link.` : `A connect link didn’t work: ${outcome}.`,
+           lines },
+} }];
+"""
+
+
+def ig_connect():
+    sub = lambda js: (js.replace("__IG_APP_ID__", IG_APP_ID).replace("__IG_REDIRECT_URI__", IG_REDIRECT_URI)
+                        .replace("__GRAPH__", GRAPH))
+    nodes = [
+        {"id": "ic-hook", "name": "Connect Callback", "type": "n8n-nodes-base.webhook", "typeVersion": 2.1,
+         "position": [0, 0], "webhookId": "f0a4b5c6-7d8e-4f9a-8b0c-1d2e3f4a5b6c",
+         "parameters": {"httpMethod": "GET", "path": "ig/connect", "responseMode": "responseNode", "options": {}}},
+        {"id": "ic-check", "name": "Check Link", "type": "n8n-nodes-base.code", "typeVersion": 2,
+         "position": [220, 0], "parameters": {"jsCode": CHECK_LINK_JS.strip()}},
+        switch("Link OK?", [440, 0], "route", ["go", "stop"]),
+        pg_node("Studio & Link Status", [660, -100], LINK_STATUS_SQL,
+                "={{ [$json.studio_id, $json.nonce, $json.code] }}", alwaysOutputData=True),
+        respond("Respond Stopped", [660, 120], "={{ $json.html }}", code=400),
+        {"id": "ic-connect", "name": "Connect Account", "type": "n8n-nodes-base.code", "typeVersion": 2,
+         "position": [880, -100], "parameters": {"jsCode": sub(CONNECT_ACCOUNT_JS).strip()}},
+        {"id": "ic-ok", "name": "Got Token?", "type": "n8n-nodes-base.if", "typeVersion": 2.2,
+         "position": [1100, -100],
+         "parameters": {"conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
+                                                   "typeValidation": "loose"},
+                                       "conditions": [{"id": "ok", "leftValue": "={{ $json.ok }}", "rightValue": "true",
+                                                       "operator": {"type": "boolean", "operation": "true",
+                                                                    "singleValue": True}}],
+                                       "combinator": "and"}, "options": {}}},
+        pg_node("Save Account", [1320, -180], SAVE_ACCOUNT_SQL,
+                "={{ [$json.nonce, $json.studio_id, $json.account_ref, $json.username, $json.token_enc, $json.expires_in] }}"),
+        {"id": "ic-result", "name": "Result", "type": "n8n-nodes-base.code", "typeVersion": 2,
+         "position": [1540, -100], "parameters": {"jsCode": RESULT_JS.strip()}},
+        respond("Respond Result", [1760, -100], "={{ $json.html }}"),
+        {"id": "ic-email", "name": "Founder Email", "type": "n8n-nodes-base.code", "typeVersion": 2,
+         "position": [1980, -100], "parameters": {"jsCode": "return [{ json: $('Result').first().json.email }];"}},
+        {"id": "ic-send", "name": "Send Email", "type": "n8n-nodes-base.executeWorkflow", "typeVersion": 1.2,
+         "position": [2200, -100], "onError": "continueRegularOutput",
+         "parameters": {"workflowId": {"__rl": True, "mode": "id", "value": "SEND_EMAIL_WF_ID"},
+                        "options": {"waitForSubWorkflow": True}}},
+    ]
+    conns = conn(("Connect Callback", "Check Link"), ("Check Link", "Link OK?"),
+                 ("Studio & Link Status", "Connect Account"), ("Connect Account", "Got Token?"),
+                 ("Save Account", "Result"), ("Result", "Respond Result"),
+                 ("Respond Result", "Founder Email"), ("Founder Email", "Send Email"))
+    conns["Link OK?"] = {"main": [[{"node": "Studio & Link Status", "type": "main", "index": 0}],
+                                  [{"node": "Respond Stopped", "type": "main", "index": 0}]]}
+    conns["Got Token?"] = {"main": [[{"node": "Save Account", "type": "main", "index": 0}],
+                                    [{"node": "Result", "type": "main", "index": 0}]]}
+    return {"id": WF_IDS["ig-connect"], "name": "IG Connect", "active": False,
+            "versionId": "00000000-0000-4000-8000-00000000d007",
+            "nodes": nodes, "connections": conns, "settings": dict(SETTINGS)}
+
+
 def main():
     scratch = sys.argv[1]
     os.makedirs(scratch, exist_ok=True)
@@ -642,7 +853,8 @@ def main():
                          (demo_booking_page(), "demo-booking-page.json"),
                          (ops_voice_lab(), "ops-voice-lab.json"),
                          (owner_actions(), "owner-actions.json"),
-                         (link_redirect(), "link-redirect.json")]:
+                         (link_redirect(), "link-redirect.json"),
+                         (ig_connect(), "ig-connect.json")]:
         redacted = json.dumps(wf, indent=2, ensure_ascii=False)
         with open(os.path.join(repo, "workflows", filename), "w") as f:
             f.write(redacted + "\n")

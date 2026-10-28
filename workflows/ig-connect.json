@@ -1,0 +1,444 @@
+{
+  "id": "C5M1lM4n3FgKO0J1",
+  "name": "IG Connect",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000d007",
+  "nodes": [
+    {
+      "id": "ic-hook",
+      "name": "Connect Callback",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "f0a4b5c6-7d8e-4f9a-8b0c-1d2e3f4a5b6c",
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "ig/connect",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "ic-check",
+      "name": "Check Link",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const esc = (s) => String(s ?? '').replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst page = (title, body) => `<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>${esc(title)}</title>\n<style>body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f4f1;color:#1f1d1a}\nmain{max-width:440px;margin:12vh auto;padding:28px 24px;background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);text-align:center}\nh1{font-size:21px;margin:0 0 14px} p{color:#5f5953;line-height:1.55;margin:0 0 10px} small{color:#9a938c}</style>\n</head><body><main>${body}<p><small>Loop Logic</small></p></main></body></html>`;\n\nconst crypto = require('crypto');\nconst q = $input.first().json.query || {};\nconst stop = (title, msg) => [{ json: { route: 'stop', html: page(title, `<h1>${esc(title)}</h1><p>${esc(msg)}</p>`) } }];\n\n// She tapped \"Cancel\" / \"Not now\" on Instagram's screen.\nif (q.error) return stop('Not connected', 'Instagram wasn’t connected. If that was a mistake, just tap the link again.');\n\nconst secret = String($env.OWNER_LINK_SECRET || '');\nconst [p64, sig] = String(q.state || '').split('.');\nlet valid = false, payload = null;\nif (secret && p64 && /^[0-9a-f]{32}$/.test(sig || '')) {\n  const want = Buffer.from(crypto.createHmac('sha256', secret).update(`ig-connect|${p64}`).digest('hex').slice(0, 32));\n  valid = crypto.timingSafeEqual(want, Buffer.from(sig));\n  if (valid) { try { payload = JSON.parse(Buffer.from(p64, 'base64url').toString('utf8')); } catch (e) { valid = false; } }\n}\nif (!valid || !payload || !Number.isInteger(payload.s) || !/^[A-Za-z0-9_-]{16,64}$/.test(String(payload.n || '')))\n  return stop('This link isn’t valid', 'It may have been changed or cut off. Use the link exactly as we sent it, or ask us for a new one.');\nif (Date.now() / 1000 > Number(payload.e))\n  return stop('This link has expired', 'Connect links work for 7 days. Ask us for a new one and it takes a minute.');\nif (!q.code || String(q.code).length > 2000)\n  return stop('Something went wrong', 'Instagram didn’t send back what we expected. Please tap the link again.');\nreturn [{ json: { route: 'go', studio_id: payload.s, nonce: String(payload.n), code: String(q.code).replace(/#_$/, '') } }];"
+      }
+    },
+    {
+      "id": "link-ok?",
+      "name": "Link OK?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        440,
+        0
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "Link OK?-go",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "go",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "go"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "Link OK?-stop",
+                    "leftValue": "={{ $json.route }}",
+                    "rightValue": "stop",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "stop"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "studio-and-link-status",
+      "name": "Studio & Link Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        660,
+        -100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Always exactly one row.\nSELECT $1::int AS studio_id, $2::text AS nonce, $3::text AS code,\n       (SELECT name FROM studios WHERE id = $1::int AND active) AS studio_name,\n       EXISTS (SELECT 1 FROM ig_connect_uses WHERE nonce = $2) AS link_used;",
+        "options": {
+          "queryReplacement": "={{ [$json.studio_id, $json.nonce, $json.code] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "respond-stopped",
+      "name": "Respond Stopped",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        660,
+        120
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseCode": 400,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Robots-Tag",
+                "value": "noindex"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "ic-connect",
+      "name": "Connect Account",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        -100
+      ],
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst tokenKey = () => {\n  const k = String($env.IG_TOKEN_KEY || '');\n  if (k.length < 32) throw new Error('IG_TOKEN_KEY is missing on the server');\n  return crypto.createHash('sha256').update(k, 'utf8').digest();\n};\nconst encryptToken = (plain) => {\n  const iv = crypto.randomBytes(12);\n  const c = crypto.createCipheriv('aes-256-gcm', tokenKey(), iv);\n  const ct = Buffer.concat([c.update(String(plain), 'utf8'), c.final()]);\n  return Buffer.concat([Buffer.from([1]), iv, c.getAuthTag(), ct]).toString('base64');\n};\nconst decryptToken = (b64) => {\n  const b = Buffer.from(String(b64 || ''), 'base64');\n  if (b.length < 30 || b[0] !== 1) throw new Error('no usable Instagram token stored for this account');\n  const d = crypto.createDecipheriv('aes-256-gcm', tokenKey(), b.subarray(1, 13));\n  d.setAuthTag(b.subarray(13, 29));\n  return Buffer.concat([d.update(b.subarray(29)), d.final()]).toString('utf8');\n};\n\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\nconst scrub = (s) => String(s || '').replace(/[A-Za-z0-9_\\-]{40,}/g, '[redacted]').slice(0, 300);\nasync function graphCall(ctx, { what, method = 'GET', url, token, qs, form, json, tries = 1 }) {\n  const headers = {};\n  if (token) headers.Authorization = `Bearer ${token}`;\n  let body;\n  if (form) { headers['Content-Type'] = 'application/x-www-form-urlencoded'; body = new URLSearchParams(form).toString(); }\n  else if (json) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(json); }\n  for (let attempt = 1; ; attempt++) {\n    let r;\n    try {\n      r = await ctx.helpers.httpRequest({ method, url, qs, headers, body, json: false,\n        returnFullResponse: true, ignoreHttpStatusErrors: true, timeout: 20000 });\n    } catch (e) {\n      if (attempt < tries) { await sleep(700 * attempt); continue; }\n      const err = new Error(`${what}: could not reach Instagram (${scrub(e.code || e.message)})`);\n      err.kind = 'network'; throw err;\n    }\n    let data = r.body;\n    if (Buffer.isBuffer(data)) data = data.toString('utf8');\n    if (typeof data === 'string') { try { data = JSON.parse(data); } catch (e) { data = { raw: scrub(data) }; } }\n    if (r.statusCode >= 500 && attempt < tries) { await sleep(700 * attempt); continue; }\n    if (r.statusCode >= 400) {\n      const m = (data && (data.error || data)) || {};\n      const err = new Error(`${what}: HTTP ${r.statusCode}: ${scrub(m.message || m.error_message || m.raw || 'error')}` +\n                            (m.code ? ` (code ${m.code}${m.error_subcode ? '/' + m.error_subcode : ''})` : ''));\n      err.kind = 'http'; err.status = r.statusCode; err.metaCode = m.code; throw err;\n    }\n    return data;\n  }\n}\n\nconst j = $input.first().json;\nconst base = { studio_id: j.studio_id, studio_name: j.studio_name, nonce: j.nonce };\nif (!j.studio_name) return [{ json: { ...base, ok: false, outcome: 'no_studio' } }];\nif (j.link_used)    return [{ json: { ...base, ok: false, outcome: 'link_used' } }];\n\nconst secret = String($env.IG_APP_SECRET_INSTAGRAM || '');\ntry {\n  if (!secret) throw new Error('IG_APP_SECRET_INSTAGRAM is missing on the server');\n  // 1. one-time code -> short-lived token (never retried: the code works once)\n  const short = await graphCall(this, { what: 'code exchange', method: 'POST',\n    url: 'https://api.instagram.com/oauth/access_token',\n    form: { client_id: '1068683115593698', client_secret: secret, grant_type: 'authorization_code',\n            redirect_uri: 'https://n8n.looplogicsystems.com/webhook/ig/connect', code: j.code } });\n  const s = Array.isArray(short.data) ? short.data[0] : short;\n  const perms = Array.isArray(s.permissions) ? s.permissions : String(s.permissions || '').split(',');\n  if (!perms.map((p) => p.trim()).includes('instagram_business_manage_messages'))\n    return [{ json: { ...base, ok: false, outcome: 'no_message_permission' } }];\n  // 2. short-lived -> long-lived (~60 days)\n  const long = await graphCall(this, { what: 'long-lived token', url: 'https://graph.instagram.com/access_token',\n    qs: { grant_type: 'ig_exchange_token', client_secret: secret, access_token: s.access_token }, tries: 2 });\n  // 3. which account is this? user_id is what webhooks carry as the account id.\n  const me = await graphCall(this, { what: 'account lookup', url: 'https://graph.instagram.com/v25.0/me',\n    qs: { fields: 'user_id,username,name,account_type' }, token: long.access_token, tries: 3 });\n  if (!me.user_id) throw new Error('account lookup: no user_id returned');\n  // 4. deliver this account's DMs to our webhook (the dashboard's per-account toggle)\n  let subscribed = false, subscribe_error = null;\n  try {\n    const sub = await graphCall(this, { what: 'webhook subscription', method: 'POST', url: 'https://graph.instagram.com/v25.0/me/subscribed_apps',\n      qs: { subscribed_fields: 'messages' }, token: long.access_token, tries: 2 });\n    subscribed = !!(sub && sub.success);\n  } catch (e) { subscribe_error = e.message; }\n  return [{ json: { ...base, ok: true, outcome: 'pending_save',\n    account_ref: String(me.user_id), username: me.username || null, name: me.name || null,\n    account_type: me.account_type || null, subscribed, subscribe_error,\n    expires_in: Number(long.expires_in) || 5184000,\n    token_enc: encryptToken(long.access_token) } }];   // ciphertext only, never the token\n} catch (e) {\n  return [{ json: { ...base, ok: false, outcome: 'error', error: String(e.message).slice(0, 400) } }];\n}"
+      }
+    },
+    {
+      "id": "ic-ok",
+      "name": "Got Token?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1100,
+        -100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "ok",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "save-account",
+      "name": "Save Account",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1320,
+        -180
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One statement, always one row. Refuses to move an account that is already\n-- connected to a DIFFERENT studio; re-connecting to the same studio just\n-- replaces the token (that is also how a revoked token is fixed: a new link).\nWITH clash AS (\n  SELECT 1 FROM channel_accounts\n   WHERE channel = 'instagram' AND account_ref = $3 AND studio_id <> $2::int\n), used AS (\n  INSERT INTO ig_connect_uses (nonce, studio_id, account_ref, ig_username)\n  SELECT $1, $2::int, $3, $4 WHERE NOT EXISTS (SELECT 1 FROM clash)\n  ON CONFLICT (nonce) DO NOTHING\n  RETURNING nonce\n), acct AS (\n  INSERT INTO channel_accounts (studio_id, channel, account_ref, access_token_enc, ig_username,\n                                connected_at, token_issued_at, token_expires_at, token_error, active)\n  SELECT $2::int, 'instagram', $3, decode($5, 'base64'), $4,\n         now(), now(), now() + make_interval(secs => $6::int), NULL, true\n   WHERE EXISTS (SELECT 1 FROM used)\n  ON CONFLICT (channel, account_ref) DO UPDATE SET\n         access_token_enc = EXCLUDED.access_token_enc, ig_username = EXCLUDED.ig_username,\n         connected_at = now(), token_issued_at = now(),\n         token_expires_at = EXCLUDED.token_expires_at, token_error = NULL, active = true\n   WHERE channel_accounts.studio_id = EXCLUDED.studio_id\n  RETURNING id\n)\nSELECT CASE WHEN EXISTS (SELECT 1 FROM acct)  THEN 'connected'\n            WHEN EXISTS (SELECT 1 FROM clash) THEN 'other_studio'\n            ELSE 'link_used' END AS outcome;",
+        "options": {
+          "queryReplacement": "={{ [$json.nonce, $json.studio_id, $json.account_ref, $json.username, $json.token_enc, $json.expires_in] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "id": "ic-result",
+      "name": "Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        -100
+      ],
+      "parameters": {
+        "jsCode": "const esc = (s) => String(s ?? '').replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' }[c]));\nconst page = (title, body) => `<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>${esc(title)}</title>\n<style>body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f4f1;color:#1f1d1a}\nmain{max-width:440px;margin:12vh auto;padding:28px 24px;background:#fff;border-radius:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);text-align:center}\nh1{font-size:21px;margin:0 0 14px} p{color:#5f5953;line-height:1.55;margin:0 0 10px} small{color:#9a938c}</style>\n</head><body><main>${body}<p><small>Loop Logic</small></p></main></body></html>`;\n\nconst c = $('Connect Account').first().json;\nconst outcome = c.ok ? $json.outcome : c.outcome;\nconst who = c.username ? `@${c.username}` : 'Your Instagram account';\nconst P = {\n  connected:     ['Connected ✓', `${who} is now connected to ${c.studio_name}. You can close this page.`],\n  other_studio:  ['Already connected elsewhere', `${who} is already connected to another studio, so we didn’t change anything. We’ve been told and will be in touch.`],\n  link_used:     ['This link was already used', 'Each connect link works once. If you need to connect again, ask us for a new one.'],\n  no_studio:     ['This link isn’t valid', 'Ask us for a new connect link.'],\n  no_message_permission: ['Almost there', 'Instagram didn’t give us permission to manage messages, which is what replies need. Tap the link again and leave every permission switched on.'],\n  error:         ['Something went wrong', 'We couldn’t finish connecting. Nothing was changed on your account. We’ve been told and will send you a new link.'],\n};\nconst [title, msg] = P[outcome] || P.error;\nconst lines = [\n  `Studio: ${c.studio_name || '(unknown)'} (id ${c.studio_id})`,\n  c.username ? `Account: @${c.username}${c.name ? ' (' + c.name + ')' : ''}, id ${c.account_ref}, type ${c.account_type || '?'}` : null,\n  outcome === 'connected' ? `Token valid until about ${new Date(Date.now() + c.expires_in * 1000).toISOString().slice(0, 10)}; refreshed automatically.` : null,\n  outcome === 'connected' && !c.subscribed ? `WARNING: subscribing this account to message webhooks failed (${c.subscribe_error || 'no success flag'}). Its DMs will not arrive until that is fixed.` : null,\n  c.error ? `Error: ${c.error}` : null,\n].filter(Boolean);\nreturn [{ json: {\n  html: page(title, `<h1>${esc(title)}</h1><p>${esc(msg)}</p>`),\n  email: { to: 'founders',\n           subject: outcome === 'connected' ? `Instagram connected: ${who} → ${c.studio_name}`\n                                            : `Instagram connect FAILED (${outcome}) for ${c.studio_name || 'studio ' + c.studio_id}`,\n           heading: outcome === 'connected' ? `${who} connected through a connect link.` : `A connect link didn’t work: ${outcome}.`,\n           lines },\n} }];"
+      }
+    },
+    {
+      "id": "respond-result",
+      "name": "Respond Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1760,
+        -100
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              },
+              {
+                "name": "X-Robots-Tag",
+                "value": "noindex"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "ic-email",
+      "name": "Founder Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        -100
+      ],
+      "parameters": {
+        "jsCode": "return [{ json: $('Result').first().json.email }];"
+      }
+    },
+    {
+      "id": "ic-send",
+      "name": "Send Email",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2200,
+        -100
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "SEND_EMAIL_WF_ID"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Connect Callback": {
+      "main": [
+        [
+          {
+            "node": "Check Link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Link": {
+      "main": [
+        [
+          {
+            "node": "Link OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Studio & Link Status": {
+      "main": [
+        [
+          {
+            "node": "Connect Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Connect Account": {
+      "main": [
+        [
+          {
+            "node": "Got Token?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Account": {
+      "main": [
+        [
+          {
+            "node": "Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Result": {
+      "main": [
+        [
+          {
+            "node": "Respond Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Result": {
+      "main": [
+        [
+          {
+            "node": "Founder Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Founder Email": {
+      "main": [
+        [
+          {
+            "node": "Send Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Link OK?": {
+      "main": [
+        [
+          {
+            "node": "Studio & Link Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Stopped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Got Token?": {
+      "main": [
+        [
+          {
+            "node": "Save Account",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

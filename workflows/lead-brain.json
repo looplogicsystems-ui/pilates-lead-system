@@ -195,9 +195,9 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Idempotent per (channel, external_id). The status CASE is the lifecycle:\n--   cold/new  -> engaged   (a returning lead re-enters the funnel)\n--   escalated -> escalated (stays with the human until they resolve it)\n--   booked / link_sent     (kept: the conversation continues, the state stands)\n-- and nothing moves at all while ai_paused is set.\nINSERT INTO leads (external_id, channel, name, studio_id, status, created_at, updated_at)\nVALUES ($1, $2, $3, $4, 'engaged', now(), now())\nON CONFLICT (channel, external_id) DO UPDATE SET\n    name       = COALESCE(EXCLUDED.name, leads.name),\n    status     = CASE\n                   WHEN leads.ai_paused                THEN leads.status\n                   WHEN leads.status IN ('cold','new') THEN 'engaged'\n                   ELSE leads.status\n                 END,\n    updated_at = now()\nRETURNING id, status, ai_paused;",
+        "query": "-- Idempotent per (channel, external_id). The status CASE is the lifecycle:\n--   cold/new  -> engaged   (a returning lead re-enters the funnel)\n--   escalated -> escalated (stays with the human until they resolve it)\n--   booked / link_sent     (kept: the conversation continues, the state stands)\n-- and nothing moves at all while ai_paused is set.\nWITH prev AS (   -- the row as it was before this message (empty for a new lead)\n  SELECT pause_alerted_at FROM leads WHERE channel = $2 AND external_id = $1\n)\nINSERT INTO leads (external_id, channel, name, username, profile_checked_at, studio_id, status, created_at, updated_at)\nVALUES ($1, $2, $3, $5, CASE WHEN $6::boolean THEN now() END, $4, 'engaged', now(), now())\nON CONFLICT (channel, external_id) DO UPDATE SET\n    name       = COALESCE(EXCLUDED.name, leads.name),\n    username   = COALESCE(EXCLUDED.username, leads.username),\n    profile_checked_at = COALESCE(EXCLUDED.profile_checked_at, leads.profile_checked_at),\n    status     = CASE\n                   WHEN leads.ai_paused                THEN leads.status\n                   WHEN leads.status IN ('cold','new') THEN 'engaged'\n                   ELSE leads.status\n                 END,\n    -- While paused, the owner hears \"she wrote again\" at most once per 12h\n    -- (the takeover / escalation email itself sets this too).\n    pause_alerted_at = CASE\n                   WHEN leads.ai_paused AND (leads.pause_alerted_at IS NULL\n                                             OR leads.pause_alerted_at < now() - interval '12 hours')\n                   THEN now() ELSE leads.pause_alerted_at END,\n    updated_at = now()\nRETURNING id, status, ai_paused, username, name,\n          (ai_paused AND ((SELECT pause_alerted_at FROM prev) IS NULL\n                          OR (SELECT pause_alerted_at FROM prev) < now() - interval '12 hours')) AS pause_alert_due;",
         "options": {
-          "queryReplacement": "={{ [$('When Called').first().json.external_id, $('When Called').first().json.channel, $('When Called').first().json.name, $('Resolve Studio').first().json.studio_id] }}"
+          "queryReplacement": "={{ [$('When Called').first().json.external_id, $('When Called').first().json.channel, $('When Called').first().json.name || null, $('Resolve Studio').first().json.studio_id, $('When Called').first().json.username || null, !!$('When Called').first().json.profile_checked] }}"
         }
       },
       "credentials": {
@@ -274,11 +274,45 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        860,
+        1080,
         460
       ],
       "parameters": {
-        "jsCode": "const leadLabel = (inb) => inb.name ? String(inb.name)\n  : (inb.channel === 'instagram' ? 'An Instagram lead' : `A ${inb.channel} lead`);\n// Signed one-tap owner buttons (Owner Actions workflow). Same signature as its\n// Verify node: first 32 hex of HMAC-SHA256(OWNER_LINK_SECRET, \"<action>:<lead id>\").\n// No secret on the server -> no buttons, rather than buttons that can't work.\nconst ownerButton = (label, action, leadId) => {\n  const secret = String($env.OWNER_LINK_SECRET || '');\n  if (!secret || !leadId) return null;\n  const t = require('crypto').createHmac('sha256', secret).update(`${action}:${leadId}`).digest('hex').slice(0, 32);\n  return { label, url: `https://n8n.looplogicsystems.com/webhook/owner?a=${action}&l=${leadId}&t=${t}` };\n};\n\nconst inb = $('When Called').first().json;\nconst cfg = $('Resolve Studio').first().json;\nconst leadId = $('Upsert Lead').first().json.id;\nreturn [{ json: {\n  to: inb.channel === 'test' ? 'delivered@resend.dev' : (cfg.owner_alert_email || 'founders'),\n  subject: `${leadLabel(inb)} replied — the AI is paused for her`,\n  heading: `${leadLabel(inb)} sent a new message. The AI did not answer, because this conversation is with you.`,\n  lines: [`Her message: \"${String(inb.message || '').slice(0, 500)}\"`,\n          `Reply to her in your ${inb.channel === 'instagram' ? 'Instagram DMs' : inb.channel}, or tap Resume to hand her back to the AI.`],\n  buttons: [ownerButton('Resume AI', 'resume', leadId)].filter(Boolean),\n} }];"
+        "jsCode": "const leadLabel = (l) => {\n  const u = l.username ? `@${l.username}` : null;\n  if (u && l.name) return `${u} (${l.name})`;\n  if (u) return u;\n  if (l.name) return String(l.name);\n  return l.channel === 'instagram' ? 'An Instagram lead' : `A ${l.channel} lead`;\n};\n// Opens the owner's DM thread with this lead in the Instagram app.\nconst chatButton = (l) => (l.channel === 'instagram' && l.username && /^[A-Za-z0-9._]{1,30}$/.test(l.username))\n  ? { label: 'Open chat', url: `https://ig.me/m/${l.username}` } : null;\n\n// The lead as stored (the adapter looks an Instagram profile up only once, so\n// this message alone may not carry the @username).\nconst person = () => {\n  const up = $('Upsert Lead').first().json, inb = $('When Called').first().json;\n  return { channel: inb.channel, username: up.username || inb.username || null, name: up.name || inb.name || null };\n};\n// Signed one-tap owner buttons (Owner Actions workflow). Same signature as its\n// Verify node: first 32 hex of HMAC-SHA256(OWNER_LINK_SECRET, \"<action>:<lead id>\").\n// No secret on the server -> no buttons, rather than buttons that can't work.\nconst ownerButton = (label, action, leadId) => {\n  const secret = String($env.OWNER_LINK_SECRET || '');\n  if (!secret || !leadId) return null;\n  const t = require('crypto').createHmac('sha256', secret).update(`${action}:${leadId}`).digest('hex').slice(0, 32);\n  return { label, url: `https://n8n.looplogicsystems.com/webhook/owner?a=${action}&l=${leadId}&t=${t}` };\n};\n\nconst inb = $('When Called').first().json;\nconst cfg = $('Resolve Studio').first().json;\nconst leadId = $('Upsert Lead').first().json.id;\nconst p = person();\nreturn [{ json: {\n  to: inb.channel === 'test' ? 'delivered@resend.dev' : (cfg.owner_alert_email || 'founders'),\n  subject: `${leadLabel(p)} wrote again — the AI is paused for her`,\n  heading: `${leadLabel(p)} sent a new message. The AI did not answer, because this conversation is with you.`,\n  lines: [`Her message: \"${String(inb.message || '').slice(0, 500)}\"`,\n          `Reply to her in your ${inb.channel === 'instagram' ? 'Instagram DMs' : inb.channel}, or tap Resume to hand her back to the AI.`,\n          'You get at most one of these emails every 12 hours per lead.'],\n  buttons: [ownerButton('Resume AI', 'resume', leadId), chatButton(p)].filter(Boolean),\n} }];"
+      }
+    },
+    {
+      "id": "alert-due",
+      "name": "Alert Due?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        860,
+        380
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "alert-due",
+              "leftValue": "={{ $('Upsert Lead').first().json.pause_alert_due }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
       }
     },
     {
@@ -287,7 +321,7 @@
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1.2,
       "position": [
-        1080,
+        1300,
         460
       ],
       "parameters": {
@@ -309,8 +343,8 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1300,
-        460
+        1520,
+        400
       ],
       "parameters": {
         "assignments": {
@@ -456,7 +490,7 @@
         200
       ],
       "parameters": {
-        "jsCode": "const leadLabel = (inb) => inb.name ? String(inb.name)\n  : (inb.channel === 'instagram' ? 'An Instagram lead' : `A ${inb.channel} lead`);\n// Signed one-tap owner buttons (Owner Actions workflow). Same signature as its\n// Verify node: first 32 hex of HMAC-SHA256(OWNER_LINK_SECRET, \"<action>:<lead id>\").\n// No secret on the server -> no buttons, rather than buttons that can't work.\nconst ownerButton = (label, action, leadId) => {\n  const secret = String($env.OWNER_LINK_SECRET || '');\n  if (!secret || !leadId) return null;\n  const t = require('crypto').createHmac('sha256', secret).update(`${action}:${leadId}`).digest('hex').slice(0, 32);\n  return { label, url: `https://n8n.looplogicsystems.com/webhook/owner?a=${action}&l=${leadId}&t=${t}` };\n};\n\nconst crypto = require('crypto');\nconst cfg = $('Resolve Studio').first().json;\nconst inb = $('When Called').first().json;\nconst ctx = $('Build Context').first().json;\nconst v   = (typeof cfg.prompt_vars === 'string') ? JSON.parse(cfg.prompt_vars) : (cfg.prompt_vars || {});\nconst owner = cfg.owner_name || 'the owner';\n\n// --- parse the model's JSON (tolerate code fences / stray prose) ----------\nconst raw = String($json.output ?? $json.text ?? '');\nlet ai = null;\ntry { const m = raw.match(/\\{[\\s\\S]*\\}/); ai = JSON.parse(m ? m[0] : raw); } catch (e) { ai = null; }\n\nconst holding = v.escalation_line || `Let me get ${owner} to come back to you on that properly.`;\nconst INTENTS = ['continue', 'send_booking_link', 'lead_booked', 'escalate'];\nlet intent = ai && INTENTS.includes(ai.intent) ? ai.intent : 'continue';\nlet reason = ai && ai.escalate_reason ? String(ai.escalate_reason) : null;\n\n// The model must never type a link — strip anything that looks like one.\nconst stripUrls = (s) => String(s || '').replace(/\\bhttps?:\\/\\/\\S+/gi, '').replace(/\\bwww\\.\\S+/gi, '').replace(/[ \\t]{2,}/g, ' ').trim();\nlet reply = stripUrls(ai ? ai.reply : '');\n// Em/en dashes are the strongest \"an AI wrote this\" tell. The prompt forbids\n// them; any that slip through become ordinary texting punctuation. Only the\n// model's text: the owner's own escalation line and the disclosure are hers.\nreply = reply\n  .replace(/^\\s*(yes|yep|yeah|ok|okay)\\s*[—–]\\s*/i, (m, w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() + ', ')\n  .replace(/\\s*[—–]\\s*/g, ', ')\n  .replace(/,\\s*([,.!?])/g, '$1')\n  .trim();\n\n// Unparseable or empty output: don't send the model's raw text to a lead.\nif (!ai || !reply) { intent = 'escalate'; reason = reason || 'the AI produced no usable reply'; }\n\n// --- the studio isn't fully set up: never improvise ------------------------\nif (!ctx.ready) { intent = 'escalate'; reason = 'studio setup incomplete: ' + ctx.missing.join('; '); }\n\n// --- validate the class it picked -----------------------------------------\n// Safety net: if the model ASKS whether to send the link, it hasn't been agreed\n// yet — attaching it anyway contradicts its own question (seen live 2026-10-25).\n// Catches \"want me to send the link?\" AND \"want me to send it over?\" (the\n// second slipped past the first version of this check in the voice lab).\nif (intent === 'send_booking_link'\n    && /\\b(want|would you like|shall|should|can|do you want)\\b[^?]{0,60}\\b(send|share|drop|pass)\\b[^?]*\\?/i.test(reply)) {\n  intent = 'continue';\n}\n\nconst slot = (ai && ai.slot) ? (ctx.slots || []).find((s) => s.id === String(ai.slot).trim().toUpperCase()) || null : null;\nconst returning = !!(ai && ai.returning_client === true);\n\n// --- choose the link (code, not the model) --------------------------------\nlet link = null, kind = null, linkProblem = false;\nif (intent === 'send_booking_link') {\n  if (!returning && ctx.intro && ctx.intro.url) { link = ctx.intro.url; kind = 'new_client'; }\n  else if (returning && slot && slot.url)       { link = slot.url;       kind = 'class'; }\n  else if (cfg.booking_url)                     { link = cfg.booking_url; kind = 'main'; }\n  if (!link || cfg.links_ok === false) {\n    // No working link: a human has to send it. Honest holding line + alert.\n    intent = 'escalate'; linkProblem = true;\n    link = null; kind = null;   // nothing is sent, so nothing is recorded or coded\n    reason = cfg.links_ok === false ? 'booking link marked broken by the daily check' : 'no booking link configured';\n    reply = `${reply}\\n\\n${owner} will send you the booking link shortly.`.trim();\n  }\n}\n\n// --- compose the final message --------------------------------------------\n// The lead gets a tracked short link (Link Redirect records the click, then\n// sends her to `link`). The owner email shows the real destination.\nconst shortCode = link ? crypto.randomBytes(6).toString('base64url') : null;\nconst trackedLink = shortCode ? `https://go.looplogicsystems.com/${shortCode}` : null;\nlet final;\nif (intent === 'send_booking_link')                     final = `${reply}\\n${trackedLink}`;\nelse if (intent === 'lead_booked' && v.first_visit_tips)\n  // Once only: skip if the model already wrote tips despite being told not to.\n  final = /grip socks|minutes early|waiver/i.test(reply) ? reply : `${reply}\\n\\n${v.first_visit_tips}`;\nelse if (intent === 'escalate')                         final = linkProblem ? reply : holding;   // never let the model answer what it must hand over\nelse                                                    final = reply;\nif (ctx.first_message && v.ai_disclosure) final = `${final}\\n\\n${v.ai_disclosure}`;\n\n// --- the owner email for this outcome (built here, sent once downstream) ---\nconst who = leadLabel(inb);\nconst where = inb.channel === 'instagram' ? 'your Instagram DMs' : inb.channel;\nconst theirMsg = `Her message: \"${String(inb.message || '').slice(0, 500)}\"`;\nconst leadId = $('Upsert Lead').first().json.id;\nconst btn = (label, action) => ownerButton(label, action, leadId);\nlet owner_email = null;\nif (intent === 'send_booking_link') owner_email = {\n  subject: `${who} is heading to book${slot ? ' — ' + slot.label : ''}`,\n  heading: `${who} wants to book, and was sent your booking link.`,\n  lines: [slot ? `Recommended class: ${slot.label}` : 'No specific class was picked yet.',\n          `Link sent: ${link}`, theirMsg,\n          'She books herself on your booking page. When she shows up in your booking system, tap Mark booked.'],\n  buttons: [btn('Mark booked', 'booked'), btn('Pause AI for her', 'pause')].filter(Boolean) };\nif (intent === 'lead_booked') owner_email = {\n  subject: `${who} says she's booked`,\n  heading: `${who} says she has booked or bought the pass.`,\n  lines: [theirMsg, 'Please check she shows up in your booking system, then tap Confirm booked.'],\n  buttons: [btn('Confirm booked', 'booked'), btn('Pause AI for her', 'pause')].filter(Boolean) };\nif (intent === 'escalate') owner_email = {\n  subject: `${who} needs you — ${reason || 'a question for you'}`,\n  heading: `${who} asked something the AI handed to you.`,\n  lines: [`Why: ${reason || 'not specified'}`, theirMsg,\n          `The AI sent her a holding reply and is now PAUSED for this lead, so it won't answer her again. Reply to her in ${where}. When you're done, tap Resume to hand her back to the AI.`],\n  buttons: [btn('Resume AI', 'resume')].filter(Boolean) };\nif (owner_email) owner_email.to = (reason && reason.startsWith('studio setup incomplete'))\n  ? `${cfg.owner_alert_email || 'founders'}, founders` : (cfg.owner_alert_email || 'founders');\n// Voice-lab conversations (channel 'test') must not flood real inboxes:\n// their owner emails go to Resend's test sink, which accepts and discards.\nif (owner_email && inb.channel === 'test') owner_email.to = 'delivered@resend.dev';\n\nreturn [{ json: {\n  intent, reason, final_reply: final, ai_reply: reply,\n  slot_id: slot ? slot.id : null, class_id: slot ? slot.class_id : null, slot_label: slot ? slot.label : null,\n  link, link_kind: kind, short_code: shortCode, tracked_link: trackedLink,\n  returning_client: returning, owner_email,\n} }];"
+        "jsCode": "const leadLabel = (l) => {\n  const u = l.username ? `@${l.username}` : null;\n  if (u && l.name) return `${u} (${l.name})`;\n  if (u) return u;\n  if (l.name) return String(l.name);\n  return l.channel === 'instagram' ? 'An Instagram lead' : `A ${l.channel} lead`;\n};\n// Opens the owner's DM thread with this lead in the Instagram app.\nconst chatButton = (l) => (l.channel === 'instagram' && l.username && /^[A-Za-z0-9._]{1,30}$/.test(l.username))\n  ? { label: 'Open chat', url: `https://ig.me/m/${l.username}` } : null;\n\n// The lead as stored (the adapter looks an Instagram profile up only once, so\n// this message alone may not carry the @username).\nconst person = () => {\n  const up = $('Upsert Lead').first().json, inb = $('When Called').first().json;\n  return { channel: inb.channel, username: up.username || inb.username || null, name: up.name || inb.name || null };\n};\n// Signed one-tap owner buttons (Owner Actions workflow). Same signature as its\n// Verify node: first 32 hex of HMAC-SHA256(OWNER_LINK_SECRET, \"<action>:<lead id>\").\n// No secret on the server -> no buttons, rather than buttons that can't work.\nconst ownerButton = (label, action, leadId) => {\n  const secret = String($env.OWNER_LINK_SECRET || '');\n  if (!secret || !leadId) return null;\n  const t = require('crypto').createHmac('sha256', secret).update(`${action}:${leadId}`).digest('hex').slice(0, 32);\n  return { label, url: `https://n8n.looplogicsystems.com/webhook/owner?a=${action}&l=${leadId}&t=${t}` };\n};\n\nconst crypto = require('crypto');\nconst cfg = $('Resolve Studio').first().json;\nconst inb = $('When Called').first().json;\nconst ctx = $('Build Context').first().json;\nconst v   = (typeof cfg.prompt_vars === 'string') ? JSON.parse(cfg.prompt_vars) : (cfg.prompt_vars || {});\nconst owner = cfg.owner_name || 'the owner';\n\n// --- parse the model's JSON (tolerate code fences / stray prose) ----------\nconst raw = String($json.output ?? $json.text ?? '');\nlet ai = null;\ntry { const m = raw.match(/\\{[\\s\\S]*\\}/); ai = JSON.parse(m ? m[0] : raw); } catch (e) { ai = null; }\n\nconst holding = v.escalation_line || `Let me get ${owner} to come back to you on that properly.`;\nconst INTENTS = ['continue', 'send_booking_link', 'lead_booked', 'escalate'];\nlet intent = ai && INTENTS.includes(ai.intent) ? ai.intent : 'continue';\nlet reason = ai && ai.escalate_reason ? String(ai.escalate_reason) : null;\n\n// The model must never type a link — strip anything that looks like one.\nconst stripUrls = (s) => String(s || '').replace(/\\bhttps?:\\/\\/\\S+/gi, '').replace(/\\bwww\\.\\S+/gi, '').replace(/[ \\t]{2,}/g, ' ').trim();\nlet reply = stripUrls(ai ? ai.reply : '');\n// Em/en dashes are the strongest \"an AI wrote this\" tell. The prompt forbids\n// them; any that slip through become ordinary texting punctuation. Only the\n// model's text: the owner's own escalation line and the disclosure are hers.\nreply = reply\n  .replace(/^\\s*(yes|yep|yeah|ok|okay)\\s*[—–]\\s*/i, (m, w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() + ', ')\n  .replace(/\\s*[—–]\\s*/g, ', ')\n  .replace(/,\\s*([,.!?])/g, '$1')\n  .trim();\n\n// Unparseable or empty output: don't send the model's raw text to a lead.\nif (!ai || !reply) { intent = 'escalate'; reason = reason || 'the AI produced no usable reply'; }\n\n// --- the studio isn't fully set up: never improvise ------------------------\nif (!ctx.ready) { intent = 'escalate'; reason = 'studio setup incomplete: ' + ctx.missing.join('; '); }\n\n// --- validate the class it picked -----------------------------------------\n// Safety net: if the model ASKS whether to send the link, it hasn't been agreed\n// yet — attaching it anyway contradicts its own question (seen live 2026-10-25).\n// Catches \"want me to send the link?\" AND \"want me to send it over?\" (the\n// second slipped past the first version of this check in the voice lab).\nif (intent === 'send_booking_link'\n    && /\\b(want|would you like|shall|should|can|do you want)\\b[^?]{0,60}\\b(send|share|drop|pass)\\b[^?]*\\?/i.test(reply)) {\n  intent = 'continue';\n}\n\nconst slot = (ai && ai.slot) ? (ctx.slots || []).find((s) => s.id === String(ai.slot).trim().toUpperCase()) || null : null;\nconst returning = !!(ai && ai.returning_client === true);\n\n// --- choose the link (code, not the model) --------------------------------\nlet link = null, kind = null, linkProblem = false;\nif (intent === 'send_booking_link') {\n  if (!returning && ctx.intro && ctx.intro.url) { link = ctx.intro.url; kind = 'new_client'; }\n  else if (returning && slot && slot.url)       { link = slot.url;       kind = 'class'; }\n  else if (cfg.booking_url)                     { link = cfg.booking_url; kind = 'main'; }\n  if (!link || cfg.links_ok === false) {\n    // No working link: a human has to send it. Honest holding line + alert.\n    intent = 'escalate'; linkProblem = true;\n    link = null; kind = null;   // nothing is sent, so nothing is recorded or coded\n    reason = cfg.links_ok === false ? 'booking link marked broken by the daily check' : 'no booking link configured';\n    reply = `${reply}\\n\\n${owner} will send you the booking link shortly.`.trim();\n  }\n}\n\n// --- compose the final message --------------------------------------------\n// The lead gets a tracked short link (Link Redirect records the click, then\n// sends her to `link`). The owner email shows the real destination.\nconst shortCode = link ? crypto.randomBytes(6).toString('base64url') : null;\nconst trackedLink = shortCode ? `https://go.looplogicsystems.com/${shortCode}` : null;\nlet final;\nif (intent === 'send_booking_link')                     final = `${reply}\\n${trackedLink}`;\nelse if (intent === 'lead_booked' && v.first_visit_tips)\n  // Once only: skip if the model already wrote tips despite being told not to.\n  final = /grip socks|minutes early|waiver/i.test(reply) ? reply : `${reply}\\n\\n${v.first_visit_tips}`;\nelse if (intent === 'escalate')                         final = linkProblem ? reply : holding;   // never let the model answer what it must hand over\nelse                                                    final = reply;\nif (ctx.first_message && v.ai_disclosure) final = `${final}\\n\\n${v.ai_disclosure}`;\n\n// --- the owner email for this outcome (built here, sent once downstream) ---\nconst p = person();\nconst who = leadLabel(p);\nconst where = inb.channel === 'instagram' ? 'your Instagram DMs' : inb.channel;\nconst theirMsg = `Her message: \"${String(inb.message || '').slice(0, 500)}\"`;\nconst leadId = $('Upsert Lead').first().json.id;\nconst btn = (label, action) => ownerButton(label, action, leadId);\nconst chat = chatButton(p);\nlet owner_email = null;\nif (intent === 'send_booking_link') owner_email = {\n  subject: `${who} is heading to book${slot ? ' — ' + slot.label : ''}`,\n  heading: `${who} wants to book, and was sent your booking link.`,\n  lines: [slot ? `Recommended class: ${slot.label}` : 'No specific class was picked yet.',\n          `Link sent: ${link}`, theirMsg,\n          'She books herself on your booking page. When she shows up in your booking system, tap Mark booked.'],\n  buttons: [btn('Mark booked', 'booked'), btn('Pause AI for her', 'pause'), chat].filter(Boolean) };\nif (intent === 'lead_booked') owner_email = {\n  subject: `${who} says she's booked`,\n  heading: `${who} says she has booked or bought the pass.`,\n  lines: [theirMsg, 'Please check she shows up in your booking system, then tap Confirm booked.'],\n  buttons: [btn('Confirm booked', 'booked'), btn('Pause AI for her', 'pause'), chat].filter(Boolean) };\nif (intent === 'escalate') owner_email = {\n  subject: `${who} needs you — ${reason || 'a question for you'}`,\n  heading: `${who} asked something the AI handed to you.`,\n  lines: [`Why: ${reason || 'not specified'}`, theirMsg,\n          `The AI sent her a holding reply and is now PAUSED for this lead, so it won't answer her again. Reply to her in ${where}. When you're done, tap Resume to hand her back to the AI.`],\n  buttons: [btn('Resume AI', 'resume'), chat].filter(Boolean) };\nif (owner_email) owner_email.to = (reason && reason.startsWith('studio setup incomplete'))\n  ? `${cfg.owner_alert_email || 'founders'}, founders` : (cfg.owner_alert_email || 'founders');\n// Voice-lab conversations (channel 'test') must not flood real inboxes:\n// their owner emails go to Resend's test sink, which accepts and discards.\nif (owner_email && inb.channel === 'test') owner_email.to = 'delivered@resend.dev';\n\nreturn [{ json: {\n  intent, reason, final_reply: final, ai_reply: reply,\n  slot_id: slot ? slot.id : null, class_id: slot ? slot.class_id : null, slot_label: slot ? slot.label : null,\n  link, link_kind: kind, short_code: shortCode, tracked_link: trackedLink,\n  returning_client: returning, owner_email,\n} }];"
       }
     },
     {
@@ -610,7 +644,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH e AS (\n  INSERT INTO escalations (lead_id, reason, resolved, created_at)\n  VALUES ($1, $2, false, now())\n  RETURNING id\n)\n-- Escalating PAUSES the AI for this lead until the owner taps Resume: the\n-- owner email says it has stepped back, and now it really has.\nUPDATE leads SET status = 'escalated', ai_paused = true, updated_at = now()\n WHERE id = $1\nRETURNING (SELECT id FROM e) AS escalation_id;",
+        "query": "WITH e AS (\n  INSERT INTO escalations (lead_id, reason, resolved, created_at)\n  VALUES ($1, $2, false, now())\n  RETURNING id\n)\n-- Escalating PAUSES the AI for this lead until the owner taps Resume: the\n-- owner email says it has stepped back, and now it really has.\nUPDATE leads SET status = 'escalated', ai_paused = true, paused_by = 'escalation',\n                 paused_at = now(), pause_alerted_at = now(), updated_at = now()\n WHERE id = $1\nRETURNING (SELECT id FROM e) AS escalation_id;",
         "options": {
           "queryReplacement": "={{ [$('Upsert Lead').first().json.id, $('Decide').first().json.reason || 'unspecified'] }}"
         }
@@ -763,6 +797,12 @@
               "name": "outbound_message_id",
               "type": "number",
               "value": "={{ $('Log Outbound').first().json.id }}"
+            },
+            {
+              "id": "r12",
+              "name": "account_ref",
+              "type": "string",
+              "value": "={{ $('When Called').first().json.account_ref }}"
             }
           ]
         },
@@ -870,7 +910,7 @@
       "main": [
         [
           {
-            "node": "Email: Paused Lead",
+            "node": "Alert Due?",
             "type": "main",
             "index": 0
           }
@@ -878,6 +918,24 @@
         [
           {
             "node": "Load Studio Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Due?": {
+      "main": [
+        [
+          {
+            "node": "Email: Paused Lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return: Paused",
             "type": "main",
             "index": 0
           }

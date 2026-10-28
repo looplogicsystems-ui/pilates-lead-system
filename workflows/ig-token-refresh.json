@@ -1,0 +1,210 @@
+{
+  "id": "n56lLK7WRdYFesdW",
+  "name": "IG Token Refresh",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000c002",
+  "nodes": [
+    {
+      "id": "daily-check",
+      "name": "Daily Check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 10
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "run-now",
+      "name": "Run Now",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "load-tokens",
+      "name": "Load Tokens",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ca.id, ca.account_ref, ca.ig_username, s.name AS studio_name,\n       encode(ca.access_token_enc, 'base64') AS token_enc,\n       ca.token_issued_at, ca.token_expires_at,\n       (ca.token_issued_at IS NULL OR ca.token_issued_at < now() - interval '7 days') AS refresh_due\n  FROM channel_accounts ca\n  JOIN studios s ON s.id = ca.studio_id\n WHERE ca.channel = 'instagram' AND ca.active AND s.active\n   AND ca.access_token_enc IS NOT NULL;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "refresh",
+      "name": "Refresh Tokens",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst tokenKey = () => {\n  const k = String($env.IG_TOKEN_KEY || '');\n  if (k.length < 32) throw new Error('IG_TOKEN_KEY is missing on the server');\n  return crypto.createHash('sha256').update(k, 'utf8').digest();\n};\nconst encryptToken = (plain) => {\n  const iv = crypto.randomBytes(12);\n  const c = crypto.createCipheriv('aes-256-gcm', tokenKey(), iv);\n  const ct = Buffer.concat([c.update(String(plain), 'utf8'), c.final()]);\n  return Buffer.concat([Buffer.from([1]), iv, c.getAuthTag(), ct]).toString('base64');\n};\nconst decryptToken = (b64) => {\n  const b = Buffer.from(String(b64 || ''), 'base64');\n  if (b.length < 30 || b[0] !== 1) throw new Error('no usable Instagram token stored for this account');\n  const d = crypto.createDecipheriv('aes-256-gcm', tokenKey(), b.subarray(1, 13));\n  d.setAuthTag(b.subarray(13, 29));\n  return Buffer.concat([d.update(b.subarray(29)), d.final()]).toString('utf8');\n};\n\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\nconst scrub = (s) => String(s || '').replace(/[A-Za-z0-9_\\-]{40,}/g, '[redacted]').slice(0, 300);\nasync function graphCall(ctx, { what, method = 'GET', url, token, qs, form, json, tries = 1 }) {\n  const headers = {};\n  if (token) headers.Authorization = `Bearer ${token}`;\n  let body;\n  if (form) { headers['Content-Type'] = 'application/x-www-form-urlencoded'; body = new URLSearchParams(form).toString(); }\n  else if (json) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(json); }\n  for (let attempt = 1; ; attempt++) {\n    let r;\n    try {\n      r = await ctx.helpers.httpRequest({ method, url, qs, headers, body, json: false,\n        returnFullResponse: true, ignoreHttpStatusErrors: true, timeout: 20000 });\n    } catch (e) {\n      if (attempt < tries) { await sleep(700 * attempt); continue; }\n      const err = new Error(`${what}: could not reach Instagram (${scrub(e.code || e.message)})`);\n      err.kind = 'network'; throw err;\n    }\n    let data = r.body;\n    if (Buffer.isBuffer(data)) data = data.toString('utf8');\n    if (typeof data === 'string') { try { data = JSON.parse(data); } catch (e) { data = { raw: scrub(data) }; } }\n    if (r.statusCode >= 500 && attempt < tries) { await sleep(700 * attempt); continue; }\n    if (r.statusCode >= 400) {\n      const m = (data && (data.error || data)) || {};\n      const err = new Error(`${what}: HTTP ${r.statusCode}: ${scrub(m.message || m.error_message || m.raw || 'error')}` +\n                            (m.code ? ` (code ${m.code}${m.error_subcode ? '/' + m.error_subcode : ''})` : ''));\n      err.kind = 'http'; err.status = r.statusCode; err.metaCode = m.code; throw err;\n    }\n    return data;\n  }\n}\n\n// One output item per account. The new token is encrypted here and never output.\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  if (!j.id) continue;                         // a zero-row SELECT still emits {success:true}\n  const base = { id: j.id, account_ref: j.account_ref, ig_username: j.ig_username, studio_name: j.studio_name,\n                 old_expires_at: j.token_expires_at };\n  if (!j.refresh_due) { out.push({ json: { ...base, status: 'not_due', token_enc: '', expires_in: 0, error: '' } }); continue; }\n  try {\n    const r = await graphCall(this, { what: 'token refresh', url: 'https://graph.instagram.com/refresh_access_token',\n      qs: { grant_type: 'ig_refresh_token', access_token: decryptToken(j.token_enc) }, tries: 2 });\n    if (!r.access_token) throw new Error('token refresh: no token in the response');\n    out.push({ json: { ...base, status: 'refreshed', token_enc: encryptToken(r.access_token),\n                       expires_in: Number(r.expires_in) || 5184000, error: '' } });\n  } catch (e) {\n    out.push({ json: { ...base, status: 'failed', token_enc: '', expires_in: 0, error: String(e.message).slice(0, 400) } });\n  }\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "save-refresh",
+      "name": "Save",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        200,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Writes only what changed. Always returns the account's current state.\nUPDATE channel_accounts SET\n       access_token_enc = CASE WHEN $2 = 'refreshed' THEN decode($3, 'base64') ELSE access_token_enc END,\n       token_issued_at  = CASE WHEN $2 = 'refreshed' THEN now() ELSE token_issued_at END,\n       token_expires_at = CASE WHEN $2 = 'refreshed' THEN now() + make_interval(secs => $4::int)\n                               ELSE token_expires_at END,\n       token_error      = CASE WHEN $2 = 'refreshed' THEN NULL\n                               WHEN $2 = 'failed'    THEN $5\n                               ELSE token_error END\n WHERE id = $1::int\nRETURNING id, $2::text AS status, account_ref, ig_username, token_expires_at, token_error,\n          (SELECT name FROM studios WHERE studios.id = channel_accounts.studio_id) AS studio_name;",
+        "options": {
+          "queryReplacement": "={{ [$json.id, $json.status, $json.token_enc, $json.expires_in, $json.error] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "retryOnFail": true
+    },
+    {
+      "id": "report",
+      "name": "Anything Wrong?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// One email, only if something needs a human.\nconst rows = $input.all().map((i) => i.json).filter((r) => r.id);\nconst soon = (r) => r.token_expires_at && (new Date(r.token_expires_at) - Date.now()) < 10 * 86400e3;\nconst bad = rows.filter((r) => r.status === 'failed' || soon(r));\nif (!bad.length) return [];\nconst who = (r) => `${r.ig_username ? '@' + r.ig_username : r.account_ref} (${r.studio_name})`;\nreturn [{ json: {\n  to: 'founders',\n  subject: `Instagram token problem: ${bad.map(who).join(', ')}`,\n  heading: 'An Instagram token needs attention. If it expires, that studio\\u2019s leads get no replies.',\n  lines: [\n    ...bad.map((r) => `${who(r)}: ` + (r.status === 'failed' ? `refresh FAILED (${r.token_error}). ` : '') +\n                     (r.token_expires_at ? `Expires ${String(r.token_expires_at).slice(0, 10)}.` : 'Expiry unknown.')),\n    'The job retries every day. If it keeps failing, send the studio a new connect link: python3 workflows/build/ig_connect_link.py <studio id>.',\n  ],\n} }];"
+      }
+    },
+    {
+      "id": "send-email",
+      "name": "Email Founders",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        640,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily Check": {
+      "main": [
+        [
+          {
+            "node": "Load Tokens",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now": {
+      "main": [
+        [
+          {
+            "node": "Load Tokens",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Tokens": {
+      "main": [
+        [
+          {
+            "node": "Refresh Tokens",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Refresh Tokens": {
+      "main": [
+        [
+          {
+            "node": "Save",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save": {
+      "main": [
+        [
+          {
+            "node": "Anything Wrong?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything Wrong?": {
+      "main": [
+        [
+          {
+            "node": "Email Founders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}
