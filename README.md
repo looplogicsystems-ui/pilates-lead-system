@@ -18,11 +18,12 @@ adapters**, driven by per-studio configuration in Postgres:
 | Workflow | id | Role |
 |---|---|---|
 | `Lead Brain` | `fvHhAUDCbVN9ELb0` | Channel-agnostic core. Resolves the studio, upserts the lead, runs the agent, books/escalates, **returns** a result. Never touches a webhook. |
-| `Channel Adapter: Instagram` | `OQMXzwDyu5YAmRTo` | GET verify + POST events on `/webhook/instagram`, HMAC signature, durable dedupe, calls the brain, sends via Graph API. |
+| `Channel Adapter: Instagram` | `OQMXzwDyu5YAmRTo` | GET verify + POST events on `/webhook/instagram`, HMAC signature, durable dedupe, looks up the lead's @username once, calls the brain, sends with **that studio's own encrypted token** (one send path for every studio). A reply typed by staff in the Instagram app pauses the AI for that lead. |
 | `Channel Adapter: Slack` | `px8F683kj1I8Sb9X` | Polls the lead channel, same contract, replies in-channel. |
 | `Follow-up Scheduler` | `fyk6eYsVGtUVS1dh` | Chases quiet leads with AI-written nudges on the studio's cadence. |
 | `Lead System — Error Handler` | `4L4K72aSSwiBcnjX` | Any execution error → a `dead_letters` row **and** an ops Slack alert. |
-| `IG Token Expiry Monitor` | `n56lLK7WRdYFesdW` | Weekly, per studio, warns before an Instagram token lapses. |
+| `IG Connect` | `C5M1lM4n3FgKO0J1` | `/webhook/ig/connect`: a studio connects her Instagram from a signed, single-use link (`workflows/build/ig_connect_link.py <studio id>`). Token stored encrypted with `IG_TOKEN_KEY`. |
+| `IG Token Refresh` | `n56lLK7WRdYFesdW` | Daily: refreshes every Instagram token renewed >7 days ago; emails the founders on failure or <10 days to expiry. |
 | `Legal Pages (Privacy Policy)` | `SqkuTaitCtgEWn7O` | Serves the Meta-required privacy page. |
 
 ```
@@ -90,8 +91,9 @@ purpose" — the lead is paused, or the account was unknown.
 - `db/migrate.sh` — applies all of them (works on a bare database).
 - `db/seed/local-ids.sql.example` — deployment-specific ids; copy to `local-ids.sql` (gitignored).
 - `workflows/*.json` — the live graphs, credential ids redacted to placeholders
-  (`POSTGRES_CRED_ID`, `OPENAI_CRED_ID`, `GOOGLE_CAL_CRED_ID`, `SLACK_LEAD_BOT_CRED_ID`,
-  `SLACK_OWNER_BOT_CRED_ID`, `SLACK_OPS_BOT_CRED_ID`, `IG_TOKEN_CRED_ID`).
+  (`POSTGRES_CRED_ID`, `OPENAI_CRED_ID`, `RESEND_CRED_ID`, `SLACK_LEAD_BOT_CRED_ID`,
+  `SLACK_OWNER_BOT_CRED_ID`, `SLACK_OPS_BOT_CRED_ID`). Instagram tokens are not n8n credentials:
+  they live encrypted in `channel_accounts` (pilot build step 6).
 - `workflows/build/` — the generators that produce those JSON files, plus `deploy.sh`.
 - `workflows/legacy/` — the retired v2.0 monolith, kept as the rollback path.
 - `DEMO.md` — demonstration script.

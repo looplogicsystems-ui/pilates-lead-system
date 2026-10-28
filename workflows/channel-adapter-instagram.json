@@ -120,8 +120,8 @@
       }
     },
     {
-      "id": "extract-ig-messages",
-      "name": "Extract IG Messages",
+      "id": "extract-ig-events",
+      "name": "Extract IG Events",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
@@ -129,7 +129,7 @@
         160
       ],
       "parameters": {
-        "jsCode": "\n// Flattens Meta's batched webhook payload into one item per inbound text DM.\n// `entry` and `messaging` are both arrays: a single POST can legitimately carry\n// messages from several different people.\nconst out = [];\n\nfor (const item of $input.all()) {\n  const body = item.json.body ?? {};\n  if (body.object !== 'instagram') continue;\n\n  for (const entry of body.entry ?? []) {\n    for (const ev of entry.messaging ?? []) {\n      const msg = ev.message;\n      if (!msg) continue;          // delivery / read receipts\n      if (msg.is_echo) continue;   // our own outbound DM echoed back\n      if (!msg.text) continue;     // reactions, attachments, stickers\n\n      out.push({ json: {\n        ig_sender: ev.sender?.id,\n        ig_mid: msg.mid,\n        text: msg.text,\n        // The account the lead messaged. This is what resolves the studio.\n        account_ref: String(ev.recipient?.id ?? entry.id ?? ''),\n        received_at: ev.timestamp ? new Date(ev.timestamp).toISOString() : new Date().toISOString(),\n      } });\n    }\n  }\n}\n\nreturn out;\n"
+        "jsCode": "\n// Flattens Meta's batched webhook payload into one item per event we act on:\n//   kind 'inbound' — a lead's text DM to the studio\n//   kind 'echo'    — a message SENT FROM the studio account: either our own\n//                    reply coming back, or staff replying in the Instagram app\n// `entry` and `messaging` are both arrays: one POST can carry several people.\nconst describe = (atts) => {\n  const t = (atts && atts[0] && atts[0].type) || '';\n  return ({ image: '[photo]', audio: '[voice note]', video: '[video]', file: '[file]', share: '[shared post]',\n            story_mention: '[story mention]', ig_reel: '[reel]' })[t] || '[attachment]';\n};\nconst out = [];\nfor (const item of $input.all()) {\n  const body = item.json.body ?? {};\n  if (body.object !== 'instagram') continue;\n  for (const entry of body.entry ?? []) {\n    for (const ev of entry.messaging ?? []) {\n      const msg = ev.message;\n      if (!msg || msg.is_deleted) continue;          // receipts, reactions, unsends\n      const received_at = ev.timestamp ? new Date(ev.timestamp).toISOString() : new Date().toISOString();\n      if (msg.is_echo) {\n        out.push({ json: {\n          kind: 'echo',\n          account_ref: String(ev.sender?.id ?? entry.id ?? ''),   // the studio account that sent it\n          lead_ref: String(ev.recipient?.id ?? ''),               // the person it was sent to\n          ig_mid: msg.mid,\n          text: msg.text ?? null,                                 // our replies are always text\n          body: msg.text ?? describe(msg.attachments),\n          received_at,\n        } });\n        continue;\n      }\n      if (!msg.text) continue;     // a lead's photo / sticker / voice note: not answered (unchanged)\n      out.push({ json: {\n        kind: 'inbound',\n        ig_sender: String(ev.sender?.id ?? ''),\n        ig_mid: msg.mid,\n        text: msg.text,\n        account_ref: String(ev.recipient?.id ?? entry.id ?? ''),  // the account the lead messaged\n        received_at,\n      } });\n    }\n  }\n}\nreturn out;\n"
       }
     },
     {
@@ -167,21 +167,110 @@
         160
       ],
       "parameters": {
-        "jsCode": "\n// Keep only the messages whose mid we actually just claimed. A mid already in\n// processed_messages returns no row, so it never reaches the brain — this is\n// what makes a Meta retry (or a replay after an n8n restart) a no-op.\nconst claimed = new Set(\n  $input.all().map((i) => i.json.provider_msg_id).filter(Boolean)\n);\nreturn $('Extract IG Messages').all().filter((i) => claimed.has(i.json.ig_mid));\n"
+        "jsCode": "\n// Keep only the events whose mid we actually just claimed. A mid already in\n// processed_messages returns no row, so it never runs twice — this is what\n// makes a Meta retry (or a replay after an n8n restart) a no-op.\nconst claimed = new Set(\n  $input.all().map((i) => i.json.provider_msg_id).filter(Boolean)\n);\nreturn $('Extract IG Events').all().filter((i) => claimed.has(i.json.ig_mid));\n"
       }
     },
     {
-      "id": "build-inbound-contract",
-      "name": "Build Inbound Contract",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
+      "id": "inbound-or-echo",
+      "name": "Inbound or Echo?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
       "position": [
         640,
         160
       ],
       "parameters": {
-        "mode": "runOnceForEachItem",
-        "jsCode": "\n// The channel-agnostic contract the Lead Brain accepts. Note there is no\n// studio_id: the brain resolves that from (channel, account_ref) itself, so an\n// adapter can never assert which studio a message belongs to.\nreturn { json: {\n  channel: 'instagram',\n  account_ref: $json.account_ref,\n  external_id: String($json.ig_sender),\n  name: null,\n  message: String($json.text ?? ''),\n  provider_message_id: $json.ig_mid,\n  received_at: $json.received_at,\n} };\n"
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "kind-inbound",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "inbound",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "inbound"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "kind-echo",
+                    "leftValue": "={{ $json.kind }}",
+                    "rightValue": "echo",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "echo"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "load-account-&-lead",
+      "name": "Load Account & Lead",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        860,
+        60
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Always exactly one row per message. Carries the message fields through\n-- (a Postgres node outputs only its query result) plus this account's\n-- ENCRYPTED token and whether this lead's profile still needs looking up.\nSELECT $1::text AS account_ref, $2::text AS ig_sender, $3::text AS ig_mid,\n       $4::text AS text, $5::text AS received_at,\n       encode(ca.access_token_enc, 'base64') AS token_enc,\n       (l.username IS NULL\n        AND (l.profile_checked_at IS NULL OR l.profile_checked_at < now() - interval '7 days')) AS profile_due\n  FROM (SELECT 1) AS anchor\n  LEFT JOIN channel_accounts ca ON ca.channel = 'instagram' AND ca.account_ref = $1 AND ca.active\n  LEFT JOIN leads l ON l.channel = 'instagram' AND l.external_id = $2;",
+        "options": {
+          "queryReplacement": "={{ [$json.account_ref, $json.ig_sender, $json.ig_mid, $json.text, $json.received_at] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "look-up-profile",
+      "name": "Look Up Profile",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        60
+      ],
+      "parameters": {
+        "jsCode": "\nconst crypto = require('crypto');\nconst tokenKey = () => {\n  const k = String($env.IG_TOKEN_KEY || '');\n  if (k.length < 32) throw new Error('IG_TOKEN_KEY is missing on the server');\n  return crypto.createHash('sha256').update(k, 'utf8').digest();\n};\nconst encryptToken = (plain) => {\n  const iv = crypto.randomBytes(12);\n  const c = crypto.createCipheriv('aes-256-gcm', tokenKey(), iv);\n  const ct = Buffer.concat([c.update(String(plain), 'utf8'), c.final()]);\n  return Buffer.concat([Buffer.from([1]), iv, c.getAuthTag(), ct]).toString('base64');\n};\nconst decryptToken = (b64) => {\n  const b = Buffer.from(String(b64 || ''), 'base64');\n  if (b.length < 30 || b[0] !== 1) throw new Error('no usable Instagram token stored for this account');\n  const d = crypto.createDecipheriv('aes-256-gcm', tokenKey(), b.subarray(1, 13));\n  d.setAuthTag(b.subarray(13, 29));\n  return Buffer.concat([d.update(b.subarray(29)), d.final()]).toString('utf8');\n};\n\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\nconst scrub = (s) => String(s || '').replace(/[A-Za-z0-9_\\-]{40,}/g, '[redacted]').slice(0, 300);\nasync function graphCall(ctx, { what, method = 'GET', url, token, qs, form, json, tries = 1 }) {\n  const headers = {};\n  if (token) headers.Authorization = `Bearer ${token}`;\n  let body;\n  // n8n's Code sandbox has no URLSearchParams / URL / fetch: encode by hand.\n  if (form) { headers['Content-Type'] = 'application/x-www-form-urlencoded';\n             body = Object.entries(form).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v ?? ''))}`).join('&'); }\n  else if (json) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(json); }\n  for (let attempt = 1; ; attempt++) {\n    let r;\n    try {\n      r = await ctx.helpers.httpRequest({ method, url, qs, headers, body, json: false,\n        returnFullResponse: true, ignoreHttpStatusErrors: true, timeout: 20000 });\n    } catch (e) {\n      if (attempt < tries) { await sleep(700 * attempt); continue; }\n      const err = new Error(`${what}: could not reach Instagram (${scrub(e.code || e.message)})`);\n      err.kind = 'network'; throw err;\n    }\n    let data = r.body;\n    if (Buffer.isBuffer(data)) data = data.toString('utf8');\n    if (typeof data === 'string') { try { data = JSON.parse(data); } catch (e) { data = { raw: scrub(data) }; } }\n    if (r.statusCode >= 500 && attempt < tries) { await sleep(700 * attempt); continue; }\n    if (r.statusCode >= 400) {\n      const m = (data && (data.error || data)) || {};\n      const err = new Error(`${what}: HTTP ${r.statusCode}: ${scrub(m.message || m.error_message || m.raw || 'error')}` +\n                            (m.code ? ` (code ${m.code}${m.error_subcode ? '/' + m.error_subcode : ''})` : ''));\n      err.kind = 'http'; err.status = r.statusCode; err.metaCode = m.code; throw err;\n    }\n    return data;\n  }\n}\n\n// Instagram's webhook gives only a numeric id. Once per lead (retried at most\n// weekly if it fails) we ask Instagram for her @username and name, so owner\n// emails can say who she is. Builds the channel-agnostic contract the Lead\n// Brain accepts — no studio_id: the brain resolves that from account_ref.\n// Never outputs the token.\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  let username = null, name = null, profile_checked = false;\n  if (j.profile_due && j.token_enc) {\n    profile_checked = true;\n    try {\n      const p = await graphCall(this, { what: 'profile lookup', url: `https://graph.instagram.com/v25.0/${encodeURIComponent(j.ig_sender)}`,\n        qs: { fields: 'name,username' }, token: decryptToken(j.token_enc), tries: 2 });\n      username = p.username || null;\n      name = p.name || null;\n    } catch (e) { /* she still gets her reply; the lookup is retried next week */ }\n  }\n  out.push({ json: {\n    channel: 'instagram',\n    account_ref: j.account_ref,\n    external_id: String(j.ig_sender),\n    name, username, profile_checked,\n    message: String(j.text ?? ''),\n    provider_message_id: j.ig_mid,\n    received_at: j.received_at,\n  } });\n}\nreturn out;\n"
       }
     },
     {
@@ -190,8 +279,8 @@
       "type": "n8n-nodes-base.executeWorkflow",
       "typeVersion": 1.2,
       "position": [
-        860,
-        160
+        1300,
+        60
       ],
       "parameters": {
         "workflowId": {
@@ -222,8 +311,8 @@
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
       "position": [
-        1080,
-        160
+        1520,
+        60
       ],
       "parameters": {
         "conditions": {
@@ -261,52 +350,346 @@
       }
     },
     {
-      "id": "send-ig-reply",
-      "name": "Send IG Reply",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
+      "id": "no-reply-sent",
+      "name": "No Reply Sent",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
       "position": [
-        1300,
-        100
+        1740,
+        200
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "load-send-token",
+      "name": "Load Send Token",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1740,
+        0
       ],
       "parameters": {
-        "method": "POST",
-        "url": "https://graph.instagram.com/v25.0/me/messages",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
+        "operation": "executeQuery",
+        "query": "-- Always one row. Re-reads the lead's pause state at the last moment: if\n-- staff replied in the Instagram app while the AI was writing, the AI's\n-- reply must not go out on top of theirs.\nSELECT $1::int AS lead_id, $2::text AS external_id, $3::text AS reply,\n       NULLIF($4::text, '')::int AS outbound_message_id, $5::text AS account_ref,\n       encode(ca.access_token_enc, 'base64') AS token_enc,\n       l.paused_by AS paused_by_now, l.username, l.name, s.name AS studio_name\n  FROM (SELECT 1) AS anchor\n  LEFT JOIN channel_accounts ca ON ca.channel = 'instagram' AND ca.account_ref = $5 AND ca.active\n  LEFT JOIN leads l ON l.id = $1::int\n  LEFT JOIN studios s ON s.id = l.studio_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.lead_id, $json.external_id, $json.reply, $json.outbound_message_id ?? '', $json.account_ref] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "send-ig-reply",
+      "name": "Send IG Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        0
+      ],
+      "parameters": {
+        "jsCode": "\nconst crypto = require('crypto');\nconst tokenKey = () => {\n  const k = String($env.IG_TOKEN_KEY || '');\n  if (k.length < 32) throw new Error('IG_TOKEN_KEY is missing on the server');\n  return crypto.createHash('sha256').update(k, 'utf8').digest();\n};\nconst encryptToken = (plain) => {\n  const iv = crypto.randomBytes(12);\n  const c = crypto.createCipheriv('aes-256-gcm', tokenKey(), iv);\n  const ct = Buffer.concat([c.update(String(plain), 'utf8'), c.final()]);\n  return Buffer.concat([Buffer.from([1]), iv, c.getAuthTag(), ct]).toString('base64');\n};\nconst decryptToken = (b64) => {\n  const b = Buffer.from(String(b64 || ''), 'base64');\n  if (b.length < 30 || b[0] !== 1) throw new Error('no usable Instagram token stored for this account');\n  const d = crypto.createDecipheriv('aes-256-gcm', tokenKey(), b.subarray(1, 13));\n  d.setAuthTag(b.subarray(13, 29));\n  return Buffer.concat([d.update(b.subarray(29)), d.final()]).toString('utf8');\n};\n\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\nconst scrub = (s) => String(s || '').replace(/[A-Za-z0-9_\\-]{40,}/g, '[redacted]').slice(0, 300);\nasync function graphCall(ctx, { what, method = 'GET', url, token, qs, form, json, tries = 1 }) {\n  const headers = {};\n  if (token) headers.Authorization = `Bearer ${token}`;\n  let body;\n  // n8n's Code sandbox has no URLSearchParams / URL / fetch: encode by hand.\n  if (form) { headers['Content-Type'] = 'application/x-www-form-urlencoded';\n             body = Object.entries(form).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v ?? ''))}`).join('&'); }\n  else if (json) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(json); }\n  for (let attempt = 1; ; attempt++) {\n    let r;\n    try {\n      r = await ctx.helpers.httpRequest({ method, url, qs, headers, body, json: false,\n        returnFullResponse: true, ignoreHttpStatusErrors: true, timeout: 20000 });\n    } catch (e) {\n      if (attempt < tries) { await sleep(700 * attempt); continue; }\n      const err = new Error(`${what}: could not reach Instagram (${scrub(e.code || e.message)})`);\n      err.kind = 'network'; throw err;\n    }\n    let data = r.body;\n    if (Buffer.isBuffer(data)) data = data.toString('utf8');\n    if (typeof data === 'string') { try { data = JSON.parse(data); } catch (e) { data = { raw: scrub(data) }; } }\n    if (r.statusCode >= 500 && attempt < tries) { await sleep(700 * attempt); continue; }\n    if (r.statusCode >= 400) {\n      const m = (data && (data.error || data)) || {};\n      const err = new Error(`${what}: HTTP ${r.statusCode}: ${scrub(m.message || m.error_message || m.raw || 'error')}` +\n                            (m.code ? ` (code ${m.code}${m.error_subcode ? '/' + m.error_subcode : ''})` : ''));\n      err.kind = 'http'; err.status = r.statusCode; err.metaCode = m.code; throw err;\n    }\n    return data;\n  }\n}\n\n// Sends the AI's reply with THIS studio's token (decrypted here, never output)\n// to Instagram's one fixed endpoint. No per-studio nodes or switches: a new\n// studio is just a channel_accounts row. Never retried — a retry after an\n// unclear failure could deliver the message twice.\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const base = { lead_id: j.lead_id, external_id: j.external_id, outbound_message_id: j.outbound_message_id,\n                 account_ref: j.account_ref, username: j.username, name: j.name, studio_name: j.studio_name,\n                 reply: j.reply };\n  if (j.paused_by_now === 'staff_reply') { out.push({ json: { ...base, status: 'skipped' } }); continue; }\n  try {\n    if (!j.token_enc) throw new Error('no Instagram token stored for this account (reconnect it with a connect link)');\n    const r = await graphCall(this, { what: 'send reply', method: 'POST', url: 'https://graph.instagram.com/v25.0/me/messages',\n      token: decryptToken(j.token_enc), json: { recipient: { id: j.external_id }, message: { text: j.reply } } });\n    out.push({ json: { ...base, status: 'sent', mid: r.message_id || null } });\n  } catch (e) {\n    out.push({ json: { ...base, status: 'failed', error: String(e.message).slice(0, 400),\n                       token_problem: e.metaCode === 190 || /token/i.test(String(e.message)) } });\n  }\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "sent",
+      "name": "Sent?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        2180,
+        0
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
             {
-              "name": "Content-Type",
-              "value": "application/json"
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "st-sent",
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "sent",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "sent"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "st-skipped",
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "skipped",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "skipped"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "st-failed",
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "failed",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "failed"
             }
           ]
         },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ recipient: { id: $json.external_id }, message: { text: $json.reply } }) }}",
         "options": {}
+      }
+    },
+    {
+      "id": "record-message-id",
+      "name": "Record Message Id",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2400,
+        -120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE messages SET provider_message_id = $1\n WHERE id = NULLIF($2::text, '')::int;",
+        "options": {
+          "queryReplacement": "={{ [$json.mid, $json.outbound_message_id ?? ''] }}"
+        }
       },
       "credentials": {
-        "httpHeaderAuth": {
-          "id": "IG_TOKEN_CRED_ID",
-          "name": "Instagram DM Token"
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
         }
       },
       "onError": "continueRegularOutput",
       "retryOnFail": true
     },
     {
-      "id": "no-reply-sent",
-      "name": "No Reply Sent",
-      "type": "n8n-nodes-base.noOp",
-      "typeVersion": 1,
+      "id": "drop-unsent-reply",
+      "name": "Drop Unsent Reply",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2400,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "DELETE FROM messages\n WHERE id = NULLIF($1::text, '')::int AND author = 'ai' AND provider_message_id IS NULL;",
+        "options": {
+          "queryReplacement": "={{ [$json.outbound_message_id ?? ''] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "dead-letter-send-failed",
+      "name": "Dead Letter: Send Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2400,
+        140
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The lead got NO reply. Keep the text for a human to send, take it out of\n-- the thread (it was never delivered), and flag the account if it was a token\n-- problem. One statement, one row back.\nWITH dl AS (\n  INSERT INTO dead_letters (workflow_id, execution_id, reason, payload, error)\n  VALUES ($1, $2, 'ig_send_failed', $3::jsonb, $4)\n  RETURNING id\n), unsent AS (\n  DELETE FROM messages WHERE id = NULLIF($5::text, '')::int AND author = 'ai' AND provider_message_id IS NULL\n  RETURNING id\n), acct AS (\n  UPDATE channel_accounts SET token_error = $4\n   WHERE channel = 'instagram' AND account_ref = $6 AND $7::boolean\n  RETURNING id\n)\nSELECT (SELECT id FROM dl) AS dead_letter_id;",
+        "options": {
+          "queryReplacement": "={{ [$workflow.id, $execution.id, JSON.stringify({ lead_id: $json.lead_id, reply: $json.reply, account_ref: $json.account_ref }), $json.error, $json.outbound_message_id ?? '', $json.account_ref, !!$json.token_problem] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "email-send-failed",
+      "name": "Email: Send Failed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2620,
+        140
+      ],
+      "parameters": {
+        "jsCode": "\nconst leadLabel = (l) => {\n  const u = l.username ? `@${l.username}` : null;\n  if (u && l.name) return `${u} (${l.name})`;\n  if (u) return u;\n  if (l.name) return String(l.name);\n  return l.channel === 'instagram' ? 'An Instagram lead' : `A ${l.channel} lead`;\n};\n// Opens the owner's DM thread with this lead in the Instagram app.\nconst chatButton = (l) => (l.channel === 'instagram' && l.username && /^[A-Za-z0-9._]{1,30}$/.test(l.username))\n  ? { label: 'Open chat', url: `https://ig.me/m/${l.username}` } : null;\n\nreturn $('Send IG Reply').all().filter((i) => i.json.status === 'failed').map((i) => {\n  const j = i.json;\n  const who = leadLabel({ channel: 'instagram', username: j.username, name: j.name });\n  return { json: {\n    to: 'founders',\n    subject: `Instagram reply NOT delivered: ${who} (${j.studio_name || 'unknown studio'})`,\n    heading: `The AI wrote a reply to ${who}, but Instagram refused it, so she has had no answer.`,\n    lines: [`Error: ${j.error}`,\n            `The reply that didn't go out: \"${String(j.reply || '').slice(0, 600)}\"`,\n            j.token_problem ? 'This looks like a token problem: send the studio a new connect link (ig_connect_link.py).' : 'Send it to her by hand from the studio’s Instagram if it still makes sense.',\n            'Saved in dead_letters.'],\n    buttons: [chatButton({ channel: 'instagram', username: j.username })].filter(Boolean),\n  } };\n});\n"
+      }
+    },
+    {
+      "id": "send-send-failed",
+      "name": "Send: Send Failed",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2840,
+        140
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "handle-echo",
+      "name": "Handle Echo",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        860,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- One statement, always one row. Our own reply comes back as an echo too:\n-- it is recognised by Instagram's message id (stored when we sent it) or, if\n-- the echo beat that write, by the same text to the same lead in the last 2\n-- minutes. ANY other echo to a known lead is a person replying from the\n-- Instagram app: log it as staff (so the AI reads it after Resume) and pause\n-- the AI for THAT lead only. Echoes to people who never messaged the studio\n-- (staff DMing a friend) are ignored entirely.\nWITH acct AS (\n  SELECT studio_id FROM channel_accounts\n   WHERE channel = 'instagram' AND account_ref = $1 AND active\n), lead AS (\n  SELECT l.id, l.username, l.name FROM leads l\n   WHERE l.channel = 'instagram' AND l.external_id = $2\n     AND l.studio_id = (SELECT studio_id FROM acct)\n), ours AS (\n  SELECT 1 FROM messages m\n   WHERE m.lead_id = (SELECT id FROM lead) AND m.direction = 'outbound' AND m.author = 'ai'\n     AND (m.provider_message_id = $3\n          OR (m.provider_message_id IS NULL AND $4 <> '' AND m.body = $4\n              AND m.created_at > now() - interval '2 minutes'))\n), human AS (\n  SELECT id AS lead_id FROM lead WHERE NOT EXISTS (SELECT 1 FROM ours)\n), logged AS (\n  INSERT INTO messages (lead_id, direction, channel, body, author, provider_message_id, created_at)\n  SELECT lead_id, 'outbound', 'instagram', $5, 'human', $3, now() FROM human\n  RETURNING id\n), paused AS (\n  UPDATE leads SET ai_paused = true, paused_by = 'staff_reply', paused_at = now(),\n                   pause_alerted_at = now(), updated_at = now()\n   WHERE id = (SELECT lead_id FROM human) AND NOT ai_paused\n  RETURNING id\n)\nSELECT CASE WHEN NOT EXISTS (SELECT 1 FROM acct)   THEN 'unknown_account'\n            WHEN NOT EXISTS (SELECT 1 FROM lead)   THEN 'not_a_lead'\n            WHEN EXISTS (SELECT 1 FROM ours)       THEN 'ours'\n            WHEN EXISTS (SELECT 1 FROM paused)     THEN 'paused_now'\n            ELSE 'already_paused' END AS outcome,\n       (SELECT id FROM lead) AS lead_id,\n       (SELECT username FROM lead) AS username,\n       (SELECT name FROM lead) AS name,\n       (SELECT s.name FROM studios s WHERE s.id = (SELECT studio_id FROM acct)) AS studio_name,\n       (SELECT s.owner_alert_email FROM studios s WHERE s.id = (SELECT studio_id FROM acct)) AS owner_alert_email,\n       $5::text AS staff_body;",
+        "options": {
+          "queryReplacement": "={{ [$json.account_ref, $json.lead_ref, $json.ig_mid, $json.text ?? '', $json.body] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "staff-took-over",
+      "name": "Staff Took Over?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        1080,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "took-over",
+              "leftValue": "={{ $json.outcome }}",
+              "rightValue": "paused_now",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "email-staff-took-over",
+      "name": "Email: Staff Took Over",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
         1300,
-        240
+        300
       ],
-      "parameters": {}
+      "parameters": {
+        "jsCode": "\nconst leadLabel = (l) => {\n  const u = l.username ? `@${l.username}` : null;\n  if (u && l.name) return `${u} (${l.name})`;\n  if (u) return u;\n  if (l.name) return String(l.name);\n  return l.channel === 'instagram' ? 'An Instagram lead' : `A ${l.channel} lead`;\n};\n// Opens the owner's DM thread with this lead in the Instagram app.\nconst chatButton = (l) => (l.channel === 'instagram' && l.username && /^[A-Za-z0-9._]{1,30}$/.test(l.username))\n  ? { label: 'Open chat', url: `https://ig.me/m/${l.username}` } : null;\n\n// Signed Resume link: same scheme as Lead Brain and the Owner Actions workflow.\nconst crypto = require('crypto');\nconst secret = String($env.OWNER_LINK_SECRET || '');\nreturn $input.all().map((i) => {\n  const j = i.json;\n  const who = leadLabel({ channel: 'instagram', username: j.username, name: j.name });\n  const t = secret ? crypto.createHmac('sha256', secret).update(`resume:${j.lead_id}`).digest('hex').slice(0, 32) : null;\n  return { json: {\n    to: j.owner_alert_email || 'founders',\n    subject: `You replied to ${who}, so the AI has stepped back`,\n    heading: `You (or your team) replied to ${who} in Instagram, so the AI has stopped answering her.`,\n    lines: [`Your message: \"${String(j.staff_body || '').slice(0, 400)}\"`,\n            'The AI won’t message her again until you tap Resume. Every other lead is still answered as normal.',\n            'When you’re done chatting, tap Resume and the AI picks up from where you left off. It reads what you said.'],\n    buttons: [t ? { label: 'Resume AI', url: `https://n8n.looplogicsystems.com/webhook/owner?a=resume&l=${j.lead_id}&t=${t}` } : null,\n              chatButton({ channel: 'instagram', username: j.username })].filter(Boolean),\n  } };\n});\n"
+      }
+    },
+    {
+      "id": "send-staff-took-over",
+      "name": "Send: Staff Took Over",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1520,
+        300
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
     }
   ],
   "connections": {
@@ -354,14 +737,14 @@
       "main": [
         [
           {
-            "node": "Extract IG Messages",
+            "node": "Extract IG Events",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Extract IG Messages": {
+    "Extract IG Events": {
       "main": [
         [
           {
@@ -387,14 +770,43 @@
       "main": [
         [
           {
-            "node": "Build Inbound Contract",
+            "node": "Inbound or Echo?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Build Inbound Contract": {
+    "Inbound or Echo?": {
+      "main": [
+        [
+          {
+            "node": "Load Account & Lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Echo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Account & Lead": {
+      "main": [
+        [
+          {
+            "node": "Look Up Profile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Look Up Profile": {
       "main": [
         [
           {
@@ -420,7 +832,7 @@
       "main": [
         [
           {
-            "node": "Send IG Reply",
+            "node": "Load Send Token",
             "type": "main",
             "index": 0
           }
@@ -428,6 +840,108 @@
         [
           {
             "node": "No Reply Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Send Token": {
+      "main": [
+        [
+          {
+            "node": "Send IG Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send IG Reply": {
+      "main": [
+        [
+          {
+            "node": "Sent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sent?": {
+      "main": [
+        [
+          {
+            "node": "Record Message Id",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Drop Unsent Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dead Letter: Send Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dead Letter: Send Failed": {
+      "main": [
+        [
+          {
+            "node": "Email: Send Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Send Failed": {
+      "main": [
+        [
+          {
+            "node": "Send: Send Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Echo": {
+      "main": [
+        [
+          {
+            "node": "Staff Took Over?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Staff Took Over?": {
+      "main": [
+        [
+          {
+            "node": "Email: Staff Took Over",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Staff Took Over": {
+      "main": [
+        [
+          {
+            "node": "Send: Staff Took Over",
             "type": "main",
             "index": 0
           }

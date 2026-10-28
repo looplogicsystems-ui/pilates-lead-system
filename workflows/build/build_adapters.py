@@ -14,13 +14,17 @@ import json
 import os
 import sys
 
+from ig_common import GRAPH, TOKEN_CRYPTO_JS, GRAPH_JS, LEAD_NAME_JS
+
 CREDS = {
     "POSTGRES_CRED_ID":        "VVIxtEmT1GWsEZn9",
     "OPENAI_CRED_ID":          "2dmtKOJYL68BMOyG",
     "SLACK_LEAD_BOT_CRED_ID":  "4juRUVuQfSLuSC9y",
     "SLACK_OWNER_BOT_CRED_ID": "AL4h8l7yMMNZHFBE",
-    "IG_TOKEN_CRED_ID":        "DQWn7WWwGN2XkfSV",
 }
+
+# Send Email sub-workflow (build_pilot.py). Not a secret.
+SEND_EMAIL_WF_ID = "PQWBdER3x291uWeU"
 
 BASE_SETTINGS = {
     "executionOrder": "v1",
@@ -72,6 +76,13 @@ class WF:
             "text": text, "otherOptions": {}},
             credentials={"slackApi": {"id": cred, "name": "Slack"}},
             onError="continueRegularOutput", retryOnFail=True, **kw)
+
+    def send_email(self, name, pos):
+        # An alert that fails must never stop anything else: continue on error.
+        return self.node(name, "n8n-nodes-base.executeWorkflow", 1.2, pos, {
+            "workflowId": {"__rl": True, "mode": "id", "value": SEND_EMAIL_WF_ID},
+            "options": {"waitForSubWorkflow": True}},
+            onError="continueRegularOutput", alwaysOutputData=True)
 
     def call_brain(self, name, pos, brain_id):
         # mode 'each' is the whole point: one sub-execution per message.
@@ -181,38 +192,53 @@ return out;
 """})
     w.connect("IG Events", "Verify IG Signature")
 
-    w.node("Extract IG Messages", "n8n-nodes-base.code", 2, [-20, 160], {"jsCode": r"""
-// Flattens Meta's batched webhook payload into one item per inbound text DM.
-// `entry` and `messaging` are both arrays: a single POST can legitimately carry
-// messages from several different people.
+    w.node("Extract IG Events", "n8n-nodes-base.code", 2, [-20, 160], {"jsCode": r"""
+// Flattens Meta's batched webhook payload into one item per event we act on:
+//   kind 'inbound' — a lead's text DM to the studio
+//   kind 'echo'    — a message SENT FROM the studio account: either our own
+//                    reply coming back, or staff replying in the Instagram app
+// `entry` and `messaging` are both arrays: one POST can carry several people.
+const describe = (atts) => {
+  const t = (atts && atts[0] && atts[0].type) || '';
+  return ({ image: '[photo]', audio: '[voice note]', video: '[video]', file: '[file]', share: '[shared post]',
+            story_mention: '[story mention]', ig_reel: '[reel]' })[t] || '[attachment]';
+};
 const out = [];
-
 for (const item of $input.all()) {
   const body = item.json.body ?? {};
   if (body.object !== 'instagram') continue;
-
   for (const entry of body.entry ?? []) {
     for (const ev of entry.messaging ?? []) {
       const msg = ev.message;
-      if (!msg) continue;          // delivery / read receipts
-      if (msg.is_echo) continue;   // our own outbound DM echoed back
-      if (!msg.text) continue;     // reactions, attachments, stickers
-
+      if (!msg || msg.is_deleted) continue;          // receipts, reactions, unsends
+      const received_at = ev.timestamp ? new Date(ev.timestamp).toISOString() : new Date().toISOString();
+      if (msg.is_echo) {
+        out.push({ json: {
+          kind: 'echo',
+          account_ref: String(ev.sender?.id ?? entry.id ?? ''),   // the studio account that sent it
+          lead_ref: String(ev.recipient?.id ?? ''),               // the person it was sent to
+          ig_mid: msg.mid,
+          text: msg.text ?? null,                                 // our replies are always text
+          body: msg.text ?? describe(msg.attachments),
+          received_at,
+        } });
+        continue;
+      }
+      if (!msg.text) continue;     // a lead's photo / sticker / voice note: not answered (unchanged)
       out.push({ json: {
-        ig_sender: ev.sender?.id,
+        kind: 'inbound',
+        ig_sender: String(ev.sender?.id ?? ''),
         ig_mid: msg.mid,
         text: msg.text,
-        // The account the lead messaged. This is what resolves the studio.
-        account_ref: String(ev.recipient?.id ?? entry.id ?? ''),
-        received_at: ev.timestamp ? new Date(ev.timestamp).toISOString() : new Date().toISOString(),
+        account_ref: String(ev.recipient?.id ?? entry.id ?? ''),  // the account the lead messaged
+        received_at,
       } });
     }
   }
 }
-
 return out;
 """})
-    w.connect("Verify IG Signature", "Extract IG Messages")
+    w.connect("Verify IG Signature", "Extract IG Events")
 
     # Durable dedupe. Write-then-check: let the primary key arbitrate, so two
     # concurrent deliveries of the same mid cannot both pass.
@@ -222,40 +248,83 @@ ON CONFLICT (provider, provider_msg_id) DO NOTHING
 RETURNING provider_msg_id;""",
          replacement="={{ [$json.ig_mid] }}",
          alwaysOutputData=True, retryOnFail=True)
-    w.connect("Extract IG Messages", "Claim Message IDs")
+    w.connect("Extract IG Events", "Claim Message IDs")
 
     w.node("Drop Replays", "n8n-nodes-base.code", 2, [420, 160], {"jsCode": r"""
-// Keep only the messages whose mid we actually just claimed. A mid already in
-// processed_messages returns no row, so it never reaches the brain — this is
-// what makes a Meta retry (or a replay after an n8n restart) a no-op.
+// Keep only the events whose mid we actually just claimed. A mid already in
+// processed_messages returns no row, so it never runs twice — this is what
+// makes a Meta retry (or a replay after an n8n restart) a no-op.
 const claimed = new Set(
   $input.all().map((i) => i.json.provider_msg_id).filter(Boolean)
 );
-return $('Extract IG Messages').all().filter((i) => claimed.has(i.json.ig_mid));
+return $('Extract IG Events').all().filter((i) => claimed.has(i.json.ig_mid));
 """})
     w.connect("Claim Message IDs", "Drop Replays")
 
-    w.node("Build Inbound Contract", "n8n-nodes-base.code", 2, [640, 160], {
-        "mode": "runOnceForEachItem", "jsCode": r"""
-// The channel-agnostic contract the Lead Brain accepts. Note there is no
-// studio_id: the brain resolves that from (channel, account_ref) itself, so an
-// adapter can never assert which studio a message belongs to.
-return { json: {
-  channel: 'instagram',
-  account_ref: $json.account_ref,
-  external_id: String($json.ig_sender),
-  name: null,
-  message: String($json.text ?? ''),
-  provider_message_id: $json.ig_mid,
-  received_at: $json.received_at,
-} };
-"""})
-    w.connect("Drop Replays", "Build Inbound Contract")
+    w.node("Inbound or Echo?", "n8n-nodes-base.switch", 3.4, [640, 160], {
+        "rules": {"values": [
+            {"conditions": {"options": {"caseSensitive": True, "leftValue": "", "typeValidation": "strict",
+                                        "version": 3},
+                            "conditions": [{"id": f"kind-{k}", "leftValue": "={{ $json.kind }}", "rightValue": k,
+                                            "operator": {"type": "string", "operation": "equals"}}],
+                            "combinator": "and"},
+             "renameOutput": True, "outputKey": k} for k in ("inbound", "echo")]},
+        "options": {}})
+    w.connect("Drop Replays", "Inbound or Echo?")
 
-    w.call_brain("Call Lead Brain", [860, 160], brain_id)
-    w.connect("Build Inbound Contract", "Call Lead Brain")
+    # --- inbound: who is she? (looked up once), then the brain -------------
+    w.pg("Load Account & Lead", [860, 60], """-- Always exactly one row per message. Carries the message fields through
+-- (a Postgres node outputs only its query result) plus this account's
+-- ENCRYPTED token and whether this lead's profile still needs looking up.
+SELECT $1::text AS account_ref, $2::text AS ig_sender, $3::text AS ig_mid,
+       $4::text AS text, $5::text AS received_at,
+       encode(ca.access_token_enc, 'base64') AS token_enc,
+       (l.username IS NULL
+        AND (l.profile_checked_at IS NULL OR l.profile_checked_at < now() - interval '7 days')) AS profile_due
+  FROM (SELECT 1) AS anchor
+  LEFT JOIN channel_accounts ca ON ca.channel = 'instagram' AND ca.account_ref = $1 AND ca.active
+  LEFT JOIN leads l ON l.channel = 'instagram' AND l.external_id = $2;""",
+         replacement="={{ [$json.account_ref, $json.ig_sender, $json.ig_mid, $json.text, $json.received_at] }}",
+         alwaysOutputData=True, retryOnFail=True)
+    w.connect("Inbound or Echo?", "Load Account & Lead", out=0)
 
-    w.node("Should Reply?", "n8n-nodes-base.if", 2.2, [1080, 160], {
+    w.node("Look Up Profile", "n8n-nodes-base.code", 2, [1080, 60], {"jsCode": TOKEN_CRYPTO_JS + GRAPH_JS + r"""
+// Instagram's webhook gives only a numeric id. Once per lead (retried at most
+// weekly if it fails) we ask Instagram for her @username and name, so owner
+// emails can say who she is. Builds the channel-agnostic contract the Lead
+// Brain accepts — no studio_id: the brain resolves that from account_ref.
+// Never outputs the token.
+const out = [];
+for (const item of $input.all()) {
+  const j = item.json;
+  let username = null, name = null, profile_checked = false;
+  if (j.profile_due && j.token_enc) {
+    profile_checked = true;
+    try {
+      const p = await graphCall(this, { what: 'profile lookup', url: `__GRAPH__/${encodeURIComponent(j.ig_sender)}`,
+        qs: { fields: 'name,username' }, token: decryptToken(j.token_enc), tries: 2 });
+      username = p.username || null;
+      name = p.name || null;
+    } catch (e) { /* she still gets her reply; the lookup is retried next week */ }
+  }
+  out.push({ json: {
+    channel: 'instagram',
+    account_ref: j.account_ref,
+    external_id: String(j.ig_sender),
+    name, username, profile_checked,
+    message: String(j.text ?? ''),
+    provider_message_id: j.ig_mid,
+    received_at: j.received_at,
+  } });
+}
+return out;
+""".replace("__GRAPH__", GRAPH)})
+    w.connect("Load Account & Lead", "Look Up Profile")
+
+    w.call_brain("Call Lead Brain", [1300, 60], brain_id)
+    w.connect("Look Up Profile", "Call Lead Brain")
+
+    w.node("Should Reply?", "n8n-nodes-base.if", 2.2, [1520, 60], {
         "conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
                                    "typeValidation": "loose"},
                        "conditions": [
@@ -270,28 +339,200 @@ return { json: {
                        "combinator": "and"}, "options": {}})
     w.connect("Call Lead Brain", "Should Reply?")
 
-    # NOTE (multi-studio): n8n cannot pick a credential by expression, so this
-    # node uses one static Instagram token. `channel_accounts.credential_ref`
-    # already records which credential each studio should use; adding studio #2
-    # means adding a Switch on that value plus one send node per credential.
-    w.node("Send IG Reply", "n8n-nodes-base.httpRequest", 4.2, [1300, 100], {
-        "method": "POST",
-        "url": "https://graph.instagram.com/v25.0/me/messages",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendHeaders": True,
-        "headerParameters": {"parameters": [{"name": "Content-Type",
-                                             "value": "application/json"}]},
-        "sendBody": True, "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ recipient: { id: $json.external_id }, message: { text: $json.reply } }) }}",
-        "options": {}},
-        credentials={"httpHeaderAuth": {"id": "IG_TOKEN_CRED_ID",
-                                        "name": "Instagram DM Token"}},
-        onError="continueRegularOutput", retryOnFail=True)
-    w.connect("Should Reply?", "Send IG Reply", out=0)
-
-    w.node("No Reply Sent", "n8n-nodes-base.noOp", 1, [1300, 240], {})
+    w.node("No Reply Sent", "n8n-nodes-base.noOp", 1, [1740, 200], {})
     w.connect("Should Reply?", "No Reply Sent", out=1)
+
+    # --- send: ONE path for every studio, with that studio's own token ------
+    w.pg("Load Send Token", [1740, 0], """-- Always one row. Re-reads the lead's pause state at the last moment: if
+-- staff replied in the Instagram app while the AI was writing, the AI's
+-- reply must not go out on top of theirs.
+SELECT $1::int AS lead_id, $2::text AS external_id, $3::text AS reply,
+       NULLIF($4::text, '')::int AS outbound_message_id, $5::text AS account_ref,
+       encode(ca.access_token_enc, 'base64') AS token_enc,
+       l.paused_by AS paused_by_now, l.username, l.name, s.name AS studio_name
+  FROM (SELECT 1) AS anchor
+  LEFT JOIN channel_accounts ca ON ca.channel = 'instagram' AND ca.account_ref = $5 AND ca.active
+  LEFT JOIN leads l ON l.id = $1::int
+  LEFT JOIN studios s ON s.id = l.studio_id;""",
+         replacement=("={{ [$json.lead_id, $json.external_id, $json.reply, "
+                      "$json.outbound_message_id ?? '', $json.account_ref] }}"),
+         alwaysOutputData=True, retryOnFail=True)
+    w.connect("Should Reply?", "Load Send Token", out=0)
+
+    w.node("Send IG Reply", "n8n-nodes-base.code", 2, [1960, 0], {"jsCode": TOKEN_CRYPTO_JS + GRAPH_JS + r"""
+// Sends the AI's reply with THIS studio's token (decrypted here, never output)
+// to Instagram's one fixed endpoint. No per-studio nodes or switches: a new
+// studio is just a channel_accounts row. Never retried — a retry after an
+// unclear failure could deliver the message twice.
+const out = [];
+for (const item of $input.all()) {
+  const j = item.json;
+  const base = { lead_id: j.lead_id, external_id: j.external_id, outbound_message_id: j.outbound_message_id,
+                 account_ref: j.account_ref, username: j.username, name: j.name, studio_name: j.studio_name,
+                 reply: j.reply };
+  if (j.paused_by_now === 'staff_reply') { out.push({ json: { ...base, status: 'skipped' } }); continue; }
+  try {
+    if (!j.token_enc) throw new Error('no Instagram token stored for this account (reconnect it with a connect link)');
+    const r = await graphCall(this, { what: 'send reply', method: 'POST', url: '__GRAPH__/me/messages',
+      token: decryptToken(j.token_enc), json: { recipient: { id: j.external_id }, message: { text: j.reply } } });
+    out.push({ json: { ...base, status: 'sent', mid: r.message_id || null } });
+  } catch (e) {
+    out.push({ json: { ...base, status: 'failed', error: String(e.message).slice(0, 400),
+                       token_problem: e.metaCode === 190 || /token/i.test(String(e.message)) } });
+  }
+}
+return out;
+""".replace("__GRAPH__", GRAPH)})
+    w.connect("Load Send Token", "Send IG Reply")
+
+    w.node("Sent?", "n8n-nodes-base.switch", 3.4, [2180, 0], {
+        "rules": {"values": [
+            {"conditions": {"options": {"caseSensitive": True, "leftValue": "", "typeValidation": "strict",
+                                        "version": 3},
+                            "conditions": [{"id": f"st-{k}", "leftValue": "={{ $json.status }}", "rightValue": k,
+                                            "operator": {"type": "string", "operation": "equals"}}],
+                            "combinator": "and"},
+             "renameOutput": True, "outputKey": k} for k in ("sent", "skipped", "failed")]},
+        "options": {}})
+    w.connect("Send IG Reply", "Sent?")
+
+    # Instagram's id for our message: how its echo is recognised as OURS.
+    w.pg("Record Message Id", [2400, -120], """UPDATE messages SET provider_message_id = $1
+ WHERE id = NULLIF($2::text, '')::int;""",
+         replacement="={{ [$json.mid, $json.outbound_message_id ?? ''] }}",
+         onError="continueRegularOutput", retryOnFail=True)
+    w.connect("Sent?", "Record Message Id", out=0)
+
+    # Staff took over while the AI was writing: the reply never went out, so
+    # it must not sit in the thread as something the AI "said".
+    w.pg("Drop Unsent Reply", [2400, 0], """DELETE FROM messages
+ WHERE id = NULLIF($1::text, '')::int AND author = 'ai' AND provider_message_id IS NULL;""",
+         replacement="={{ [$json.outbound_message_id ?? ''] }}",
+         onError="continueRegularOutput", retryOnFail=True)
+    w.connect("Sent?", "Drop Unsent Reply", out=1)
+
+    w.pg("Dead Letter: Send Failed", [2400, 140], """-- The lead got NO reply. Keep the text for a human to send, take it out of
+-- the thread (it was never delivered), and flag the account if it was a token
+-- problem. One statement, one row back.
+WITH dl AS (
+  INSERT INTO dead_letters (workflow_id, execution_id, reason, payload, error)
+  VALUES ($1, $2, 'ig_send_failed', $3::jsonb, $4)
+  RETURNING id
+), unsent AS (
+  DELETE FROM messages WHERE id = NULLIF($5::text, '')::int AND author = 'ai' AND provider_message_id IS NULL
+  RETURNING id
+), acct AS (
+  UPDATE channel_accounts SET token_error = $4
+   WHERE channel = 'instagram' AND account_ref = $6 AND $7::boolean
+  RETURNING id
+)
+SELECT (SELECT id FROM dl) AS dead_letter_id;""",
+         replacement=("={{ [$workflow.id, $execution.id, "
+                      "JSON.stringify({ lead_id: $json.lead_id, reply: $json.reply, account_ref: $json.account_ref }), "
+                      "$json.error, $json.outbound_message_id ?? '', $json.account_ref, !!$json.token_problem] }}"),
+         onError="continueRegularOutput", retryOnFail=True, alwaysOutputData=True)
+    w.connect("Sent?", "Dead Letter: Send Failed", out=2)
+
+    w.node("Email: Send Failed", "n8n-nodes-base.code", 2, [2620, 140], {"jsCode": LEAD_NAME_JS + r"""
+return $('Send IG Reply').all().filter((i) => i.json.status === 'failed').map((i) => {
+  const j = i.json;
+  const who = leadLabel({ channel: 'instagram', username: j.username, name: j.name });
+  return { json: {
+    to: 'founders',
+    subject: `Instagram reply NOT delivered: ${who} (${j.studio_name || 'unknown studio'})`,
+    heading: `The AI wrote a reply to ${who}, but Instagram refused it, so she has had no answer.`,
+    lines: [`Error: ${j.error}`,
+            `The reply that didn't go out: "${String(j.reply || '').slice(0, 600)}"`,
+            j.token_problem ? 'This looks like a token problem: send the studio a new connect link (ig_connect_link.py).' : 'Send it to her by hand from the studio’s Instagram if it still makes sense.',
+            'Saved in dead_letters.'],
+    buttons: [chatButton({ channel: 'instagram', username: j.username })].filter(Boolean),
+  } };
+});
+"""})
+    w.connect("Dead Letter: Send Failed", "Email: Send Failed")
+    w.send_email("Send: Send Failed", [2840, 140])
+    w.connect("Email: Send Failed", "Send: Send Failed")
+
+    # --- echo: was it us, or did staff reply in the Instagram app? ----------
+    w.pg("Handle Echo", [860, 300], """-- One statement, always one row. Our own reply comes back as an echo too:
+-- it is recognised by Instagram's message id (stored when we sent it) or, if
+-- the echo beat that write, by the same text to the same lead in the last 2
+-- minutes. ANY other echo to a known lead is a person replying from the
+-- Instagram app: log it as staff (so the AI reads it after Resume) and pause
+-- the AI for THAT lead only. Echoes to people who never messaged the studio
+-- (staff DMing a friend) are ignored entirely.
+WITH acct AS (
+  SELECT studio_id FROM channel_accounts
+   WHERE channel = 'instagram' AND account_ref = $1 AND active
+), lead AS (
+  SELECT l.id, l.username, l.name FROM leads l
+   WHERE l.channel = 'instagram' AND l.external_id = $2
+     AND l.studio_id = (SELECT studio_id FROM acct)
+), ours AS (
+  SELECT 1 FROM messages m
+   WHERE m.lead_id = (SELECT id FROM lead) AND m.direction = 'outbound' AND m.author = 'ai'
+     AND (m.provider_message_id = $3
+          OR (m.provider_message_id IS NULL AND $4 <> '' AND m.body = $4
+              AND m.created_at > now() - interval '2 minutes'))
+), human AS (
+  SELECT id AS lead_id FROM lead WHERE NOT EXISTS (SELECT 1 FROM ours)
+), logged AS (
+  INSERT INTO messages (lead_id, direction, channel, body, author, provider_message_id, created_at)
+  SELECT lead_id, 'outbound', 'instagram', $5, 'human', $3, now() FROM human
+  RETURNING id
+), paused AS (
+  UPDATE leads SET ai_paused = true, paused_by = 'staff_reply', paused_at = now(),
+                   pause_alerted_at = now(), updated_at = now()
+   WHERE id = (SELECT lead_id FROM human) AND NOT ai_paused
+  RETURNING id
+)
+SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM acct)   THEN 'unknown_account'
+            WHEN NOT EXISTS (SELECT 1 FROM lead)   THEN 'not_a_lead'
+            WHEN EXISTS (SELECT 1 FROM ours)       THEN 'ours'
+            WHEN EXISTS (SELECT 1 FROM paused)     THEN 'paused_now'
+            ELSE 'already_paused' END AS outcome,
+       (SELECT id FROM lead) AS lead_id,
+       (SELECT username FROM lead) AS username,
+       (SELECT name FROM lead) AS name,
+       (SELECT s.name FROM studios s WHERE s.id = (SELECT studio_id FROM acct)) AS studio_name,
+       (SELECT s.owner_alert_email FROM studios s WHERE s.id = (SELECT studio_id FROM acct)) AS owner_alert_email,
+       $5::text AS staff_body;""",
+         replacement="={{ [$json.account_ref, $json.lead_ref, $json.ig_mid, $json.text ?? '', $json.body] }}",
+         alwaysOutputData=True, retryOnFail=True)
+    w.connect("Inbound or Echo?", "Handle Echo", out=1)
+
+    w.node("Staff Took Over?", "n8n-nodes-base.filter", 2.2, [1080, 300], {
+        "conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
+                                   "typeValidation": "strict"},
+                       "conditions": [{"id": "took-over", "leftValue": "={{ $json.outcome }}",
+                                       "rightValue": "paused_now",
+                                       "operator": {"type": "string", "operation": "equals"}}],
+                       "combinator": "and"}, "options": {}})
+    w.connect("Handle Echo", "Staff Took Over?")
+
+    w.node("Email: Staff Took Over", "n8n-nodes-base.code", 2, [1300, 300], {"jsCode": LEAD_NAME_JS + r"""
+// Signed Resume link: same scheme as Lead Brain and the Owner Actions workflow.
+const crypto = require('crypto');
+const secret = String($env.OWNER_LINK_SECRET || '');
+return $input.all().map((i) => {
+  const j = i.json;
+  const who = leadLabel({ channel: 'instagram', username: j.username, name: j.name });
+  const t = secret ? crypto.createHmac('sha256', secret).update(`resume:${j.lead_id}`).digest('hex').slice(0, 32) : null;
+  return { json: {
+    to: j.owner_alert_email || 'founders',
+    subject: `You replied to ${who}, so the AI has stepped back`,
+    heading: `You (or your team) replied to ${who} in Instagram, so the AI has stopped answering her.`,
+    lines: [`Your message: "${String(j.staff_body || '').slice(0, 400)}"`,
+            'The AI won’t message her again until you tap Resume. Every other lead is still answered as normal.',
+            'When you’re done chatting, tap Resume and the AI picks up from where you left off. It reads what you said.'],
+    buttons: [t ? { label: 'Resume AI', url: `https://n8n.looplogicsystems.com/webhook/owner?a=resume&l=${j.lead_id}&t=${t}` } : null,
+              chatButton({ channel: 'instagram', username: j.username })].filter(Boolean),
+  } };
+});
+"""})
+    w.connect("Staff Took Over?", "Email: Staff Took Over")
+    w.send_email("Send: Staff Took Over", [1520, 300])
+    w.connect("Email: Staff Took Over", "Send: Staff Took Over")
 
     return w
 
@@ -649,6 +890,15 @@ def main():
 
     for w, filename in targets:
         wf = w.build(active=False)
+        incoming = {c["node"] for outs in wf["connections"].values() for kind in outs.values()
+                    for out in kind for c in out}
+        # AI sub-nodes (model, memory) plug INTO another node, so they have no input.
+        subnodes = {src for src, kinds in wf["connections"].items() if any(k != "main" for k in kinds)}
+        orphans = [n["name"] for n in wf["nodes"] if n["name"] not in incoming | subnodes
+                   and not any(t in n["type"] for t in ("Trigger", "webhook", "scheduleTrigger", "manualTrigger"))]
+        assert not orphans, f"{wf['name']}: nodes with nothing feeding them: {orphans}"
+        names = [n["name"] for n in wf["nodes"]]
+        assert len(names) == len(set(names)), f"{wf['name']}: duplicate node names"
         redacted = json.dumps(wf, indent=2, ensure_ascii=False)
         with open(os.path.join(repo, "workflows", filename), "w") as f:
             f.write(redacted + "\n")

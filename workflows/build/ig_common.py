@@ -14,6 +14,11 @@ SECURITY MODEL
   executions (inputs and outputs of every node) never contain a usable token.
 - Instagram API errors are re-thrown as short, scrubbed messages: the raw
   HTTP error would carry the request, including the Authorization header.
+
+SANDBOX: n8n 2.34's Code-node task runner has NO URLSearchParams, URL, fetch,
+structuredClone or AbortController (verified 2026-10-28). It does have
+Buffer, setTimeout, TextEncoder, encodeURIComponent and require('crypto').
+Use this.helpers.httpRequest for HTTP.
 """
 
 # Our Meta app's Instagram app id. Public: it is part of every connect link.
@@ -57,7 +62,9 @@ async function graphCall(ctx, { what, method = 'GET', url, token, qs, form, json
   const headers = {};
   if (token) headers.Authorization = `Bearer ${token}`;
   let body;
-  if (form) { headers['Content-Type'] = 'application/x-www-form-urlencoded'; body = new URLSearchParams(form).toString(); }
+  // n8n's Code sandbox has no URLSearchParams / URL / fetch: encode by hand.
+  if (form) { headers['Content-Type'] = 'application/x-www-form-urlencoded';
+             body = Object.entries(form).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v ?? ''))}`).join('&'); }
   else if (json) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(json); }
   for (let attempt = 1; ; attempt++) {
     let r;
