@@ -579,14 +579,28 @@ CLASSIFY_JS = r"""
 const j = $input.first().json;
 const code = String((j.query || {}).c || '');
 const ua = String((j.headers || {})['user-agent'] || '');
-const crawler = /facebookexternalhit|facebot|meta-externalagent|meta-externalfetcher|twitterbot|slackbot|linkedinbot|discordbot|telegrambot|whatsapp|googlebot|bingbot|applebot|crawler|spider|\bbot\b|preview/i.test(ua)
+// The visitor's network, passed on by the go worker from Cloudflare. Meta's
+// link scanners pose as normal Android/Windows Chrome (seen live 2026-10-30,
+// ~8s after every link was sent) but come from Meta's own network, AS32934.
+const h = j.headers || {};
+const asn = String(h['x-client-asn'] || '').slice(0, 12);
+const network = String(h['x-client-org'] || '').slice(0, 120);
+const metaNetwork = asn === '32934' || /facebook|meta platforms/i.test(network);
+const crawler = metaNetwork
+  || /facebookexternalhit|facebot|meta-externalagent|meta-externalfetcher|twitterbot|slackbot|linkedinbot|discordbot|telegrambot|whatsapp|googlebot|bingbot|applebot|crawler|spider|\bbot\b|preview/i.test(ua)
   || ua === '';
-return [{ json: { code: /^[A-Za-z0-9_-]{4,16}$/.test(code) ? code : '', crawler } }];
+return [{ json: { code: /^[A-Za-z0-9_-]{4,16}$/.test(code) ? code : '', crawler, ua: ua.slice(0, 400), asn, network } }];
 """
 
 REDIRECT_SQL = """
--- Always exactly one row: target_url is NULL for an unknown code.
-WITH hit AS (
+-- Always exactly one row: target_url is NULL for an unknown code. Every
+-- request to a real code is logged with its user agent (link_hits).
+WITH logged AS (
+  INSERT INTO link_hits (short_code, user_agent, counted, asn, network)
+  SELECT $1, $3, NOT $2::boolean, NULLIF($4, ''), NULLIF($5, '')
+   WHERE EXISTS (SELECT 1 FROM booking_links WHERE short_code = $1)
+  RETURNING id
+), hit AS (
   UPDATE booking_links
      SET click_count = click_count + 1,
          clicked_at  = COALESCE(clicked_at, now())
@@ -611,7 +625,7 @@ def link_redirect():
          "parameters": {"httpMethod": "GET", "path": "go", "responseMode": "responseNode", "options": {}}},
         {"id": "lr-classify", "name": "Classify", "type": "n8n-nodes-base.code", "typeVersion": 2,
          "position": [220, 0], "parameters": {"jsCode": CLASSIFY_JS.strip()}},
-        pg_node("Look Up & Count", [440, 0], REDIRECT_SQL, "={{ [$json.code, $json.crawler] }}",
+        pg_node("Look Up & Count", [440, 0], REDIRECT_SQL, "={{ [$json.code, $json.crawler, $json.ua, $json.asn, $json.network] }}",
                 alwaysOutputData=True),
         {"id": "lr-found", "name": "Found?", "type": "n8n-nodes-base.if", "typeVersion": 2.2,
          "position": [660, 0],

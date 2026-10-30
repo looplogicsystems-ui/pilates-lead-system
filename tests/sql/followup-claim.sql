@@ -1,5 +1,6 @@
 BEGIN;
--- Follow-up Scheduler: who gets nudged / handed over. Expected:
+-- Follow-up Scheduler: who gets nudged / handed over. Assumes the demo studio's normal
+-- cadence (60 min, then 1200 min). Expected:
 --   A quiet nudge 1, C link nudge, E hand over, H final nudge; B D F G I nothing; run 2 nothing.
 -- scenario leads on the demo studio (2); created_at offsets are relative to now()
 CREATE TEMP TABLE scen(code text, ext text, status text, paused bool, channel text);

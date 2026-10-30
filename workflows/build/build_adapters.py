@@ -692,7 +692,8 @@ def followup():
 -- (she replied, or staff did) are never nudged. Only conversations from the
 -- last 48h are considered, so old history is never acted on.
 WITH last_in AS (
-  SELECT lead_id, max(created_at) AS t FROM messages WHERE direction = 'inbound' GROUP BY lead_id
+  SELECT lead_id, max(created_at) AS t, max(id) AS last_id
+    FROM messages WHERE direction = 'inbound' GROUP BY lead_id
 ), last_msg AS (
   SELECT DISTINCT ON (lead_id) lead_id, created_at AS t, direction, author
     FROM messages ORDER BY lead_id, created_at DESC
@@ -705,7 +706,7 @@ WITH last_in AS (
   SELECT l.id AS lead_id, l.external_id, l.channel, l.status, l.username, l.name,
          s.id AS studio_id, s.name AS studio_name, s.prompt_vars, s.owner_alert_email, s.owner_name,
          s.slack_lead_channel_id, s.max_nudges,
-         li.t AS last_inbound_at, lm.t AS last_msg_at, COALESCE(n.n, 0) AS nudges_sent,
+         li.t AS last_inbound_at, li.last_id AS last_inbound_id, lm.t AS last_msg_at, COALESCE(n.n, 0) AS nudges_sent,
          bl.id AS link_id, bl.short_code,
          CASE
            WHEN l.status = 'link_sent' THEN
@@ -730,7 +731,7 @@ WITH last_in AS (
     JOIN last_msg lm ON lm.lead_id = l.id
     LEFT JOIN nudges n ON n.lead_id = l.id
     LEFT JOIN LATERAL (SELECT * FROM booking_links b WHERE b.lead_id = l.id
-                        ORDER BY b.sent_at DESC LIMIT 1) bl ON true
+                        ORDER BY b.id DESC LIMIT 1) bl ON true          -- the most recently sent link
     -- one Instagram account per studio during the pilot
     LEFT JOIN LATERAL (SELECT access_token_enc FROM channel_accounts c
                         WHERE c.studio_id = l.studio_id AND c.channel = 'instagram' AND c.active
@@ -842,12 +843,14 @@ return { json: { ...keep, text, skip: false } };
 SELECT $1::int, 'outbound', $2, $3, 'ai', true, now()
  WHERE NOT $11::boolean
    AND NOT (SELECT ai_paused FROM leads WHERE id = $1::int)
+   -- By id, not timestamp: n8n rounds Postgres's microseconds to milliseconds,
+   -- which made her own last message look newer than itself (seen live 2026-10-30).
    AND NOT EXISTS (SELECT 1 FROM messages WHERE lead_id = $1::int AND direction = 'inbound'
-                    AND created_at > $4::timestamptz)
+                    AND id > $4::int)
 RETURNING id AS message_id, lead_id, channel, body AS text, $5::text AS external_id, $6::text AS kind,
           $7::boolean AS is_final, NULLIF($8::text, '')::int AS link_id, $9::text AS token_enc,
           $10::text AS slack_channel;""",
-         replacement=("={{ [$json.lead_id, $json.channel, $json.text ?? '', $json.last_inbound_at, $json.external_id, "
+         replacement=("={{ [$json.lead_id, $json.channel, $json.text ?? '', $json.last_inbound_id, $json.external_id, "
                       "$json.kind, !!$json.is_final, $json.link_id ?? '', $json.token_enc ?? '', "
                       "$json.slack_lead_channel_id ?? '', !!$json.skip] }}"),
          alwaysOutputData=True, retryOnFail=True)
@@ -902,8 +905,12 @@ WITH m AS (
 ), b AS (
   UPDATE booking_links SET nudged_at = now() WHERE id = NULLIF($3::text, '')::int AND $4 = 'link' RETURNING id
 ), l AS (
-  UPDATE leads SET status = 'cold', updated_at = now()
-   WHERE id = $5::int AND $6::boolean AND status = 'engaged' RETURNING id
+  -- Release the claim now the nudge is out (the nudge itself now prevents a
+  -- repeat); mark her cold after the final one.
+  UPDATE leads SET nudge_claimed_at = NULL,
+                   status = CASE WHEN $6::boolean AND status = 'engaged' THEN 'cold' ELSE status END,
+                   updated_at = now()
+   WHERE id = $5::int RETURNING id
 )
 SELECT (SELECT id FROM m) AS message_id;""",
          replacement="={{ [$json.message_id, $json.mid ?? '', $json.link_id ?? '', $json.kind, $json.lead_id, !!$json.is_final] }}",
