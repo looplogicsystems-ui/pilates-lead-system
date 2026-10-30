@@ -1,0 +1,154 @@
+{
+  "id": "RMZ5c58Vo8CpDVRs",
+  "name": "Weekly Review",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000c005",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "weeksInterval": 1,
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 13
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "run-now",
+      "name": "Run Now",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "weekly-numbers",
+      "name": "Weekly Numbers",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT s.name AS studio_name,\n  (SELECT count(*) FROM leads l WHERE l.studio_id = s.id AND l.channel <> 'test'\n      AND l.created_at > now() - interval '7 days') AS new_leads,\n  (SELECT count(*) FROM booking_links b JOIN leads l ON l.id = b.lead_id\n    WHERE b.studio_id = s.id AND l.channel <> 'test' AND b.sent_at > now() - interval '7 days') AS links_sent,\n  (SELECT count(*) FROM booking_links b JOIN leads l ON l.id = b.lead_id\n    WHERE b.studio_id = s.id AND l.channel <> 'test' AND b.sent_at > now() - interval '7 days'\n      AND b.clicked_at IS NOT NULL) AS links_tapped,\n  (SELECT count(*) FROM booking_links b JOIN leads l ON l.id = b.lead_id\n    WHERE b.studio_id = s.id AND l.channel <> 'test' AND b.sent_at > now() - interval '7 days'\n      AND b.lead_said_booked_at IS NOT NULL) AS said_booked,\n  (SELECT count(*) FROM booking_links b JOIN leads l ON l.id = b.lead_id\n    WHERE b.studio_id = s.id AND l.channel <> 'test' AND b.sent_at > now() - interval '7 days'\n      AND b.owner_confirmed_at IS NOT NULL) AS owner_confirmed,\n  (SELECT count(*) FROM escalations e JOIN leads l ON l.id = e.lead_id\n    WHERE l.studio_id = s.id AND l.channel <> 'test' AND e.created_at > now() - interval '7 days') AS escalations,\n  (SELECT count(*) FROM messages m JOIN leads l ON l.id = m.lead_id\n    WHERE l.studio_id = s.id AND l.channel <> 'test' AND m.nudge AND m.created_at > now() - interval '7 days') AS nudges,\n  (SELECT count(*) FROM messages m JOIN leads l ON l.id = m.lead_id\n    WHERE l.studio_id = s.id AND m.unanswered_alerted_at > now() - interval '7 days'\n      AND m.unanswered_alerted_at > m.created_at + interval '1 minute') AS unanswered,\n  (SELECT string_agg(coalesce('@' || l.username, l.name, 'lead ' || l.id) || ' (' || coalesce(l.paused_by, '?') || ')', ', ')\n     FROM leads l WHERE l.studio_id = s.id AND l.channel <> 'test' AND l.ai_paused) AS paused_now,\n  s.link_problem,\n  (SELECT count(*) FROM dead_letters WHERE resolved_at IS NULL) AS open_dead_letters,\n  (SELECT count(*) FROM dead_letters WHERE created_at > now() - interval '7 days') AS dead_letters_week\n  FROM studios s\n WHERE s.active\n ORDER BY s.id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "retryOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "build-review",
+      "name": "Build Review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const rows = $input.all().map((i) => i.json).filter((r) => r.studio_name);\nif (!rows.length) return [];\nconst pct = (a, b) => (Number(b) ? ` (${Math.round(100 * Number(a) / Number(b))}%)` : '');\nconst lines = [];\nfor (const r of rows) {\n  lines.push(`${r.studio_name}: ${r.new_leads} new leads. Links sent ${r.links_sent} → tapped ${r.links_tapped}${pct(r.links_tapped, r.links_sent)} → said booked ${r.said_booked} → owner confirmed ${r.owner_confirmed}.`);\n  lines.push(`   Escalations ${r.escalations}, nudges sent ${r.nudges}, unanswered-DM alarms ${r.unanswered}. Paused right now: ${r.paused_now || 'nobody'}.${r.link_problem ? ' LINK PROBLEM: ' + r.link_problem.split('\\n')[0] : ''}`);\n}\nconst r0 = rows[0];\nlines.push(`System: ${r0.dead_letters_week} errors this week, ${r0.open_dead_letters} unresolved in dead_letters.`);\nlines.push('The 5-minute review: (1) any unresolved errors? (2) links sent → tapped → booked look sane? (3) every escalation answered? (4) anyone paused who should be resumed?');\nreturn [{ json: { to: 'founders', subject: `Weekly review — ${new Date().toISOString().slice(0, 10)}`,\n                  heading: 'Last 7 days', lines } }];"
+      }
+    },
+    {
+      "id": "email-founders",
+      "name": "Email Founders",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        200,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule": {
+      "main": [
+        [
+          {
+            "node": "Weekly Numbers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Numbers": {
+      "main": [
+        [
+          {
+            "node": "Build Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Review": {
+      "main": [
+        [
+          {
+            "node": "Email Founders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now": {
+      "main": [
+        [
+          {
+            "node": "Weekly Numbers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

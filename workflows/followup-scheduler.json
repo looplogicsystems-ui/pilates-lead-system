@@ -5,8 +5,8 @@
   "versionId": "00000000-0000-4000-8000-00000000a003",
   "nodes": [
     {
-      "id": "follow-up-scheduler",
-      "name": "Follow-up Scheduler",
+      "id": "every-15-minutes",
+      "name": "Every 15 Minutes",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
       "position": [
@@ -25,8 +25,8 @@
       }
     },
     {
-      "id": "find-stale-leads",
-      "name": "Find Stale Leads",
+      "id": "claim-due-leads",
+      "name": "Claim Due Leads",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.6,
       "position": [
@@ -35,7 +35,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Leads who went quiet and are still fair game for an automated nudge.\n--\n-- Exclusions that did not exist before: `escalated` leads (handed to a human --\n-- they used to sit at 'engaged' and get nudged an hour after asking a medical\n-- or pricing question) and `ai_paused` leads (the owner has taken the thread\n-- over). Cadence comes from studios, not from literals in this query.\nWITH last_inbound AS (\n  SELECT lead_id, MAX(created_at) AS t FROM messages WHERE direction = 'inbound' GROUP BY lead_id\n),\nlast_msg AS (\n  SELECT lead_id, MAX(created_at) AS t FROM messages GROUP BY lead_id\n),\nout_since AS (\n  SELECT m.lead_id, COUNT(*) AS n\n    FROM messages m JOIN last_inbound li ON li.lead_id = m.lead_id\n   WHERE m.direction = 'outbound' AND m.created_at > li.t\n   GROUP BY m.lead_id\n)\nSELECT l.id, l.external_id, l.channel, l.name,\n       COALESCE(os.n, 0) AS nudges_sent,\n       (SELECT m.body FROM messages m\n         WHERE m.lead_id = l.id AND m.direction = 'inbound'\n         ORDER BY m.created_at DESC LIMIT 1) AS last_msg,\n       s.id AS studio_id, s.timezone, s.prompt_vars, s.class_capacity,\n       -- The intro offer from studio_offers (migration 009), e.g. \"2-week unlimited\n       -- intro pass ($89)\". studios.offers / prompt_vars.offer are retired by 010.\n       (SELECT o.name || CASE WHEN o.price IS NULL THEN ''\n                              ELSE ' (' || CASE WHEN o.currency = 'USD' THEN '$' ELSE o.currency || ' ' END\n                                        || trim(to_char(o.price, 'FM999999990.##')) || ')' END\n          FROM studio_offers o\n         WHERE o.studio_id = s.id AND o.active AND o.kind = 'intro'\n         ORDER BY o.sort_order LIMIT 1) AS intro_offer,\n       s.slack_lead_channel_id, s.slack_owner_channel_id, s.max_nudges,\n       (COALESCE(os.n, 0) >= s.max_nudges) AS is_final\n  FROM leads l\n  JOIN studios s  ON s.id = l.studio_id\n  JOIN last_msg lm ON lm.lead_id = l.id\n  LEFT JOIN out_since os ON os.lead_id = l.id\n WHERE l.status = 'engaged'\n   AND NOT l.ai_paused\n   AND s.active\n   AND COALESCE(os.n, 0) BETWEEN 1 AND s.max_nudges\n   AND lm.t < now() - make_interval(mins => CASE\n                                              WHEN COALESCE(os.n, 0) = 1\n                                                THEN s.followup_first_after_minutes\n                                              ELSE s.followup_final_after_minutes\n                                            END)\n ORDER BY lm.t ASC\n LIMIT 20;",
+        "query": "-- Who is due a nudge or a hand-over RIGHT NOW, claimed in the same statement\n-- so an overlapping run can't nudge them too. Leads the AI didn't speak to last\n-- (she replied, or staff did) are never nudged. Only conversations from the\n-- last 48h are considered, so old history is never acted on.\nWITH last_in AS (\n  SELECT lead_id, max(created_at) AS t FROM messages WHERE direction = 'inbound' GROUP BY lead_id\n), last_msg AS (\n  SELECT DISTINCT ON (lead_id) lead_id, created_at AS t, direction, author\n    FROM messages ORDER BY lead_id, created_at DESC\n), nudges AS (\n  SELECT m.lead_id, count(*) AS n\n    FROM messages m JOIN last_in li ON li.lead_id = m.lead_id\n   WHERE m.direction = 'outbound' AND m.nudge AND m.created_at > li.t\n   GROUP BY m.lead_id\n), cand AS (\n  SELECT l.id AS lead_id, l.external_id, l.channel, l.status, l.username, l.name,\n         s.id AS studio_id, s.name AS studio_name, s.prompt_vars, s.owner_alert_email, s.owner_name,\n         s.slack_lead_channel_id, s.max_nudges,\n         li.t AS last_inbound_at, lm.t AS last_msg_at, COALESCE(n.n, 0) AS nudges_sent,\n         bl.id AS link_id, bl.short_code,\n         CASE\n           WHEN l.status = 'link_sent' THEN\n             CASE WHEN bl.id IS NOT NULL AND bl.clicked_at IS NULL AND bl.nudged_at IS NULL\n                       AND bl.lead_said_booked_at IS NULL AND bl.owner_confirmed_at IS NULL\n                       AND bl.sent_at < now() - interval '3 hours' THEN 'link' END\n           WHEN COALESCE(n.n, 0) = 0\n                AND lm.t < now() - make_interval(mins => s.followup_first_after_minutes) THEN 'quiet'\n           WHEN COALESCE(n.n, 0) BETWEEN 1 AND s.max_nudges - 1\n                AND lm.t < now() - make_interval(mins => s.followup_final_after_minutes) THEN 'quiet'\n         END AS kind,\n         -- Instagram's 24h window (30 min of margin); Slack has none.\n         (l.channel <> 'instagram' OR li.t > now() - interval '23 hours 30 minutes') AS window_open,\n         (EXTRACT(HOUR FROM now() AT TIME ZONE s.timezone) BETWEEN 8 AND 20) AS daytime,\n         encode(ca.access_token_enc, 'base64') AS token_enc,\n         (SELECT json_agg(th ORDER BY th.created_at)\n            FROM (SELECT direction, author, body, created_at FROM messages\n                   WHERE lead_id = l.id ORDER BY created_at DESC LIMIT 12) th) AS thread\n    FROM leads l\n    JOIN studios s   ON s.id = l.studio_id AND s.active\n    JOIN last_in li  ON li.lead_id = l.id\n    JOIN last_msg lm ON lm.lead_id = l.id\n    LEFT JOIN nudges n ON n.lead_id = l.id\n    LEFT JOIN LATERAL (SELECT * FROM booking_links b WHERE b.lead_id = l.id\n                        ORDER BY b.sent_at DESC LIMIT 1) bl ON true\n    -- one Instagram account per studio during the pilot\n    LEFT JOIN LATERAL (SELECT access_token_enc FROM channel_accounts c\n                        WHERE c.studio_id = l.studio_id AND c.channel = 'instagram' AND c.active\n                        ORDER BY c.connected_at DESC NULLS LAST LIMIT 1) ca ON l.channel = 'instagram'\n   WHERE NOT l.ai_paused\n     AND l.channel IN ('instagram', 'slack')\n     AND l.status IN ('engaged', 'link_sent')\n     AND lm.direction = 'outbound' AND lm.author = 'ai'\n     AND li.t > now() - interval '48 hours'\n     AND (l.nudge_claimed_at IS NULL OR l.nudge_claimed_at < now() - interval '30 minutes')\n), due AS (\n  SELECT c.*, CASE WHEN NOT c.window_open THEN 'hand_over' ELSE 'send' END AS action,\n         (c.kind = 'quiet' AND c.nudges_sent + 1 >= c.max_nudges) AS is_final\n    FROM cand c\n   WHERE c.kind IS NOT NULL\n     AND (NOT c.window_open OR c.daytime)        -- inside the window but at night: wait\n   ORDER BY c.last_msg_at\n   LIMIT 20\n)\nUPDATE leads SET nudge_claimed_at = now()\n  FROM due WHERE leads.id = due.lead_id\nRETURNING due.*;",
         "options": {}
       },
       "credentials": {
@@ -48,51 +48,93 @@
       "retryOnFail": true
     },
     {
-      "id": "has-stale-leads",
-      "name": "Has Stale Leads?",
-      "type": "n8n-nodes-base.filter",
-      "typeVersion": 2.2,
+      "id": "run-now",
+      "name": "Run Now",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "send-or-hand-over",
+      "name": "Send or Hand Over?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
       "position": [
         -20,
         0
       ],
       "parameters": {
-        "conditions": {
-          "options": {
-            "version": 2,
-            "leftValue": "",
-            "caseSensitive": true,
-            "typeValidation": "loose"
-          },
-          "conditions": [
+        "rules": {
+          "values": [
             {
-              "id": "has-id",
-              "leftValue": "={{ $json.id }}",
-              "rightValue": "",
-              "operator": {
-                "type": "string",
-                "operation": "notEmpty",
-                "singleValue": true
-              }
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "act-send",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "send",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "send"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "act-hand_over",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "hand_over",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "hand_over"
             }
-          ],
-          "combinator": "and"
+          ]
         },
         "options": {}
       }
     },
     {
-      "id": "compose-follow-up",
-      "name": "Compose Follow-up",
+      "id": "compose-prompt",
+      "name": "Compose Prompt",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
         200,
-        0
+        -100
       ],
       "parameters": {
         "mode": "runOnceForEachItem",
-        "jsCode": "\n// Builds the AI prompt AND a persuasive template fallback.\n//\n// The fallback is genuinely reachable, not dead code: Write Nudge (AI) runs\n// with onError=continueRegularOutput, so an OpenAI failure passes this item\n// straight through with no `output` field and Assemble Nudge falls back to\n// `followup_text` below.\nconst v = (typeof $json.prompt_vars === 'string')\n            ? JSON.parse($json.prompt_vars) : ($json.prompt_vars || {});\nconst first = $json.name ? (' ' + String($json.name).trim().split(/\\s+/)[0]) : '';\nconst persona = v.persona_name || 'the studio';\nconst offer = $json.intro_offer || 'our intro offer';\nconst cap = $json.class_capacity;\nconst isFinal = $json.is_final === true || $json.is_final === 'true';\n\nconst msgs = [\n  `Hey${first} 😊 no rush at all — I know starting something new can feel a bit daunting, especially if you're not sure it's for you yet. Our beginner classes are small (max ${cap}) and built for total first-timers, so you'd be in really good hands. Your ${offer} is still open — want me to suggest an easy time to come try one class? No commitment, just see how it feels.`,\n  `Hey${first}, just checking in one last time 💛 honestly, most of our members were on the fence before their first class and now they can't imagine their week without it. If you're even a little curious, just tell me which day suits and I'll point you to an easy class to start with — nothing to lose. And if the timing isn't right, no worries at all, I'm here whenever you're ready.`,\n];\n\nconst systemMessage = [\n`You are ${persona}, the warm, friendly owner of ${v.studio_name || 'the studio'}, a ${v.studio_type || 'fitness studio'} in ${v.location || ''}. You are writing a short follow-up DM to a lead who asked about classes but went quiet — they seem interested but unsure about committing. Re-engage them and make trying a class feel easy, WITHOUT being pushy or salesy.`,\n``,\n`Rules:`,\n`- 1 to 3 short sentences, warm and human, like a real text from a person. No 'Dear', no formal sign-off, no subject line.`,\n`- Use what they last said to gently address their specific hesitation.`,\n`- Naturally remind them of the value: ${offer}, small classes (max ${cap})${v.amenities ? ', ' + v.amenities.toLowerCase() : ''}.`,\n`- End with ONE easy, low-friction question or invite.`,\n`- If it is the FINAL nudge, be extra gentle and leave the door open.`,\n`- Output ONLY the message text. No quotes, no labels, no JSON. At most one tasteful emoji.`,\n].join('\\n');\n\nconst userMessage = [\n`Write a follow-up message — nudge #${Number($json.nudges_sent)}${isFinal ? ' (FINAL nudge: extra gentle, leave the door open)' : ''}.`,\n`Lead's first name: ${$json.name || 'there'}`,\n`What they last said to us: \"${$json.last_msg ?? ''}\"`,\n`Write the message now.`,\n].join('\\n');\n\nreturn { json: {\n  id: $json.id,\n  external_id: $json.external_id,\n  channel: $json.channel,\n  studio_id: $json.studio_id,\n  slack_lead_channel_id: $json.slack_lead_channel_id,\n  slack_owner_channel_id: $json.slack_owner_channel_id,\n  name: $json.name ?? null,\n  last_msg: $json.last_msg ?? '',\n  followup_text: msgs[Math.min(Math.max(Number($json.nudges_sent) - 1, 0), msgs.length - 1)],\n  nudge_number: Number($json.nudges_sent),\n  is_final: isFinal,\n  systemMessage,\n  userMessage,\n} };\n"
+        "jsCode": "\nconst j = $json;\nconst v = (typeof j.prompt_vars === 'string') ? JSON.parse(j.prompt_vars) : (j.prompt_vars || {});\nconst persona = v.persona_name || 'the studio assistant';\nconst studio = v.studio_name || j.studio_name;\nconst owner = j.owner_name || 'the owner';\nconst thread = Array.isArray(j.thread) ? j.thread : [];\nconst who = (m) => m.direction === 'inbound' ? 'Lead' : (m.author === 'human' ? 'Studio staff' : 'You');\nconst history = thread.map((m) => `${who(m)}: ${String(m.body || '').replace(/\\s+/g, ' ').slice(0, 500)}`).join('\\n');\nconst task = j.kind === 'link'\n  ? `About 3 hours ago you sent her the booking link and she hasn't opened it yet. Write a light check-in: did she get a chance to grab a spot? The system attaches the same link under your message, so don't write a link and don't say \"here's the link again\" in a robotic way.`\n  : (j.is_final\n      ? `She went quiet after your last message, and you already followed up once. This is the LAST follow-up: extra gentle, no pressure, leave the door open for whenever she's ready.`\n      : `She went quiet after your last message. Write a light, friendly check-in that picks up where you left off.`);\nconst systemMessage = [\n`You are ${persona}, the AI assistant for ${studio}${v.type ? ', a ' + v.type : ''}${v.city ? ' in ' + v.city : ''}. You text leads on Instagram in the owner's (${owner}'s) voice: warm, casual, specific, like a real person texting.`,\n``,\ntask,\n``,\n`Rules:`,\n`- One or two short sentences. No greeting like \"Hey!\" or \"Hi again!\", no sign-off.`,\n`- Never pushy: no guilt, no fake urgency, no \"just following up\", \"circling back\", \"touching base\" or \"I wanted to reach out\".`,\n`- Use the conversation: refer to the class or question she was actually considering. Don't repeat what was already said.`,\n`- Never say she is booked and never claim a spot is free. Don't quote prices unless she asked about price.`,\n`- Write times like \"5:30pm\". No em dashes. No URLs. At most one emoji, usually none.`,\n`- At most one easy question.`,\n``,\n`Output ONLY the message text.`,\n].join('\\n');\nconst userMessage = `Conversation so far:\\n${history || '(none)'}\\n\\nWrite the follow-up now.`;\nreturn { json: { ...j, systemMessage, userMessage } };\n"
       }
     },
     {
@@ -102,7 +144,7 @@
       "typeVersion": 3.1,
       "position": [
         420,
-        0
+        -100
       ],
       "parameters": {
         "promptType": "define",
@@ -111,8 +153,7 @@
           "systemMessage": "={{ $json.systemMessage }}"
         }
       },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true
+      "onError": "continueRegularOutput"
     },
     {
       "id": "openai-nudge",
@@ -121,14 +162,14 @@
       "typeVersion": 1.3,
       "position": [
         420,
-        200
+        100
       ],
       "parameters": {
         "model": {
           "__rl": true,
-          "value": "gpt-5.4-mini",
+          "value": "gpt-5.4",
           "mode": "list",
-          "cachedResultName": "gpt-5.4-mini"
+          "cachedResultName": "gpt-5.4"
         },
         "builtInTools": {},
         "options": {}
@@ -141,64 +182,103 @@
       }
     },
     {
-      "id": "assemble-nudge",
-      "name": "Assemble Nudge",
-      "type": "n8n-nodes-base.set",
-      "typeVersion": 3.4,
+      "id": "finish-nudge",
+      "name": "Finish Nudge",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
         640,
-        0
+        -100
       ],
       "parameters": {
-        "assignments": {
-          "assignments": [
+        "mode": "runOnceForEachItem",
+        "jsCode": "\n// Cleans the AI's text and attaches the link BY CODE (the AI never types one).\n// If the AI failed or wrote nothing usable, nothing is sent: the lead stays\n// due and the next run (15 min) tries again while the window is open.\nconst c = $('Compose Prompt').item.json;\nlet text = String($json.output || '').trim()\n  .replace(/^[\"'“”]+|[\"'“”]+$/g, '')\n  .replace(/https?:\\/\\/\\S+/g, '')\n  .replace(/\\s*—\\s*/g, ', ')\n  .replace(/[ \\t]+/g, ' ').trim();\nif (!text || text.length > 400) return { json: { ...c, skip: true, skip_reason: text ? 'too long' : ($json.error ? 'AI error' : 'empty') } };\nif (c.kind === 'link' && c.short_code) text = `${text}\\nhttps://go.looplogicsystems.com/${c.short_code}`;\nconst { systemMessage, userMessage, thread, prompt_vars, ...keep } = c;\nreturn { json: { ...keep, text, skip: false } };\n"
+      }
+    },
+    {
+      "id": "log-nudge",
+      "name": "Log Nudge",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        860,
+        -100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO messages (lead_id, direction, channel, body, author, nudge, created_at)\nSELECT $1::int, 'outbound', $2, $3, 'ai', true, now()\n WHERE NOT $11::boolean\n   AND NOT (SELECT ai_paused FROM leads WHERE id = $1::int)\n   AND NOT EXISTS (SELECT 1 FROM messages WHERE lead_id = $1::int AND direction = 'inbound'\n                    AND created_at > $4::timestamptz)\nRETURNING id AS message_id, lead_id, channel, body AS text, $5::text AS external_id, $6::text AS kind,\n          $7::boolean AS is_final, NULLIF($8::text, '')::int AS link_id, $9::text AS token_enc,\n          $10::text AS slack_channel;",
+        "options": {
+          "queryReplacement": "={{ [$json.lead_id, $json.channel, $json.text ?? '', $json.last_inbound_at, $json.external_id, $json.kind, !!$json.is_final, $json.link_id ?? '', $json.token_enc ?? '', $json.slack_lead_channel_id ?? '', !!$json.skip] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true,
+      "retryOnFail": true
+    },
+    {
+      "id": "which-channel",
+      "name": "Which Channel?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1080,
+        -100
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
             {
-              "id": "a1",
-              "name": "followup_text",
-              "type": "string",
-              "value": "={{ $json.output || $('Compose Follow-up').item.json.followup_text }}"
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "ch-instagram",
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "instagram",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "instagram"
             },
             {
-              "id": "a2",
-              "name": "id",
-              "type": "number",
-              "value": "={{ $('Compose Follow-up').item.json.id }}"
-            },
-            {
-              "id": "a3",
-              "name": "external_id",
-              "type": "string",
-              "value": "={{ $('Compose Follow-up').item.json.external_id }}"
-            },
-            {
-              "id": "a4",
-              "name": "channel",
-              "type": "string",
-              "value": "={{ $('Compose Follow-up').item.json.channel }}"
-            },
-            {
-              "id": "a5",
-              "name": "nudge_number",
-              "type": "number",
-              "value": "={{ $('Compose Follow-up').item.json.nudge_number }}"
-            },
-            {
-              "id": "a6",
-              "name": "is_final",
-              "type": "boolean",
-              "value": "={{ $('Compose Follow-up').item.json.is_final }}"
-            },
-            {
-              "id": "a7",
-              "name": "slack_lead_channel_id",
-              "type": "string",
-              "value": "={{ $('Compose Follow-up').item.json.slack_lead_channel_id }}"
-            },
-            {
-              "id": "a8",
-              "name": "slack_owner_channel_id",
-              "type": "string",
-              "value": "={{ $('Compose Follow-up').item.json.slack_owner_channel_id }}"
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "ch-slack",
+                    "leftValue": "={{ $json.channel }}",
+                    "rightValue": "slack",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "slack"
             }
           ]
         },
@@ -206,133 +286,35 @@
       }
     },
     {
-      "id": "log-follow-up-outbound",
-      "name": "Log Follow-up (outbound)",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.6,
+      "id": "send-ig-nudge",
+      "name": "Send IG Nudge",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        860,
-        -180
+        1300,
+        -200
       ],
       "parameters": {
-        "operation": "executeQuery",
-        "query": "INSERT INTO messages (lead_id, direction, channel, body, created_at)\nVALUES ($1, 'outbound', $2, $3, now());",
-        "options": {
-          "queryReplacement": "={{ [$json.id, $json.channel, $json.followup_text] }}"
-        }
-      },
-      "credentials": {
-        "postgres": {
-          "id": "POSTGRES_CRED_ID",
-          "name": "Postgres account"
-        }
-      },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true
-    },
-    {
-      "id": "mark-cold-if-final",
-      "name": "Mark Cold if Final",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.6,
-      "position": [
-        860,
-        -60
-      ],
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "UPDATE leads\n   SET status = CASE WHEN $2 THEN 'cold' ELSE status END, updated_at = now()\n WHERE id = $1;",
-        "options": {
-          "queryReplacement": "={{ [$json.id, $json.is_final] }}"
-        }
-      },
-      "credentials": {
-        "postgres": {
-          "id": "POSTGRES_CRED_ID",
-          "name": "Postgres account"
-        }
-      },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true
-    },
-    {
-      "id": "notify-owner---follow-up",
-      "name": "Notify Owner - Follow-up",
-      "type": "n8n-nodes-base.slack",
-      "typeVersion": 2.3,
-      "position": [
-        860,
-        60
-      ],
-      "parameters": {
-        "select": "channel",
-        "channelId": {
-          "__rl": true,
-          "value": "={{ $json.slack_owner_channel_id }}",
-          "mode": "id"
-        },
-        "text": "=:wave: Auto follow-up #{{ $json.nudge_number }} for {{ $json.external_id }} ({{ $json.channel }}): \"{{ $json.followup_text }}\"{{ $json.channel === 'slack' ? '' : '\\n:information_source: Not auto-sent — Instagram nudges outside Meta''s 24h window need a message tag, so this one is logged for you to send.' }}",
-        "otherOptions": {}
-      },
-      "credentials": {
-        "slackApi": {
-          "id": "SLACK_OWNER_BOT_CRED_ID",
-          "name": "Slack"
-        }
-      },
-      "onError": "continueRegularOutput",
-      "retryOnFail": true
-    },
-    {
-      "id": "is-slack-lead",
-      "name": "Is Slack Lead?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        860,
-        200
-      ],
-      "parameters": {
-        "conditions": {
-          "options": {
-            "version": 2,
-            "leftValue": "",
-            "caseSensitive": true,
-            "typeValidation": "loose"
-          },
-          "conditions": [
-            {
-              "id": "is-slack",
-              "leftValue": "={{ $json.channel }}",
-              "rightValue": "slack",
-              "operator": {
-                "type": "string",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
+        "jsCode": "\nconst crypto = require('crypto');\nconst tokenKey = () => {\n  const k = String($env.IG_TOKEN_KEY || '');\n  if (k.length < 32) throw new Error('IG_TOKEN_KEY is missing on the server');\n  return crypto.createHash('sha256').update(k, 'utf8').digest();\n};\nconst encryptToken = (plain) => {\n  const iv = crypto.randomBytes(12);\n  const c = crypto.createCipheriv('aes-256-gcm', tokenKey(), iv);\n  const ct = Buffer.concat([c.update(String(plain), 'utf8'), c.final()]);\n  return Buffer.concat([Buffer.from([1]), iv, c.getAuthTag(), ct]).toString('base64');\n};\nconst decryptToken = (b64) => {\n  const b = Buffer.from(String(b64 || ''), 'base64');\n  if (b.length < 30 || b[0] !== 1) throw new Error('no usable Instagram token stored for this account');\n  const d = crypto.createDecipheriv('aes-256-gcm', tokenKey(), b.subarray(1, 13));\n  d.setAuthTag(b.subarray(13, 29));\n  return Buffer.concat([d.update(b.subarray(29)), d.final()]).toString('utf8');\n};\n\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\nconst scrub = (s) => String(s || '').replace(/[A-Za-z0-9_\\-]{40,}/g, '[redacted]').slice(0, 300);\nasync function graphCall(ctx, { what, method = 'GET', url, token, qs, form, json, tries = 1 }) {\n  const headers = {};\n  if (token) headers.Authorization = `Bearer ${token}`;\n  let body;\n  // n8n's Code sandbox has no URLSearchParams / URL / fetch: encode by hand.\n  if (form) { headers['Content-Type'] = 'application/x-www-form-urlencoded';\n             body = Object.entries(form).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v ?? ''))}`).join('&'); }\n  else if (json) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(json); }\n  for (let attempt = 1; ; attempt++) {\n    let r;\n    try {\n      r = await ctx.helpers.httpRequest({ method, url, qs, headers, body, json: false,\n        returnFullResponse: true, ignoreHttpStatusErrors: true, timeout: 20000 });\n    } catch (e) {\n      if (attempt < tries) { await sleep(700 * attempt); continue; }\n      const err = new Error(`${what}: could not reach Instagram (${scrub(e.code || e.message)})`);\n      err.kind = 'network'; throw err;\n    }\n    let data = r.body;\n    if (Buffer.isBuffer(data)) data = data.toString('utf8');\n    if (typeof data === 'string') { try { data = JSON.parse(data); } catch (e) { data = { raw: scrub(data) }; } }\n    if (r.statusCode >= 500 && attempt < tries) { await sleep(700 * attempt); continue; }\n    if (r.statusCode >= 400) {\n      const m = (data && (data.error || data)) || {};\n      const err = new Error(`${what}: HTTP ${r.statusCode}: ${scrub(m.message || m.error_message || m.raw || 'error')}` +\n                            (m.code ? ` (code ${m.code}${m.error_subcode ? '/' + m.error_subcode : ''})` : ''));\n      err.kind = 'http'; err.status = r.statusCode; err.metaCode = m.code; throw err;\n    }\n    return data;\n  }\n}\n\nasync function sendIG(ctx, tokenEnc, recipientId, text) {\n  if (!tokenEnc) throw new Error('no Instagram token stored for this account (reconnect it with a connect link)');\n  const r = await graphCall(ctx, { what: 'send message', method: 'POST', url: 'https://graph.instagram.com/v25.0/me/messages',\n    token: decryptToken(tokenEnc), json: { recipient: { id: String(recipientId) }, message: { text: String(text) } } });\n  return r.message_id || null;\n}\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  if (!j.message_id) continue;\n  const base = { message_id: j.message_id, lead_id: j.lead_id, kind: j.kind, is_final: j.is_final,\n                 link_id: j.link_id, text: j.text, channel: j.channel };\n  try { out.push({ json: { ...base, status: 'sent', mid: await sendIG(this, j.token_enc, j.external_id, j.text) } }); }\n  catch (e) { out.push({ json: { ...base, status: 'failed', mid: '', error: String(e.message).slice(0, 400),\n                                 token_problem: e.metaCode === 190 || /token/i.test(String(e.message)) } }); }\n}\nreturn out;\n"
       }
     },
     {
-      "id": "send-follow-up-to-lead-slack",
-      "name": "Send Follow-up to Lead (Slack)",
+      "id": "send-slack-nudge",
+      "name": "Send Slack Nudge",
       "type": "n8n-nodes-base.slack",
       "typeVersion": 2.3,
       "position": [
-        1080,
-        200
+        1300,
+        0
       ],
       "parameters": {
         "select": "channel",
         "channelId": {
           "__rl": true,
-          "value": "={{ $json.slack_lead_channel_id }}",
+          "value": "={{ $json.slack_channel }}",
           "mode": "id"
         },
-        "text": "={{ $json.followup_text }}",
+        "text": "={{ $json.text }}",
         "otherOptions": {}
       },
       "credentials": {
@@ -345,52 +327,250 @@
       "retryOnFail": true
     },
     {
-      "id": "ig-nudge-deferred",
-      "name": "IG Nudge (deferred)",
-      "type": "n8n-nodes-base.noOp",
-      "typeVersion": 1,
+      "id": "slack-sent",
+      "name": "Slack Sent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
       "position": [
-        1080,
-        320
+        1520,
+        0
       ],
-      "parameters": {}
+      "parameters": {
+        "jsCode": "\nreturn $('Which Channel?').all(1).filter((i) => i.json.channel === 'slack' && i.json.message_id)   // output 1 = slack\n  .map((i) => ({ json: { ...i.json, status: 'sent', mid: '' } }));\n"
+      }
+    },
+    {
+      "id": "nudge-sent",
+      "name": "Nudge Sent?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1520,
+        -200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "sent",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "sent",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "record-nudge",
+      "name": "Record Nudge",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1740,
+        -120
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Instagram's id (so the echo is recognised as ours), the link nudge spent,\n-- and the lead marked cold after her final nudge.\nWITH m AS (\n  UPDATE messages SET provider_message_id = NULLIF($2, '') WHERE id = $1::int RETURNING id\n), b AS (\n  UPDATE booking_links SET nudged_at = now() WHERE id = NULLIF($3::text, '')::int AND $4 = 'link' RETURNING id\n), l AS (\n  UPDATE leads SET status = 'cold', updated_at = now()\n   WHERE id = $5::int AND $6::boolean AND status = 'engaged' RETURNING id\n)\nSELECT (SELECT id FROM m) AS message_id;",
+        "options": {
+          "queryReplacement": "={{ [$json.message_id, $json.mid ?? '', $json.link_id ?? '', $json.kind, $json.lead_id, !!$json.is_final] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true
+    },
+    {
+      "id": "dead-letter-nudge-failed",
+      "name": "Dead Letter: Nudge Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1740,
+        -280
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Not delivered: take it out of the thread and keep it as a dead letter.\nWITH dl AS (\n  INSERT INTO dead_letters (workflow_id, execution_id, reason, payload, error)\n  VALUES ($1, $2, 'ig_nudge_failed', $3::jsonb, $4) RETURNING id\n), unsent AS (\n  DELETE FROM messages WHERE id = $5::int AND provider_message_id IS NULL RETURNING id\n)\nSELECT (SELECT id FROM dl) AS dead_letter_id;",
+        "options": {
+          "queryReplacement": "={{ [$workflow.id, $execution.id, JSON.stringify({ lead_id: $json.lead_id, kind: $json.kind, text: $json.text }), $json.error, $json.message_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "email-nudge-failed",
+      "name": "Email: Nudge Failed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        -280
+      ],
+      "parameters": {
+        "jsCode": "\nconst failed = $('Send IG Nudge').all().filter((i) => i.json.status === 'failed');\nif (!failed.length) return [];\nreturn [{ json: {\n  to: 'founders',\n  subject: `${failed.length} follow-up nudge${failed.length > 1 ? 's' : ''} NOT delivered`,\n  heading: 'Instagram refused a follow-up nudge.',\n  lines: [...failed.map((i) => `Lead ${i.json.lead_id} (${i.json.kind}): ${i.json.error}`),\n          failed.some((i) => i.json.token_problem) ? 'Looks like a token problem: send the studio a new connect link.' : 'Saved in dead_letters.'],\n} }];\n"
+      }
+    },
+    {
+      "id": "send-nudge-failed",
+      "name": "Send: Nudge Failed",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2180,
+        -280
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "hand-over",
+      "name": "Hand Over",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        200,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Nothing can be sent any more. Stop automation for this lead (once) and\n-- tell the owner. Quiet leads go cold; a link nudge is marked spent.\nWITH b AS (\n  UPDATE booking_links SET nudged_at = now() WHERE id = NULLIF($2::text, '')::int AND $3 = 'link' RETURNING id\n), l AS (\n  UPDATE leads SET status = CASE WHEN status = 'engaged' THEN 'cold' ELSE status END, updated_at = now()\n   WHERE id = $1::int RETURNING id\n)\nSELECT $1::int AS lead_id, $3::text AS kind;",
+        "options": {
+          "queryReplacement": "={{ [$json.lead_id, $json.link_id ?? '', $json.kind] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "retryOnFail": true
+    },
+    {
+      "id": "email-over-to-you",
+      "name": "Email: Over to You",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        160
+      ],
+      "parameters": {
+        "jsCode": "\nconst leadLabel = (l) => {\n  const u = l.username ? `@${l.username}` : null;\n  if (u && l.name) return `${u} (${l.name})`;\n  if (u) return u;\n  if (l.name) return String(l.name);\n  return l.channel === 'instagram' ? 'An Instagram lead' : `A ${l.channel} lead`;\n};\n// Opens the owner's DM thread with this lead in the Instagram app.\nconst chatButton = (l) => (l.channel === 'instagram' && l.username && /^[A-Za-z0-9._]{1,30}$/.test(l.username))\n  ? { label: 'Open chat', url: `https://ig.me/m/${l.username}` } : null;\n\nreturn $('Send or Hand Over?').all(1).filter((i) => i.json.action === 'hand_over').map((i) => {   // output 1 = hand_over\n  const j = i.json;\n  const who = leadLabel(j);\n  const what = j.kind === 'link' ? 'was sent your booking link but never opened it' : 'stopped replying';\n  return { json: {\n    to: j.owner_alert_email || 'founders',\n    subject: `${who} went quiet — over to you if you want to follow up`,\n    heading: `${who} ${what}.`,\n    lines: ['Instagram only lets a business message someone within 24 hours of THEIR last message, and that window has closed, so the AI can’t follow up.',\n            'If you know her or want to try once more, message her yourself. If she writes back, the AI picks the conversation up again.'],\n    buttons: [chatButton(j)].filter(Boolean),\n  } };\n});\n"
+      }
+    },
+    {
+      "id": "send-over-to-you",
+      "name": "Send: Over to You",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        640,
+        160
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
     }
   ],
   "connections": {
-    "Follow-up Scheduler": {
+    "Every 15 Minutes": {
       "main": [
         [
           {
-            "node": "Find Stale Leads",
+            "node": "Claim Due Leads",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Find Stale Leads": {
+    "Run Now": {
       "main": [
         [
           {
-            "node": "Has Stale Leads?",
+            "node": "Claim Due Leads",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Has Stale Leads?": {
+    "Claim Due Leads": {
       "main": [
         [
           {
-            "node": "Compose Follow-up",
+            "node": "Send or Hand Over?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Compose Follow-up": {
+    "Send or Hand Over?": {
+      "main": [
+        [
+          {
+            "node": "Compose Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Hand Over",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compose Prompt": {
       "main": [
         [
           {
@@ -416,51 +596,142 @@
       "main": [
         [
           {
-            "node": "Assemble Nudge",
+            "node": "Finish Nudge",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Assemble Nudge": {
+    "Finish Nudge": {
       "main": [
         [
           {
-            "node": "Log Follow-up (outbound)",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Mark Cold if Final",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Notify Owner - Follow-up",
-            "type": "main",
-            "index": 0
-          },
-          {
-            "node": "Is Slack Lead?",
+            "node": "Log Nudge",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Is Slack Lead?": {
+    "Log Nudge": {
       "main": [
         [
           {
-            "node": "Send Follow-up to Lead (Slack)",
+            "node": "Which Channel?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Which Channel?": {
+      "main": [
+        [
+          {
+            "node": "Send IG Nudge",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "IG Nudge (deferred)",
+            "node": "Send Slack Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Nudge": {
+      "main": [
+        [
+          {
+            "node": "Slack Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send IG Nudge": {
+      "main": [
+        [
+          {
+            "node": "Nudge Sent?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Nudge Sent?": {
+      "main": [
+        [
+          {
+            "node": "Record Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Dead Letter: Nudge Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Sent": {
+      "main": [
+        [
+          {
+            "node": "Record Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dead Letter: Nudge Failed": {
+      "main": [
+        [
+          {
+            "node": "Email: Nudge Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Nudge Failed": {
+      "main": [
+        [
+          {
+            "node": "Send: Nudge Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hand Over": {
+      "main": [
+        [
+          {
+            "node": "Email: Over to You",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Over to You": {
+      "main": [
+        [
+          {
+            "node": "Send: Over to You",
             "type": "main",
             "index": 0
           }

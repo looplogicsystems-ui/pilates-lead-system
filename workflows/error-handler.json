@@ -26,7 +26,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO dead_letters (workflow_id, execution_id, reason, payload, error)\nVALUES ($1, $2, 'execution_error', $3::jsonb, $4);",
+        "query": "WITH ins AS (\n  INSERT INTO dead_letters (workflow_id, execution_id, reason, payload, error)\n  VALUES ($1, $2, 'execution_error', $3::jsonb, $4)\n  RETURNING id\n)\nSELECT (SELECT id FROM ins) AS dead_letter_id,\n       (SELECT count(*) FROM dead_letters\n         WHERE reason = 'execution_error' AND workflow_id = $1\n           AND created_at > now() - interval '10 minutes') AS recent_same;",
         "options": {
           "queryReplacement": "={{ [ $json.workflow && $json.workflow.id, String(($json.execution && $json.execution.id) ?? ''), JSON.stringify($json), [($json.execution && $json.execution.lastNodeExecuted), ($json.execution && $json.execution.error && $json.execution.error.message)].filter(Boolean).join(' — ') ] }}"
         }
@@ -48,7 +48,7 @@
       "typeVersion": 2.3,
       "position": [
         180,
-        0
+        -100
       ],
       "parameters": {
         "select": "channel",
@@ -68,6 +68,40 @@
       },
       "onError": "continueRegularOutput",
       "retryOnFail": true
+    },
+    {
+      "id": "error-email",
+      "name": "Founder Email?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        180,
+        100
+      ],
+      "parameters": {
+        "jsCode": "// H3: every workflow error emails the founders, at most once per workflow per\n// 10 minutes (an outage can fire dozens of errors). Slack still gets each one.\n// Never emails about Send Email's OWN failures: Send Email reports errors to\n// this workflow, so emailing through it again could loop forever.\nconst e = $('On Workflow Error').first().json;\nconst dl = $('Persist Dead Letter').first().json || {};\nconst wf = (e.workflow && e.workflow.name) || 'unknown workflow';\nconst wfId = (e.workflow && e.workflow.id) || '';\nconst ex = e.execution || {};\nif (wfId === 'PQWBdER3x291uWeU' || wf === 'Send Email') return [];\n// recent_same is unknown when Postgres itself is down: email anyway.\nif (Number(dl.recent_same) > 0) return [];\nconst msg = String((ex.error && ex.error.message) || 'no message');\nreturn [{ json: {\n  to: 'founders',\n  subject: `System error in \"${wf}\"`,\n  heading: `\"${wf}\" failed${ex.lastNodeExecuted ? ' at \"' + ex.lastNodeExecuted + '\"' : ''}.`,\n  lines: [\n    `Error: ${msg.slice(0, 500)}`,\n    dl.dead_letter_id ? `Saved as dead letter #${dl.dead_letter_id}.` : 'It could NOT be saved to dead_letters (is Postgres down?).',\n    'If a lead was mid-conversation, check she got a reply. More errors from this workflow in the next 10 minutes go to Slack only.',\n  ],\n  buttons: (wfId && ex.id) ? [{ label: 'Open the failed run', url: `https://n8n.looplogicsystems.com/workflow/${wfId}/executions/${ex.id}` }] : [],\n} }];"
+      }
+    },
+    {
+      "id": "error-send",
+      "name": "Email Founders",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        400,
+        100
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
     }
   ],
   "connections": {
@@ -87,6 +121,22 @@
         [
           {
             "node": "Alert Owner (Slack)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Founder Email?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Founder Email?": {
+      "main": [
+        [
+          {
+            "node": "Email Founders",
             "type": "main",
             "index": 0
           }

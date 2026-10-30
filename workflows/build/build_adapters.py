@@ -14,7 +14,7 @@ import json
 import os
 import sys
 
-from ig_common import GRAPH, TOKEN_CRYPTO_JS, GRAPH_JS, LEAD_NAME_JS
+from ig_common import GRAPH, TOKEN_CRYPTO_JS, GRAPH_JS, LEAD_NAME_JS, SEND_IG_JS, LINK_BASE
 
 CREDS = {
     "POSTGRES_CRED_ID":        "VVIxtEmT1GWsEZn9",
@@ -672,204 +672,305 @@ return { json: {
 # 3. Follow-up Scheduler
 # ===========================================================================
 def followup():
+    """Pilot build step 7 (§G). Every 15 minutes:
+      quiet lead  (status engaged): nudge 1 at followup_first_after_minutes after
+                  the AI's last message, nudge 2 at followup_final_after_minutes
+                  after the first; max_nudges in total; after the final one -> cold.
+      link nudge  (status link_sent): ONE nudge ~3h after the booking link if it
+                  wasn't tapped; the same tracked link is attached again.
+    Instagram only lets a business message someone within 24h of THEIR last
+    message: inside it the nudge is sent (8am-9pm studio time only); once it has
+    closed, nothing is sent and the owner is told instead, once."""
     w = WF("Follow-up Scheduler", "00000000-0000-4000-8000-00000000a003",
            "fyk6eYsVGtUVS1dh")
 
-    w.node("Follow-up Scheduler", "n8n-nodes-base.scheduleTrigger", 1.2, [-460, 0], {
+    w.node("Every 15 Minutes", "n8n-nodes-base.scheduleTrigger", 1.2, [-460, 0], {
         "rule": {"interval": [{"field": "minutes", "minutesInterval": 15}]}})
 
-    w.pg("Find Stale Leads", [-240, 0], """-- Leads who went quiet and are still fair game for an automated nudge.
---
--- Exclusions that did not exist before: `escalated` leads (handed to a human --
--- they used to sit at 'engaged' and get nudged an hour after asking a medical
--- or pricing question) and `ai_paused` leads (the owner has taken the thread
--- over). Cadence comes from studios, not from literals in this query.
-WITH last_inbound AS (
-  SELECT lead_id, MAX(created_at) AS t FROM messages WHERE direction = 'inbound' GROUP BY lead_id
-),
-last_msg AS (
-  SELECT lead_id, MAX(created_at) AS t FROM messages GROUP BY lead_id
-),
-out_since AS (
-  SELECT m.lead_id, COUNT(*) AS n
-    FROM messages m JOIN last_inbound li ON li.lead_id = m.lead_id
-   WHERE m.direction = 'outbound' AND m.created_at > li.t
+    w.pg("Claim Due Leads", [-240, 0], """-- Who is due a nudge or a hand-over RIGHT NOW, claimed in the same statement
+-- so an overlapping run can't nudge them too. Leads the AI didn't speak to last
+-- (she replied, or staff did) are never nudged. Only conversations from the
+-- last 48h are considered, so old history is never acted on.
+WITH last_in AS (
+  SELECT lead_id, max(created_at) AS t FROM messages WHERE direction = 'inbound' GROUP BY lead_id
+), last_msg AS (
+  SELECT DISTINCT ON (lead_id) lead_id, created_at AS t, direction, author
+    FROM messages ORDER BY lead_id, created_at DESC
+), nudges AS (
+  SELECT m.lead_id, count(*) AS n
+    FROM messages m JOIN last_in li ON li.lead_id = m.lead_id
+   WHERE m.direction = 'outbound' AND m.nudge AND m.created_at > li.t
    GROUP BY m.lead_id
+), cand AS (
+  SELECT l.id AS lead_id, l.external_id, l.channel, l.status, l.username, l.name,
+         s.id AS studio_id, s.name AS studio_name, s.prompt_vars, s.owner_alert_email, s.owner_name,
+         s.slack_lead_channel_id, s.max_nudges,
+         li.t AS last_inbound_at, lm.t AS last_msg_at, COALESCE(n.n, 0) AS nudges_sent,
+         bl.id AS link_id, bl.short_code,
+         CASE
+           WHEN l.status = 'link_sent' THEN
+             CASE WHEN bl.id IS NOT NULL AND bl.clicked_at IS NULL AND bl.nudged_at IS NULL
+                       AND bl.lead_said_booked_at IS NULL AND bl.owner_confirmed_at IS NULL
+                       AND bl.sent_at < now() - interval '3 hours' THEN 'link' END
+           WHEN COALESCE(n.n, 0) = 0
+                AND lm.t < now() - make_interval(mins => s.followup_first_after_minutes) THEN 'quiet'
+           WHEN COALESCE(n.n, 0) BETWEEN 1 AND s.max_nudges - 1
+                AND lm.t < now() - make_interval(mins => s.followup_final_after_minutes) THEN 'quiet'
+         END AS kind,
+         -- Instagram's 24h window (30 min of margin); Slack has none.
+         (l.channel <> 'instagram' OR li.t > now() - interval '23 hours 30 minutes') AS window_open,
+         (EXTRACT(HOUR FROM now() AT TIME ZONE s.timezone) BETWEEN 8 AND 20) AS daytime,
+         encode(ca.access_token_enc, 'base64') AS token_enc,
+         (SELECT json_agg(th ORDER BY th.created_at)
+            FROM (SELECT direction, author, body, created_at FROM messages
+                   WHERE lead_id = l.id ORDER BY created_at DESC LIMIT 12) th) AS thread
+    FROM leads l
+    JOIN studios s   ON s.id = l.studio_id AND s.active
+    JOIN last_in li  ON li.lead_id = l.id
+    JOIN last_msg lm ON lm.lead_id = l.id
+    LEFT JOIN nudges n ON n.lead_id = l.id
+    LEFT JOIN LATERAL (SELECT * FROM booking_links b WHERE b.lead_id = l.id
+                        ORDER BY b.sent_at DESC LIMIT 1) bl ON true
+    -- one Instagram account per studio during the pilot
+    LEFT JOIN LATERAL (SELECT access_token_enc FROM channel_accounts c
+                        WHERE c.studio_id = l.studio_id AND c.channel = 'instagram' AND c.active
+                        ORDER BY c.connected_at DESC NULLS LAST LIMIT 1) ca ON l.channel = 'instagram'
+   WHERE NOT l.ai_paused
+     AND l.channel IN ('instagram', 'slack')
+     AND l.status IN ('engaged', 'link_sent')
+     AND lm.direction = 'outbound' AND lm.author = 'ai'
+     AND li.t > now() - interval '48 hours'
+     AND (l.nudge_claimed_at IS NULL OR l.nudge_claimed_at < now() - interval '30 minutes')
+), due AS (
+  SELECT c.*, CASE WHEN NOT c.window_open THEN 'hand_over' ELSE 'send' END AS action,
+         (c.kind = 'quiet' AND c.nudges_sent + 1 >= c.max_nudges) AS is_final
+    FROM cand c
+   WHERE c.kind IS NOT NULL
+     AND (NOT c.window_open OR c.daytime)        -- inside the window but at night: wait
+   ORDER BY c.last_msg_at
+   LIMIT 20
 )
-SELECT l.id, l.external_id, l.channel, l.name,
-       COALESCE(os.n, 0) AS nudges_sent,
-       (SELECT m.body FROM messages m
-         WHERE m.lead_id = l.id AND m.direction = 'inbound'
-         ORDER BY m.created_at DESC LIMIT 1) AS last_msg,
-       s.id AS studio_id, s.timezone, s.prompt_vars, s.class_capacity,
-       -- The intro offer from studio_offers (migration 009), e.g. "2-week unlimited
-       -- intro pass ($89)". studios.offers / prompt_vars.offer are retired by 010.
-       (SELECT o.name || CASE WHEN o.price IS NULL THEN ''
-                              ELSE ' (' || CASE WHEN o.currency = 'USD' THEN '$' ELSE o.currency || ' ' END
-                                        || trim(to_char(o.price, 'FM999999990.##')) || ')' END
-          FROM studio_offers o
-         WHERE o.studio_id = s.id AND o.active AND o.kind = 'intro'
-         ORDER BY o.sort_order LIMIT 1) AS intro_offer,
-       s.slack_lead_channel_id, s.slack_owner_channel_id, s.max_nudges,
-       (COALESCE(os.n, 0) >= s.max_nudges) AS is_final
-  FROM leads l
-  JOIN studios s  ON s.id = l.studio_id
-  JOIN last_msg lm ON lm.lead_id = l.id
-  LEFT JOIN out_since os ON os.lead_id = l.id
- WHERE l.status = 'engaged'
-   AND NOT l.ai_paused
-   AND s.active
-   AND COALESCE(os.n, 0) BETWEEN 1 AND s.max_nudges
-   AND lm.t < now() - make_interval(mins => CASE
-                                              WHEN COALESCE(os.n, 0) = 1
-                                                THEN s.followup_first_after_minutes
-                                              ELSE s.followup_final_after_minutes
-                                            END)
- ORDER BY lm.t ASC
- LIMIT 20;""", alwaysOutputData=True, retryOnFail=True)
-    w.connect("Follow-up Scheduler", "Find Stale Leads")
+UPDATE leads SET nudge_claimed_at = now()
+  FROM due WHERE leads.id = due.lead_id
+RETURNING due.*;""", alwaysOutputData=True, retryOnFail=True)
+    w.connect("Every 15 Minutes", "Claim Due Leads")
+    w.node("Run Now", "n8n-nodes-base.manualTrigger", 1, [-460, 160], {})   # tests / manual runs
+    w.connect("Run Now", "Claim Due Leads")
 
-    w.node("Has Stale Leads?", "n8n-nodes-base.filter", 2.2, [-20, 0], {
-        "conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
-                                   "typeValidation": "loose"},
-                       "conditions": [{"id": "has-id", "leftValue": "={{ $json.id }}",
-                                       "rightValue": "",
-                                       "operator": {"type": "string", "operation": "notEmpty",
-                                                    "singleValue": True}}],
-                       "combinator": "and"}, "options": {}})
-    w.connect("Find Stale Leads", "Has Stale Leads?")
+    w.node("Send or Hand Over?", "n8n-nodes-base.switch", 3.4, [-20, 0], {
+        "rules": {"values": [
+            {"conditions": {"options": {"caseSensitive": True, "leftValue": "", "typeValidation": "strict",
+                                        "version": 3},
+                            "conditions": [{"id": f"act-{k}", "leftValue": "={{ $json.action }}", "rightValue": k,
+                                            "operator": {"type": "string", "operation": "equals"}}],
+                            "combinator": "and"},
+             "renameOutput": True, "outputKey": k} for k in ("send", "hand_over")]},
+        "options": {}})
+    w.connect("Claim Due Leads", "Send or Hand Over?")
 
-    w.node("Compose Follow-up", "n8n-nodes-base.code", 2, [200, 0], {
+    # --- send: the AI writes it, in the studio's voice, from the real thread --
+    w.node("Compose Prompt", "n8n-nodes-base.code", 2, [200, -100], {
         "mode": "runOnceForEachItem", "jsCode": r"""
-// Builds the AI prompt AND a persuasive template fallback.
-//
-// The fallback is genuinely reachable, not dead code: Write Nudge (AI) runs
-// with onError=continueRegularOutput, so an OpenAI failure passes this item
-// straight through with no `output` field and Assemble Nudge falls back to
-// `followup_text` below.
-const v = (typeof $json.prompt_vars === 'string')
-            ? JSON.parse($json.prompt_vars) : ($json.prompt_vars || {});
-const first = $json.name ? (' ' + String($json.name).trim().split(/\s+/)[0]) : '';
-const persona = v.persona_name || 'the studio';
-const offer = $json.intro_offer || 'our intro offer';
-const cap = $json.class_capacity;
-const isFinal = $json.is_final === true || $json.is_final === 'true';
-
-const msgs = [
-  `Hey${first} 😊 no rush at all — I know starting something new can feel a bit daunting, especially if you're not sure it's for you yet. Our beginner classes are small (max ${cap}) and built for total first-timers, so you'd be in really good hands. Your ${offer} is still open — want me to suggest an easy time to come try one class? No commitment, just see how it feels.`,
-  `Hey${first}, just checking in one last time 💛 honestly, most of our members were on the fence before their first class and now they can't imagine their week without it. If you're even a little curious, just tell me which day suits and I'll point you to an easy class to start with — nothing to lose. And if the timing isn't right, no worries at all, I'm here whenever you're ready.`,
-];
-
+const j = $json;
+const v = (typeof j.prompt_vars === 'string') ? JSON.parse(j.prompt_vars) : (j.prompt_vars || {});
+const persona = v.persona_name || 'the studio assistant';
+const studio = v.studio_name || j.studio_name;
+const owner = j.owner_name || 'the owner';
+const thread = Array.isArray(j.thread) ? j.thread : [];
+const who = (m) => m.direction === 'inbound' ? 'Lead' : (m.author === 'human' ? 'Studio staff' : 'You');
+const history = thread.map((m) => `${who(m)}: ${String(m.body || '').replace(/\s+/g, ' ').slice(0, 500)}`).join('\n');
+const task = j.kind === 'link'
+  ? `About 3 hours ago you sent her the booking link and she hasn't opened it yet. Write a light check-in: did she get a chance to grab a spot? The system attaches the same link under your message, so don't write a link and don't say "here's the link again" in a robotic way.`
+  : (j.is_final
+      ? `She went quiet after your last message, and you already followed up once. This is the LAST follow-up: extra gentle, no pressure, leave the door open for whenever she's ready.`
+      : `She went quiet after your last message. Write a light, friendly check-in that picks up where you left off.`);
 const systemMessage = [
-`You are ${persona}, the warm, friendly owner of ${v.studio_name || 'the studio'}, a ${v.studio_type || 'fitness studio'} in ${v.location || ''}. You are writing a short follow-up DM to a lead who asked about classes but went quiet — they seem interested but unsure about committing. Re-engage them and make trying a class feel easy, WITHOUT being pushy or salesy.`,
+`You are ${persona}, the AI assistant for ${studio}${v.type ? ', a ' + v.type : ''}${v.city ? ' in ' + v.city : ''}. You text leads on Instagram in the owner's (${owner}'s) voice: warm, casual, specific, like a real person texting.`,
+``,
+task,
 ``,
 `Rules:`,
-`- 1 to 3 short sentences, warm and human, like a real text from a person. No 'Dear', no formal sign-off, no subject line.`,
-`- Use what they last said to gently address their specific hesitation.`,
-`- Naturally remind them of the value: ${offer}, small classes (max ${cap})${v.amenities ? ', ' + v.amenities.toLowerCase() : ''}.`,
-`- End with ONE easy, low-friction question or invite.`,
-`- If it is the FINAL nudge, be extra gentle and leave the door open.`,
-`- Output ONLY the message text. No quotes, no labels, no JSON. At most one tasteful emoji.`,
+`- One or two short sentences. No greeting like "Hey!" or "Hi again!", no sign-off.`,
+`- Never pushy: no guilt, no fake urgency, no "just following up", "circling back", "touching base" or "I wanted to reach out".`,
+`- Use the conversation: refer to the class or question she was actually considering. Don't repeat what was already said.`,
+`- Never say she is booked and never claim a spot is free. Don't quote prices unless she asked about price.`,
+`- Write times like "5:30pm". No em dashes. No URLs. At most one emoji, usually none.`,
+`- At most one easy question.`,
+``,
+`Output ONLY the message text.`,
 ].join('\n');
-
-const userMessage = [
-`Write a follow-up message — nudge #${Number($json.nudges_sent)}${isFinal ? ' (FINAL nudge: extra gentle, leave the door open)' : ''}.`,
-`Lead's first name: ${$json.name || 'there'}`,
-`What they last said to us: "${$json.last_msg ?? ''}"`,
-`Write the message now.`,
-].join('\n');
-
-return { json: {
-  id: $json.id,
-  external_id: $json.external_id,
-  channel: $json.channel,
-  studio_id: $json.studio_id,
-  slack_lead_channel_id: $json.slack_lead_channel_id,
-  slack_owner_channel_id: $json.slack_owner_channel_id,
-  name: $json.name ?? null,
-  last_msg: $json.last_msg ?? '',
-  followup_text: msgs[Math.min(Math.max(Number($json.nudges_sent) - 1, 0), msgs.length - 1)],
-  nudge_number: Number($json.nudges_sent),
-  is_final: isFinal,
-  systemMessage,
-  userMessage,
-} };
+const userMessage = `Conversation so far:\n${history || '(none)'}\n\nWrite the follow-up now.`;
+return { json: { ...j, systemMessage, userMessage } };
 """})
-    w.connect("Has Stale Leads?", "Compose Follow-up")
+    w.connect("Send or Hand Over?", "Compose Prompt", out=0)
 
-    w.node("Write Nudge (AI)", "@n8n/n8n-nodes-langchain.agent", 3.1, [420, 0], {
+    w.node("Write Nudge (AI)", "@n8n/n8n-nodes-langchain.agent", 3.1, [420, -100], {
         "promptType": "define", "text": "={{ $json.userMessage }}",
         "options": {"systemMessage": "={{ $json.systemMessage }}"}},
-        onError="continueRegularOutput", retryOnFail=True)
-    w.connect("Compose Follow-up", "Write Nudge (AI)")
+        onError="continueRegularOutput")
+    w.connect("Compose Prompt", "Write Nudge (AI)")
 
-    w.node("OpenAI (Nudge)", "@n8n/n8n-nodes-langchain.lmChatOpenAi", 1.3, [420, 200], {
-        "model": {"__rl": True, "value": "gpt-5.4-mini", "mode": "list",
-                  "cachedResultName": "gpt-5.4-mini"},
+    w.node("OpenAI (Nudge)", "@n8n/n8n-nodes-langchain.lmChatOpenAi", 1.3, [420, 100], {
+        "model": {"__rl": True, "value": "gpt-5.4", "mode": "list", "cachedResultName": "gpt-5.4"},
         "builtInTools": {}, "options": {}},
         credentials={"openAiApi": {"id": "OPENAI_CRED_ID", "name": "OpenAI account"}})
     w.connect("OpenAI (Nudge)", "Write Nudge (AI)", kind="ai_languageModel")
 
-    w.node("Assemble Nudge", "n8n-nodes-base.set", 3.4, [640, 0], {
-        "assignments": {"assignments": [
-            {"id": "a1", "name": "followup_text", "type": "string",
-             "value": "={{ $json.output || $('Compose Follow-up').item.json.followup_text }}"},
-            {"id": "a2", "name": "id", "type": "number",
-             "value": "={{ $('Compose Follow-up').item.json.id }}"},
-            {"id": "a3", "name": "external_id", "type": "string",
-             "value": "={{ $('Compose Follow-up').item.json.external_id }}"},
-            {"id": "a4", "name": "channel", "type": "string",
-             "value": "={{ $('Compose Follow-up').item.json.channel }}"},
-            {"id": "a5", "name": "nudge_number", "type": "number",
-             "value": "={{ $('Compose Follow-up').item.json.nudge_number }}"},
-            {"id": "a6", "name": "is_final", "type": "boolean",
-             "value": "={{ $('Compose Follow-up').item.json.is_final }}"},
-            {"id": "a7", "name": "slack_lead_channel_id", "type": "string",
-             "value": "={{ $('Compose Follow-up').item.json.slack_lead_channel_id }}"},
-            {"id": "a8", "name": "slack_owner_channel_id", "type": "string",
-             "value": "={{ $('Compose Follow-up').item.json.slack_owner_channel_id }}"},
-        ]}, "options": {}})
-    w.connect("Write Nudge (AI)", "Assemble Nudge")
+    w.node("Finish Nudge", "n8n-nodes-base.code", 2, [640, -100], {
+        "mode": "runOnceForEachItem", "jsCode": r"""
+// Cleans the AI's text and attaches the link BY CODE (the AI never types one).
+// If the AI failed or wrote nothing usable, nothing is sent: the lead stays
+// due and the next run (15 min) tries again while the window is open.
+const c = $('Compose Prompt').item.json;
+let text = String($json.output || '').trim()
+  .replace(/^["'“”]+|["'“”]+$/g, '')
+  .replace(/https?:\/\/\S+/g, '')
+  .replace(/\s*—\s*/g, ', ')
+  .replace(/[ \t]+/g, ' ').trim();
+if (!text || text.length > 400) return { json: { ...c, skip: true, skip_reason: text ? 'too long' : ($json.error ? 'AI error' : 'empty') } };
+if (c.kind === 'link' && c.short_code) text = `${text}\n__LINK_BASE__${c.short_code}`;
+const { systemMessage, userMessage, thread, prompt_vars, ...keep } = c;
+return { json: { ...keep, text, skip: false } };
+""".replace("__LINK_BASE__", LINK_BASE)})
+    w.connect("Write Nudge (AI)", "Finish Nudge")
 
-    w.pg("Log Follow-up (outbound)", [860, -180], """INSERT INTO messages (lead_id, direction, channel, body, created_at)
-VALUES ($1, 'outbound', $2, $3, now());""",
-         replacement="={{ [$json.id, $json.channel, $json.followup_text] }}",
-         onError="continueRegularOutput", retryOnFail=True)
+    # Logged BEFORE sending, as the AI's own message: when Instagram echoes the
+    # nudge back, Handle Echo must recognise it as ours (or it would look like
+    # a staff reply and pause her). The INSERT is also the last-moment guard:
+    # nothing is logged (so nothing sent) if she was paused or wrote back.
+    w.pg("Log Nudge", [860, -100], """INSERT INTO messages (lead_id, direction, channel, body, author, nudge, created_at)
+SELECT $1::int, 'outbound', $2, $3, 'ai', true, now()
+ WHERE NOT $11::boolean
+   AND NOT (SELECT ai_paused FROM leads WHERE id = $1::int)
+   AND NOT EXISTS (SELECT 1 FROM messages WHERE lead_id = $1::int AND direction = 'inbound'
+                    AND created_at > $4::timestamptz)
+RETURNING id AS message_id, lead_id, channel, body AS text, $5::text AS external_id, $6::text AS kind,
+          $7::boolean AS is_final, NULLIF($8::text, '')::int AS link_id, $9::text AS token_enc,
+          $10::text AS slack_channel;""",
+         replacement=("={{ [$json.lead_id, $json.channel, $json.text ?? '', $json.last_inbound_at, $json.external_id, "
+                      "$json.kind, !!$json.is_final, $json.link_id ?? '', $json.token_enc ?? '', "
+                      "$json.slack_lead_channel_id ?? '', !!$json.skip] }}"),
+         alwaysOutputData=True, retryOnFail=True)
+    w.connect("Finish Nudge", "Log Nudge")
 
-    w.pg("Mark Cold if Final", [860, -60], """UPDATE leads
-   SET status = CASE WHEN $2 THEN 'cold' ELSE status END, updated_at = now()
- WHERE id = $1;""",
-         replacement="={{ [$json.id, $json.is_final] }}",
-         onError="continueRegularOutput", retryOnFail=True)
+    w.node("Which Channel?", "n8n-nodes-base.switch", 3.4, [1080, -100], {
+        "rules": {"values": [
+            {"conditions": {"options": {"caseSensitive": True, "leftValue": "", "typeValidation": "strict",
+                                        "version": 3},
+                            "conditions": [{"id": f"ch-{k}", "leftValue": "={{ $json.channel }}", "rightValue": k,
+                                            "operator": {"type": "string", "operation": "equals"}}],
+                            "combinator": "and"},
+             "renameOutput": True, "outputKey": k} for k in ("instagram", "slack")]},
+        "options": {}})
+    w.connect("Log Nudge", "Which Channel?")
 
-    w.slack("Notify Owner - Follow-up", [860, 60],
-            "={{ $json.slack_owner_channel_id }}",
-            ("=:wave: Auto follow-up #{{ $json.nudge_number }} for {{ $json.external_id }} "
-             "({{ $json.channel }}): \"{{ $json.followup_text }}\""
-             "{{ $json.channel === 'slack' ? '' : '\\n:information_source: Not auto-sent — "
-             "Instagram nudges outside Meta''s 24h window need a message tag, so this one is "
-             "logged for you to send.' }}"),
-            "SLACK_OWNER_BOT_CRED_ID")
+    w.node("Send IG Nudge", "n8n-nodes-base.code", 2, [1300, -200], {"jsCode": TOKEN_CRYPTO_JS + GRAPH_JS + SEND_IG_JS + r"""
+const out = [];
+for (const item of $input.all()) {
+  const j = item.json;
+  if (!j.message_id) continue;
+  const base = { message_id: j.message_id, lead_id: j.lead_id, kind: j.kind, is_final: j.is_final,
+                 link_id: j.link_id, text: j.text, channel: j.channel };
+  try { out.push({ json: { ...base, status: 'sent', mid: await sendIG(this, j.token_enc, j.external_id, j.text) } }); }
+  catch (e) { out.push({ json: { ...base, status: 'failed', mid: '', error: String(e.message).slice(0, 400),
+                                 token_problem: e.metaCode === 190 || /token/i.test(String(e.message)) } }); }
+}
+return out;
+"""})
+    w.connect("Which Channel?", "Send IG Nudge", out=0)
 
-    w.node("Is Slack Lead?", "n8n-nodes-base.if", 2.2, [860, 200], {
-        "conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
-                                   "typeValidation": "loose"},
-                       "conditions": [{"id": "is-slack", "leftValue": "={{ $json.channel }}",
-                                       "rightValue": "slack",
+    w.slack("Send Slack Nudge", [1300, 0], "={{ $json.slack_channel }}", "={{ $json.text }}",
+            "SLACK_LEAD_BOT_CRED_ID")
+    w.connect("Which Channel?", "Send Slack Nudge", out=1)
+    w.node("Slack Sent", "n8n-nodes-base.code", 2, [1520, 0], {"jsCode": r"""
+return $('Which Channel?').all(1).filter((i) => i.json.channel === 'slack' && i.json.message_id)   // output 1 = slack
+  .map((i) => ({ json: { ...i.json, status: 'sent', mid: '' } }));
+"""})
+    w.connect("Send Slack Nudge", "Slack Sent")
+
+    w.node("Nudge Sent?", "n8n-nodes-base.if", 2.2, [1520, -200], {
+        "conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True, "typeValidation": "strict"},
+                       "conditions": [{"id": "sent", "leftValue": "={{ $json.status }}", "rightValue": "sent",
                                        "operator": {"type": "string", "operation": "equals"}}],
                        "combinator": "and"}, "options": {}})
+    w.connect("Send IG Nudge", "Nudge Sent?")
 
-    for dst in ["Log Follow-up (outbound)", "Mark Cold if Final",
-                "Notify Owner - Follow-up", "Is Slack Lead?"]:
-        w.connect("Assemble Nudge", dst)
+    w.pg("Record Nudge", [1740, -120], """-- Instagram's id (so the echo is recognised as ours), the link nudge spent,
+-- and the lead marked cold after her final nudge.
+WITH m AS (
+  UPDATE messages SET provider_message_id = NULLIF($2, '') WHERE id = $1::int RETURNING id
+), b AS (
+  UPDATE booking_links SET nudged_at = now() WHERE id = NULLIF($3::text, '')::int AND $4 = 'link' RETURNING id
+), l AS (
+  UPDATE leads SET status = 'cold', updated_at = now()
+   WHERE id = $5::int AND $6::boolean AND status = 'engaged' RETURNING id
+)
+SELECT (SELECT id FROM m) AS message_id;""",
+         replacement="={{ [$json.message_id, $json.mid ?? '', $json.link_id ?? '', $json.kind, $json.lead_id, !!$json.is_final] }}",
+         onError="continueRegularOutput", retryOnFail=True)
+    w.connect("Nudge Sent?", "Record Nudge", out=0)
+    w.connect("Slack Sent", "Record Nudge")
 
-    w.slack("Send Follow-up to Lead (Slack)", [1080, 200],
-            "={{ $json.slack_lead_channel_id }}",
-            "={{ $json.followup_text }}", "SLACK_LEAD_BOT_CRED_ID")
-    w.connect("Is Slack Lead?", "Send Follow-up to Lead (Slack)", out=0)
+    w.pg("Dead Letter: Nudge Failed", [1740, -280], """-- Not delivered: take it out of the thread and keep it as a dead letter.
+WITH dl AS (
+  INSERT INTO dead_letters (workflow_id, execution_id, reason, payload, error)
+  VALUES ($1, $2, 'ig_nudge_failed', $3::jsonb, $4) RETURNING id
+), unsent AS (
+  DELETE FROM messages WHERE id = $5::int AND provider_message_id IS NULL RETURNING id
+)
+SELECT (SELECT id FROM dl) AS dead_letter_id;""",
+         replacement=("={{ [$workflow.id, $execution.id, JSON.stringify({ lead_id: $json.lead_id, kind: $json.kind, text: $json.text }), "
+                      "$json.error, $json.message_id] }}"),
+         onError="continueRegularOutput", retryOnFail=True, alwaysOutputData=True)
+    w.connect("Nudge Sent?", "Dead Letter: Nudge Failed", out=1)
 
-    w.node("IG Nudge (deferred)", "n8n-nodes-base.noOp", 1, [1080, 320], {})
-    w.connect("Is Slack Lead?", "IG Nudge (deferred)", out=1)
+    w.node("Email: Nudge Failed", "n8n-nodes-base.code", 2, [1960, -280], {"jsCode": r"""
+const failed = $('Send IG Nudge').all().filter((i) => i.json.status === 'failed');
+if (!failed.length) return [];
+return [{ json: {
+  to: 'founders',
+  subject: `${failed.length} follow-up nudge${failed.length > 1 ? 's' : ''} NOT delivered`,
+  heading: 'Instagram refused a follow-up nudge.',
+  lines: [...failed.map((i) => `Lead ${i.json.lead_id} (${i.json.kind}): ${i.json.error}`),
+          failed.some((i) => i.json.token_problem) ? 'Looks like a token problem: send the studio a new connect link.' : 'Saved in dead_letters.'],
+} }];
+"""})
+    w.connect("Dead Letter: Nudge Failed", "Email: Nudge Failed")
+    w.send_email("Send: Nudge Failed", [2180, -280])
+    w.connect("Email: Nudge Failed", "Send: Nudge Failed")
+
+    # --- hand over: the 24h window closed, so the owner decides ---------------
+    w.pg("Hand Over", [200, 160], """-- Nothing can be sent any more. Stop automation for this lead (once) and
+-- tell the owner. Quiet leads go cold; a link nudge is marked spent.
+WITH b AS (
+  UPDATE booking_links SET nudged_at = now() WHERE id = NULLIF($2::text, '')::int AND $3 = 'link' RETURNING id
+), l AS (
+  UPDATE leads SET status = CASE WHEN status = 'engaged' THEN 'cold' ELSE status END, updated_at = now()
+   WHERE id = $1::int RETURNING id
+)
+SELECT $1::int AS lead_id, $3::text AS kind;""",
+         replacement="={{ [$json.lead_id, $json.link_id ?? '', $json.kind] }}",
+         retryOnFail=True)
+    w.connect("Send or Hand Over?", "Hand Over", out=1)
+
+    w.node("Email: Over to You", "n8n-nodes-base.code", 2, [420, 160], {"jsCode": LEAD_NAME_JS + r"""
+return $('Send or Hand Over?').all(1).filter((i) => i.json.action === 'hand_over').map((i) => {   // output 1 = hand_over
+  const j = i.json;
+  const who = leadLabel(j);
+  const what = j.kind === 'link' ? 'was sent your booking link but never opened it' : 'stopped replying';
+  return { json: {
+    to: j.owner_alert_email || 'founders',
+    subject: `${who} went quiet — over to you if you want to follow up`,
+    heading: `${who} ${what}.`,
+    lines: ['Instagram only lets a business message someone within 24 hours of THEIR last message, and that window has closed, so the AI can’t follow up.',
+            'If you know her or want to try once more, message her yourself. If she writes back, the AI picks the conversation up again.'],
+    buttons: [chatButton(j)].filter(Boolean),
+  } };
+});
+"""})
+    w.connect("Hand Over", "Email: Over to You")
+    w.send_email("Send: Over to You", [640, 160])
+    w.connect("Email: Over to You", "Send: Over to You")
 
     return w
 

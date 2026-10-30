@@ -1,0 +1,150 @@
+{
+  "id": "EgCJIgrxK5wyNEab",
+  "name": "Monitor: Unanswered DMs",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000c003",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "run-now",
+      "name": "Run Now",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "find-unanswered",
+      "name": "Find Unanswered",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Marks what it reports in the same statement, so each message alerts ONCE.\n-- Only her LATEST message counts, only from the last 24h, never paused or\n-- escalated leads (a human has those) and never the voice lab.\nWITH due AS (\n  SELECT m.id\n    FROM messages m\n    JOIN leads l ON l.id = m.lead_id\n   WHERE m.direction = 'inbound'\n     AND m.unanswered_alerted_at IS NULL\n     AND m.created_at < now() - interval '5 minutes'\n     AND m.created_at > now() - interval '24 hours'\n     AND l.channel <> 'test' AND NOT l.ai_paused AND l.status <> 'escalated'\n     AND NOT EXISTS (SELECT 1 FROM messages o WHERE o.lead_id = m.lead_id\n                      AND o.direction = 'outbound' AND o.created_at >= m.created_at)\n     AND NOT EXISTS (SELECT 1 FROM messages n WHERE n.lead_id = m.lead_id\n                      AND n.direction = 'inbound' AND n.created_at > m.created_at)\n), marked AS (\n  UPDATE messages SET unanswered_alerted_at = now() FROM due WHERE messages.id = due.id\n  RETURNING messages.id, messages.lead_id, messages.body, messages.created_at\n)\nSELECT mk.id, mk.lead_id, mk.body, round(extract(epoch FROM now() - mk.created_at) / 60) AS minutes,\n       l.channel, l.username, l.name, s.name AS studio_name\n  FROM marked mk JOIN leads l ON l.id = mk.lead_id JOIN studios s ON s.id = l.studio_id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "retryOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "build-alert",
+      "name": "Build Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const leadLabel = (l) => l.username ? `@${l.username}${l.name ? ' (' + l.name + ')' : ''}`\n  : (l.name || (l.channel === 'instagram' ? 'An Instagram lead' : `A ${l.channel} lead`));\n\nconst rows = $input.all().map((i) => i.json).filter((r) => r.id);\nif (!rows.length) return [];\nreturn [{ json: {\n  to: 'founders',\n  subject: `${rows.length === 1 ? leadLabel(rows[0]) + ' has' : rows.length + ' leads have'} had NO reply for ${Math.max(...rows.map((r) => r.minutes))}+ minutes`,\n  heading: 'The AI promised a reply within a minute, and these messages got none.',\n  lines: [\n    ...rows.map((r) => `${leadLabel(r)} (${r.studio_name}), ${r.minutes} min ago: \"${String(r.body || '').slice(0, 200)}\"`),\n    'Likely causes: a workflow error, an Instagram token problem, or n8n down. Check the error emails and dead_letters. Reply to her by hand if it still matters.',\n  ],\n} }];"
+      }
+    },
+    {
+      "id": "email-founders",
+      "name": "Email Founders",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        200,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule": {
+      "main": [
+        [
+          {
+            "node": "Find Unanswered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Unanswered": {
+      "main": [
+        [
+          {
+            "node": "Build Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Alert": {
+      "main": [
+        [
+          {
+            "node": "Email Founders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now": {
+      "main": [
+        [
+          {
+            "node": "Find Unanswered",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

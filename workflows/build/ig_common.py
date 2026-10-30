@@ -104,3 +104,19 @@ const leadLabel = (l) => {
 const chatButton = (l) => (l.channel === 'instagram' && l.username && /^[A-Za-z0-9._]{1,30}$/.test(l.username))
   ? { label: 'Open chat', url: `https://ig.me/m/${l.username}` } : null;
 """
+
+# Where a lead's booking link points: the tracked redirect (Link Redirect
+# workflow behind the Cloudflare Worker "go"). Used by Lead Brain and nudges.
+LINK_BASE = "https://go.looplogicsystems.com/"
+
+# sendIG: send one text DM with a studio's encrypted token. Needs
+# TOKEN_CRYPTO_JS + GRAPH_JS first. Never retried (a retry could double-send).
+# Returns Instagram's message id.
+SEND_IG_JS = r"""
+async function sendIG(ctx, tokenEnc, recipientId, text) {
+  if (!tokenEnc) throw new Error('no Instagram token stored for this account (reconnect it with a connect link)');
+  const r = await graphCall(ctx, { what: 'send message', method: 'POST', url: 'https://graph.instagram.com/v25.0/me/messages',
+    token: decryptToken(tokenEnc), json: { recipient: { id: String(recipientId) }, message: { text: String(text) } } });
+  return r.message_id || null;
+}
+"""

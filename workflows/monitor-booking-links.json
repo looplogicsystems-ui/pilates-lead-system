@@ -1,0 +1,211 @@
+{
+  "id": "7LiRAztbJZSSzvfq",
+  "name": "Monitor: Booking Links",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000c004",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 13
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "run-now",
+      "name": "Run Now",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "load-links",
+      "name": "Load Links",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT s.id AS studio_id, s.name AS studio_name, s.owner_alert_email, s.links_ok, s.link_problem,\n       json_agg(json_build_object('what', x.what, 'url', x.url)) AS links\n  FROM studios s\n  JOIN (SELECT id AS studio_id, 'main booking page' AS what, booking_url AS url\n          FROM studios WHERE booking_url IS NOT NULL\n        UNION ALL\n        SELECT studio_id, 'offer \"' || name || '\"', url FROM studio_offers WHERE active AND url IS NOT NULL\n        UNION ALL\n        SELECT studio_id, 'class \"' || name || '\"', booking_url FROM studio_classes\n         WHERE active AND booking_url IS NOT NULL) x ON x.studio_id = s.id\n WHERE s.active\n GROUP BY s.id;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "retryOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "check-links",
+      "name": "Check Links",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Opens every link like a phone browser would. BROKEN (switches the AI's links\n// off): page not found / gone, site unreachable, or still 5xx on a retry.\n// Sites that block automated visitors (401/403/429) are only WARNED about:\n// switching links off on a false alarm would stop every booking.\nconst sleep = (ms) => new Promise((r) => setTimeout(r, ms));\nconst UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';\nconst probe = async (url) => {\n  try {\n    const r = await this.helpers.httpRequest({ method: 'GET', url, headers: { 'User-Agent': UA, Accept: 'text/html' },\n      returnFullResponse: true, ignoreHttpStatusErrors: true, timeout: 20000, json: false });\n    return { status: r.statusCode };\n  } catch (e) { return { status: 0, error: String(e.code || e.message).slice(0, 80) }; }\n};\nconst verdict = (p) => (p.status >= 200 && p.status < 400) ? 'ok'\n  : ([401, 403, 429].includes(p.status) ? 'blocked' : 'broken');\nconst out = [];\nfor (const item of $input.all()) {\n  const s = item.json;\n  if (!s.studio_id) continue;\n  const seen = new Map();\n  for (const l of (s.links || [])) {\n    if (!seen.has(l.url)) seen.set(l.url, []);\n    seen.get(l.url).push(l.what);\n  }\n  const broken = [], blocked = [];\n  for (const [url, whats] of seen) {\n    let p = await probe(url);\n    if (verdict(p) !== 'ok') { await sleep(4000); p = await probe(url); }   // one retry\n    const v = verdict(p);\n    const line = `${whats.join(', ')}: ${url} -> ${p.status ? 'HTTP ' + p.status : (p.error || 'unreachable')}`;\n    if (v === 'broken') broken.push(line);\n    if (v === 'blocked') blocked.push(line);\n  }\n  const problem = [...broken.map((l) => 'BROKEN ' + l), ...blocked.map((l) => 'COULD NOT CHECK ' + l)].join('\\n');\n  out.push({ json: { studio_id: s.studio_id, studio_name: s.studio_name, owner_alert_email: s.owner_alert_email,\n    links_ok: broken.length === 0, problem, old_problem: s.link_problem || '', old_links_ok: s.links_ok,\n    broken: broken.length, blocked: blocked.length, checked: seen.size } });\n}\nreturn out;"
+      }
+    },
+    {
+      "id": "save-result",
+      "name": "Save Result",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        200,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE studios SET links_ok = $2::boolean, link_problem = NULLIF($3, ''), links_checked_at = now()\n WHERE id = $1::int\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ [$json.studio_id, $json.links_ok, $json.problem] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "retryOnFail": true
+    },
+    {
+      "id": "build-alerts",
+      "name": "Build Alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Only when something CHANGED since the last check (no daily repeats).\nconst out = [];\nfor (const i of $('Check Links').all()) {\n  const s = i.json;\n  if (s.problem === s.old_problem && s.links_ok === s.old_links_ok) continue;\n  const owner = s.owner_alert_email || 'founders';\n  if (s.broken) {\n    out.push({ json: { to: owner === 'founders' ? 'founders' : `${owner}, founders`,\n      subject: `Broken booking link — ${s.studio_name}`,\n      heading: 'A booking link we send to leads is broken, so the AI has stopped sending links.',\n      lines: [...s.problem.split('\\n'),\n              'Until it is fixed, leads who want to book get a holding reply (\"we’ll send it to you\") and you get an email for each one.',\n              'Fix the link (or tell us the new one). The next daily check switches links back on by itself.'] } });\n  } else if (s.blocked) {\n    out.push({ json: { to: 'founders', subject: `Couldn't check a booking link — ${s.studio_name}`,\n      heading: 'A booking site refused our automated check. Links are still being sent.',\n      lines: [...s.problem.split('\\n'), 'Open it on a phone to make sure it works.'] } });\n  } else if (s.old_problem) {\n    out.push({ json: { to: owner === 'founders' ? 'founders' : `${owner}, founders`,\n      subject: `Booking links working again — ${s.studio_name}`,\n      heading: 'All booking links opened fine today. The AI is sending links again.',\n      lines: [`Checked ${s.checked} link${s.checked === 1 ? '' : 's'}.`] } });\n  }\n}\nreturn out;"
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "send-alerts",
+      "name": "Send Alerts",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        640,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule": {
+      "main": [
+        [
+          {
+            "node": "Load Links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Links": {
+      "main": [
+        [
+          {
+            "node": "Check Links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Links": {
+      "main": [
+        [
+          {
+            "node": "Save Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Result": {
+      "main": [
+        [
+          {
+            "node": "Build Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Alerts": {
+      "main": [
+        [
+          {
+            "node": "Send Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now": {
+      "main": [
+        [
+          {
+            "node": "Load Links",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

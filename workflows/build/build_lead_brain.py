@@ -22,7 +22,7 @@ import json
 import os
 import sys
 
-from ig_common import LEAD_NAME_JS
+from ig_common import LEAD_NAME_JS, LINK_BASE
 
 # --- credential placeholders -> live ids -------------------------------------
 CREDS = {
@@ -117,7 +117,7 @@ const ownerButton = (label, action, leadId) => {
 # go.looplogicsystems.com is a Cloudflare Worker ("go") that forwards
 # /<code> to /webhook/go?c=<code>, passing the user agent through so preview
 # robots are still recognised. The long n8n URL keeps working as a fallback.
-LINK_BASE = "https://go.looplogicsystems.com/"
+# LINK_BASE comes from ig_common (shared with the follow-up nudges).
 
 # ---------------------------------------------------------------------------
 # 1. Entry + studio resolution (unchanged in spirit since Phase 2a)
@@ -507,7 +507,10 @@ if (intent === 'send_booking_link') {
     intent = 'escalate'; linkProblem = true;
     link = null; kind = null;   // nothing is sent, so nothing is recorded or coded
     reason = cfg.links_ok === false ? 'booking link marked broken by the daily check' : 'no booking link configured';
-    reply = `${reply}\n\n${owner} will send you the booking link shortly.`.trim();
+    // Replace the model's text: it was written to go WITH a link ("tap the link...").
+    // Slot labels are internal ("Sat 31 Oct, 9:15 AM — Mat Basics"): text it like a person would.
+    const said = (l) => String(l).replace(/\s*[\u2014\u2013]\s*/g, ' ').replace(/(\d)\s?(AM|PM)\b/g, (m, d, ap) => d + ap.toLowerCase());
+    reply = `Perfect, ${owner} will send you the booking link${slot ? ' for ' + said(slot.label) : ''} shortly.`;
   }
 }
 

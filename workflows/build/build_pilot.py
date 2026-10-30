@@ -516,6 +516,11 @@ WITH p AS (
                    status = CASE WHEN status = 'escalated' THEN 'engaged' ELSE status END,
                    updated_at = now()
    WHERE id = $2::int AND $1 = 'resume' RETURNING id
+), ra AS (
+  -- What she wrote while paused was the owner's to answer: don't let the
+  -- unanswered-DM alarm fire about it after Resume.
+  UPDATE messages SET unanswered_alerted_at = COALESCE(unanswered_alerted_at, now())
+   WHERE lead_id = $2::int AND $1 = 'resume' AND direction = 'inbound' RETURNING id
 ), re AS (
   UPDATE escalations SET resolved = true
    WHERE lead_id = $2::int AND $1 = 'resume' AND NOT resolved RETURNING id
