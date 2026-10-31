@@ -25,3 +25,7 @@ db/seed/local-ids.sql
 # Node (if any tooling is added later)
 node_modules/
 __pycache__/
+
+# Real studios' details never go in this public repo (pilot build §K5).
+# The committed template is db/seed/studios/_template.sql.example.
+db/seed/studios/*.sql

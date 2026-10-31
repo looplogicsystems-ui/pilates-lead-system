@@ -1,0 +1,77 @@
+-- ===========================================================================
+-- NEW STUDIO — onboarding template (pilot build §K5, §M).
+--
+-- 1. Copy to db/seed/studios/<slug>.sql. That path is GIT-IGNORED: a real
+--    studio's details never go in this public repo.
+-- 2. Fill every placeholder (CAPITALS in angle brackets) from her intake form. Keep the SQL quoting:
+--    a ' inside text is written ''.
+-- 3. Apply:   db/seed/apply_studio.sh db/seed/studios/<slug>.sql
+--    (refuses while any placeholder is left; snapshots first; refuses a
+--    studio name that already exists)
+-- 4. It prints the new studio id. Send her the connect link:
+--    python3 workflows/build/ig_connect_link.py <id>
+-- Afterwards, edit timetable / prices in Beekeeper as studio_editor.
+-- ===========================================================================
+BEGIN;
+
+INSERT INTO studios (name, location, studio_type, timezone, active,
+                     booking_software, booking_url, owner_name, owner_alert_email, staffed_hours,
+                     followup_first_after_minutes, followup_final_after_minutes, max_nudges, prompt_vars)
+SELECT '<STUDIO_NAME>', '<NEIGHBOURHOOD, CITY, ST>', 'Pilates', '<TIMEZONE e.g. America/Chicago>', true,
+       '<BOOKING_SOFTWARE e.g. Mindbody>', '<MAIN_SCHEDULE_URL https://...>', '<OWNER_FIRST_NAME>', '<OWNER_ALERT_EMAIL>',
+       -- Staffed hours, studio local time (for the after-hours line in the day-30 report)
+       '{"mon":["<06:00>","<19:00>"],"tue":["<06:00>","<19:00>"],"wed":["<06:00>","<19:00>"],"thu":["<06:00>","<19:00>"],"fri":["<06:00>","<19:00>"],"sat":["<08:00>","<12:00>"],"sun":["<08:00>","<12:00>"]}'::jsonb,
+       60, 1200, 2,          -- nudges: first at 60 min, final 20h later (stays inside Instagram's 24h window)
+       jsonb_build_object(
+         'persona_name',     '<ASSISTANT_NAME e.g. Mia>',
+         'studio_name',      '<STUDIO_NAME>',
+         'how_we_refer',     '<SHORT_NAME e.g. Reform>',
+         'type',             '<e.g. boutique reformer Pilates studio>',
+         'city',             '<CITY, ST>',
+         'location',         '<NEIGHBOURHOOD, CITY, ST>',
+         'address',          '<STREET ADDRESS>',
+         'booking_steps',    '<HOW A NEW CLIENT BOOKS, one line, e.g. Tap the link, grab the intro pass, then pick your class.>',
+         'first_visit_tips', '<FIRST-VISIT TIPS, one or two sentences>',
+         'ai_disclosure',    '<e.g. — Mia, Reform''s AI assistant>',
+         'escalation_line',  '<WHAT THE AI SAYS WHEN HANDING OVER, in the owner''s words>',
+         'beginner_policy',  '<WHICH CLASSES SUIT BEGINNERS>',
+         'escalate_on',      jsonb_build_array('medical','injury','pregnancy','physical_limitation','post_surgery',
+                                               'price_negotiation','refund','cancellation_dispute','complaint'),
+         'prerequisites',    jsonb_build_array('<e.g. grip socks required>'),
+         'faq',              jsonb_build_object('parking', '<PARKING>', 'what_to_bring', '<WHAT TO BRING>',
+                                                'cancellation', '<CANCELLATION POLICY>'),
+         'voice',            jsonb_build_object(
+                               'register', '<HOW SHE TEXTS, from her past DMs: e.g. warm, direct, short sentences>',
+                               'greeting', '<e.g. Hey [first name]!>',
+                               'emoji',    '<e.g. sparingly, never more than one per message>',
+                               'examples', jsonb_build_array('<REAL LINE FROM HER PAST DMs>', '<ANOTHER>', '<ANOTHER>'),
+                               'never_say', jsonb_build_array('reach out', 'circle back', 'at your earliest convenience')))
+ WHERE NOT EXISTS (SELECT 1 FROM studios WHERE name = '<STUDIO_NAME>')
+RETURNING id AS studio_id \gset
+
+-- Weekly timetable. weekday: 1 = Monday ... 7 = Sunday. Times are the studio's
+-- local wall-clock time. booking_url only if her software has a STABLE per-class link.
+INSERT INTO studio_classes (studio_id, name, weekday, start_local, duration_minutes, level, booking_url)
+SELECT :studio_id, c.name, c.weekday, c.t::time, c.mins, c.level, c.url
+  FROM (VALUES
+    ('<CLASS NAME>', 1, '<18:00>', 50, '<beginner-friendly>', NULL),
+    ('<CLASS NAME>', 3, '<07:00>', 50, '<all levels>',        NULL)
+  ) AS c(name, weekday, t, mins, level, url);
+
+-- Prices and offers: the ONLY prices the AI may quote. The intro offer's url is
+-- the new-client booking link. price NULL = "ask the studio" (the AI hands over).
+INSERT INTO studio_offers (studio_id, kind, name, price, details, url, for_new_clients, sort_order)
+SELECT :studio_id, o.kind, o.name, o.price, o.details, o.url, o.new_clients, o.sort
+  FROM (VALUES
+    ('intro',   '<INTRO OFFER NAME>', <PRICE e.g. 89.00>, '<DETAILS>', '<NEW_CLIENT_URL https://...>', true,  10),
+    ('drop_in', 'Single class',       <PRICE>,            NULL,        NULL,                           false, 20)
+  ) AS o(kind, name, price, details, url, new_clients, sort);
+
+\echo
+\echo === created ===
+SELECT 'studio id ' || id || ': ' || name || ' (' || timezone || ')' FROM studios WHERE id = :studio_id;
+SELECT count(*) || ' classes, ' || (SELECT count(*) FROM studio_offers WHERE studio_id = :studio_id) || ' offers'
+  FROM studio_classes WHERE studio_id = :studio_id;
+\echo Next: python3 workflows/build/ig_connect_link.py :studio_id
+
+COMMIT;
