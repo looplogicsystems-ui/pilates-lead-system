@@ -48,6 +48,12 @@ PYEOF
 [ -n "$FILES" ] && [ -n "$NAMES_SQL" ] || { echo "nothing generated" >&2; exit 1; }
 echo "    workflows: $FILES"
 
+# Imported (so their code stays current) but never published: they're run by
+# hand. Ops: Test Email has only a manual trigger, so publishing it fails and
+# fires the error handler on every n8n start; Ops: Voice Lab is a token-locked
+# test endpoint that's switched on only while it's being used.
+MANUAL_ONLY_SQL="'Ops: Test Email','Ops: Voice Lab'"
+
 echo "==> importing"
 for f in $FILES; do
     "$DOCKER" cp "$SCRATCH/$f.live.json" n8n:/tmp/$f.json >/dev/null
@@ -71,9 +77,15 @@ ON CONFLICT (\"versionId\") DO UPDATE
 echo "==> publishing"
 for id in $(psql_n8n -t -A -c "
 SELECT id FROM workflow_entity
- WHERE name IN ($NAMES_SQL);"); do
+ WHERE name IN ($NAMES_SQL) AND name NOT IN ($MANUAL_ONLY_SQL);"); do
     "$DOCKER" exec n8n n8n publish:workflow --id="$id" >/dev/null 2>&1 \
         && echo "    published $id" || echo "    publish $id FAILED"
+done
+for id in $(psql_n8n -t -A -c "
+SELECT id FROM workflow_entity
+ WHERE name IN ($MANUAL_ONLY_SQL) AND (active OR \"activeVersionId\" IS NOT NULL);"); do
+    "$DOCKER" exec n8n n8n unpublish:workflow --id="$id" >/dev/null 2>&1 \
+        && echo "    left off (manual only) $id" || echo "    unpublish $id FAILED"
 done
 
 if [ "${1:-}" != "--no-restart" ]; then
@@ -90,8 +102,12 @@ fi
 psql_n8n -c "SELECT name, active FROM workflow_entity WHERE active ORDER BY name;"
 
 # Don't trust the exit codes above: confirm every generated workflow is published.
-inactive="$(psql_n8n -t -A -c "SELECT name FROM workflow_entity WHERE name IN ($NAMES_SQL) AND NOT active;")"
+inactive="$(psql_n8n -t -A -c "SELECT name FROM workflow_entity WHERE name IN ($NAMES_SQL) AND name NOT IN ($MANUAL_ONLY_SQL) AND NOT active;")"
 if [ -n "$inactive" ]; then
     echo "!! NOT ACTIVE after deploy:" >&2; echo "$inactive" | sed 's/^/   /' >&2; exit 1
 fi
-echo "==> all $(echo $FILES | wc -w) generated workflows are active"
+wrongly_on="$(psql_n8n -t -A -c "SELECT name FROM workflow_entity WHERE name IN ($MANUAL_ONLY_SQL) AND active;")"
+if [ -n "$wrongly_on" ]; then
+    echo "!! manual-only workflow left ACTIVE:" >&2; echo "$wrongly_on" | sed 's/^/   /' >&2; exit 1
+fi
+echo "==> all generated workflows are active, except the manual-only ones"
