@@ -51,5 +51,11 @@ module.exports = async () => {
   r = await run('weekly-review.json', 'Build Review', [{ studio_name: 'Reform', new_leads: 12, links_sent: 8, links_tapped: 6, said_booked: 3, owner_confirmed: 2,
     escalations: 1, nudges: 4, unanswered: 0, paused_now: '@jess.moves (staff_reply)', link_problem: null, open_dead_letters: 0, dead_letters_week: 1 }]);
   ok('weekly review: funnel with %, paused list, review checklist', r.length === 1 && /Links sent 8 → tapped 6 \(75%\) → said booked 3 → owner confirmed 2/.test(r[0].lines[0])
-     && /@jess\.moves \(staff_reply\)/.test(r[0].lines[1]) && /5-minute review/.test(r[0].lines[3]));
+     && /@jess\.moves \(staff_reply\)/.test(r[0].lines[1]) && r[0].lines.some((l) => /5-minute review/.test(l)));
+  ok('weekly review: privacy line, and a warning when the retention job didn't run',
+     r[0].lines.some((l) => /^Privacy: 0 "delete my data" requests/.test(l) && /ran on 0 of 7 days: CHECK IT/.test(l)));
+  r = await run('weekly-review.json', 'Build Review', [{ studio_name: 'Reform', new_leads: 0, links_sent: 0, links_tapped: 0, said_booked: 0, owner_confirmed: 0,
+    escalations: 0, nudges: 0, unanswered: 0, paused_now: null, link_problem: null, open_dead_letters: 0, dead_letters_week: 0,
+    deletion_requests_week: 1, retention_deleted_week: 3, retention_runs_week: 7 }]);
+  ok('...and counts requests, retention deletions, no warning at 7/7', r[0].lines.some((l) => /1 "delete my data" requests carried out, 3 leads deleted/.test(l) && /ran on 7 of 7 days\.$/.test(l)));
 };

@@ -10,6 +10,9 @@
 #   llctl snapshot            export every live workflow to ~/llctl-snapshots/<ts>/
 #   llctl rollback [ts]       re-import a snapshot (default: the most recent)
 #   llctl snapshots           list snapshots
+#   llctl prune [days]        delete snapshot DATABASE dumps older than <days> (default 30);
+#                             workflow exports are kept. Runs nightly from cron (privacy:
+#                             deleted lead data must not live on in old dumps)
 #
 # Branch shorthands: `demo` = demo/computed-availability, `master` = master.
 set -euo pipefail
@@ -114,6 +117,17 @@ cmd_snapshot () {
     docker exec "$PG" pg_dumpall -U n8n 2>/dev/null | gzip > "$dir/pgdump.sql.gz" || ylw "  (db dump failed - workflows still saved)"
     grn "snapshot $ts  ($(ls -1 "$dir"/*.json 2>/dev/null | wc -l) workflows, $(du -sh "$dir" | cut -f1))"
     echo "$dir"
+}
+
+cmd_prune () {
+    local days="${1:-30}"
+    [[ "$days" =~ ^[0-9]+$ ]] && [ "$days" -ge 7 ] || die "prune: days must be a number, at least 7"
+    [ -d "$SNAP_ROOT" ] || { ylw "no snapshots"; return; }
+    local n=0 f
+    while IFS= read -r f; do
+        rm -f -- "$f" && n=$((n + 1)) && echo "  removed $f"
+    done < <(find "$SNAP_ROOT" -mindepth 2 -maxdepth 2 -name 'pgdump.sql.gz' -mtime +"$days" | sort)
+    grn "$(date -u +%FT%TZ) prune: $n database dump(s) older than $days days removed; workflow exports kept"
 }
 
 cmd_snapshots () {
@@ -275,6 +289,7 @@ case "${1:-status}" in
     snapshot)  cmd_snapshot ;;
     snapshots) cmd_snapshots ;;
     rollback)  shift; cmd_rollback "$@" ;;
+    prune)     shift; cmd_prune "$@" ;;
     -h|--help|help)
         sed -n '2,20p' "$0" | sed 's/^# \?//' ;;
     *) die "unknown command '$1' (try: llctl help)" ;;

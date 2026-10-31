@@ -37,4 +37,23 @@ module.exports = async () => {
   ok('unparseable model output -> escalate, never sent raw', d.intent === 'escalate' && d.final_reply === cfg.prompt_vars.escalation_line);
   d = await decide({ reply: 'x', intent: 'escalate', escalate_reason: 'injury' }, { up: { id: 42, username: 'jess.moves', name: 'Jess Carter' } });
   ok('owner email names "@jess.moves (Jess Carter)" + Open chat', /^@jess\.moves \(Jess Carter\) needs you/.test(d.owner_email.subject) && d.owner_email.buttons.some((b) => b.url === 'https://ig.me/m/jess.moves'));
+
+  // --- "delete my data" (privacy page promise; migration 016) -----------------
+  const wf = require('fs').readFileSync(require('path').join(__dirname, '..', 'workflows', F), 'utf8');
+  const W = JSON.parse(wf);
+  const ifNode = W.nodes.find((n) => n.name === 'Delete Request?');
+  const expr = ifNode.parameters.conditions.conditions[0].leftValue.replace(/^=\{\{\s*/, '').replace(/\s*\}\}$/, '');
+  const asks = (message) => new Function('$', 'return ' + expr)(() => ({ first: () => ({ json: { message } }) }));
+  ok('"delete my data" variants trigger deletion',
+     ['delete my data', 'Hi, please DELETE MY DATA thanks', 'can you erase my info?', 'remove all my details pls', 'delete my messages'].every(asks));
+  ok('ordinary messages do not', !['do you delete classes when nobody books?', 'my data plan ran out lol', 'how do I book?', 'delete the booking'].some(asks));
+  const to = (src, out) => ((W.connections[src] || {}).main[out] || []).map((c) => c.node);
+  ok('wired before anything is stored: Studio Found? -> Delete Request? -> Forget Lead | Upsert Lead',
+     to('Studio Found?', 0).join() === 'Delete Request?' && to('Delete Request?', 0).join() === 'Forget Lead' && to('Delete Request?', 1).join() === 'Upsert Lead');
+  const mail = (await run(F, 'Email: Data Deleted', [{}], { nodes: { 'Forget Lead': [{ result: { found: true, messages: 7, booking_links: 1, escalations: 0, dead_letters: 0 } }],
+    'Resolve Studio': [{ ...cfg, studio_name: 'Reform Collective' }], 'When Called': [{ ...inb, external_id: '17840000000000099', username: 'jess.moves', name: 'Jess Carter' }] } }))[0];
+  ok('founders told it was done, with counts', mail.to === 'founders' && /7 messages/.test(mail.lines[0]));
+  ok('...and the email names nobody', !/jess|17840000000000099/i.test(JSON.stringify(mail)));
+  const ret = W.nodes.find((n) => n.name === 'Return: Data Deleted').parameters.assignments.assignments;
+  ok('she gets a confirmation; lead_id 0 so the adapter can still send it', ret.find((a) => a.name === 'send').value === '={{ true }}' && ret.find((a) => a.name === 'lead_id').value === '={{ 0 }}');
 };

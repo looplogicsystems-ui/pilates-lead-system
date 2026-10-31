@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Carry out a "delete my data" request that arrived by EMAIL. (A DM saying
+# "delete my data" is handled automatically by Lead Brain.)
+#
+# Finds the lead by Instagram @username or Instagram id, shows what would be
+# deleted (counts only, never message text), asks, then runs forget_lead()
+# (migration 016) for every match: a request covers her data at every studio.
+# Logged in data_deletions with counts only.
+#
+#   bin/forget-lead @jess.moves
+#   bin/forget-lead 1104925588895011
+#
+# Can't find her? We only know her @username if Instagram gave it to us. Ask
+# her to DM "delete my data" to the studio instead; that always matches.
+set -euo pipefail
+MINI="${MINI_HOST:-mac-server@100.64.98.51}"
+q="${1:-}"; q="${q#@}"
+[ -n "$q" ] || { sed -n '2,14p' "$0" | sed 's/^# \?//'; exit 1; }
+[[ "$q" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "that isn't an Instagram username or id"; exit 1; }
+sql () { ssh -n -o BatchMode=yes "$MINI" "docker exec -i postgres psql -U n8n -d postgres -v ON_ERROR_STOP=1 -At -F ' | ' -c \"$1\""; }
+
+MATCH="FROM leads l JOIN studios s ON s.id = l.studio_id WHERE lower(l.username) = lower('$q') OR l.external_id = '$q'"
+rows="$(sql "SELECT l.id, s.name, l.channel, coalesce('@' || l.username, '(no username)'), 'first seen ' || l.created_at::date, 'last active ' || l.updated_at::date, (SELECT count(*) FROM messages m WHERE m.lead_id = l.id) || ' messages' $MATCH ORDER BY l.id;")"
+if [ -z "$rows" ]; then
+    echo "Nothing stored for '$q'."
+    sql "INSERT INTO data_deletions (kind, detail) VALUES ('request', '{\\\"found\\\": false, \\\"via\\\": \\\"email\\\"}');" >/dev/null
+    echo "Logged the request (nothing to delete). Reply to her that we hold no data for that account."
+    exit 0
+fi
+echo "Found:"; echo "$rows" | sed 's/^/  lead /'
+read -rp "Delete ALL of the above, permanently? [y/N] " ok
+[[ "$ok" =~ ^[Yy] ]] || { echo "Nothing deleted."; exit 1; }
+for id in $(echo "$rows" | cut -d' ' -f1); do
+    echo "  lead $id: $(sql "SELECT forget_lead($id, 'request', 'email');")"
+done
+echo "Done. Reply to her that her messages and details are deleted (within the 30 days the privacy page promises)."

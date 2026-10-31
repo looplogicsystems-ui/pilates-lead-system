@@ -198,6 +198,81 @@ node("Return: Unknown Account", "n8n-nodes-base.set", 3.4, [860, 520], {
 connect("Send: Unknown Account", "Return: Unknown Account")
 
 # ---------------------------------------------------------------------------
+# 1b. "Delete my data" (privacy page promise; migration 016). Checked BEFORE
+#     the lead is stored, so the request itself isn't saved. Deletes her lead
+#     row and everything tied to it, tells the founders (counts, no identifiers)
+#     and confirms to her. The AI never sees the message.
+# ---------------------------------------------------------------------------
+DELETE_RE = r"/\b(delete|erase|remove)\s+(all\s+)?my\s+(data|info|information|details|messages)\b/i"
+if_true("Delete Request?", [90, 120],
+        "={{ " + DELETE_RE + ".test(String(" + IN + ".message || '')) }}", "delete-request")
+
+pg("Forget Lead", [200, -160], """-- forget_lead() deletes the lead and her messages, links, escalations, error
+-- records and legacy AI memory, and logs counts only (data_deletions).
+-- Always one row; a request from someone we hold nothing on is logged too.
+WITH f AS (
+  SELECT forget_lead(l.id, 'request', 'dm') AS r
+    FROM leads l WHERE l.channel = $1 AND l.external_id = $2
+), nothing AS (
+  INSERT INTO data_deletions (kind, studio_id, detail)
+  SELECT 'request', $3::int, jsonb_build_object('found', false, 'via', 'dm', 'channel', $1::text)
+   WHERE NOT EXISTS (SELECT 1 FROM f)
+  RETURNING id
+)
+SELECT COALESCE((SELECT r FROM f LIMIT 1), '{"found": false}'::jsonb) AS result,
+       (SELECT count(*) FROM nothing) AS logged_nothing_found;""",
+   replacement=f"={{{{ [{IN}.channel, {IN}.external_id, {CFG}.studio_id] }}}}",
+   alwaysOutputData=True)
+
+code("Email: Data Deleted", [420, -160], r"""
+// Founders only, and no identifiers: an email that named her would be a copy
+// of the very data she asked us to delete.
+const r = $('Forget Lead').first().json.result || {};
+const cfg = $('Resolve Studio').first().json;
+const inb = $('When Called').first().json;
+const n = (k) => Number(r[k] || 0);
+return [{ json: {
+  to: 'founders',
+  subject: `"Delete my data" request carried out (${cfg.studio_name || 'unknown studio'})`,
+  heading: 'A lead asked us to delete her data. It is done.',
+  lines: [
+    r.found
+      ? `Deleted: her lead record, ${n('messages')} messages, ${n('booking_links')} booking links, ${n('escalations')} escalations, ${n('dead_letters')} error records.`
+      : 'We held nothing on her. The request is logged anyway.',
+    `Channel: ${inb.channel}. Logged in data_deletions (counts only). She was sent a confirmation.`,
+    'The chat itself stays in the studio\'s own Instagram inbox. Older snapshots and backups age out within 30 days.',
+  ] } }];
+""")
+
+send_email("Send: Data Deleted", [640, -160])
+
+node("Return: Data Deleted", "n8n-nodes-base.set", 3.4, [860, -160], {
+    "assignments": {"assignments": [
+        {"id": "d1", "name": "reply", "type": "string",
+         "value": "={{ ($('Forget Lead').first().json.result || {}).found "
+                  "? 'Done: your messages and details are deleted from our records. The chat itself stays in Instagram, where you can delete it on your side too.' "
+                  ": 'Done: we don\\'t hold any of your details. The chat itself stays in Instagram, where you can delete it on your side too.' }}"},
+        {"id": "d2", "name": "intent", "type": "string", "value": "data_deleted"},
+        {"id": "d3", "name": "send", "type": "boolean", "value": "={{ true }}"},
+        # 0, not empty: the Instagram adapter casts lead_id to int. No lead row
+        # exists any more, so its last-moment pause check finds nothing to stop.
+        {"id": "d4", "name": "lead_id", "type": "number", "value": "={{ 0 }}"},
+        {"id": "d5", "name": "studio_id", "type": "number", "value": f"={{{{ {CFG}.studio_id }}}}"},
+        {"id": "d6", "name": "channel", "type": "string", "value": f"={{{{ {IN}.channel }}}}"},
+        {"id": "d7", "name": "external_id", "type": "string", "value": f"={{{{ {IN}.external_id }}}}"},
+        {"id": "d8", "name": "booking_created", "type": "boolean", "value": "={{ false }}"},
+        {"id": "d9", "name": "credential_ref", "type": "string", "value": f"={{{{ {CFG}.credential_ref }}}}"},
+        {"id": "d10", "name": "link_sent", "type": "boolean", "value": "={{ false }}"},
+        {"id": "d11", "name": "account_ref", "type": "string", "value": f"={{{{ {IN}.account_ref }}}}"},
+    ]}, "options": {}})
+
+connect("Studio Found?", "Delete Request?", out=0)
+connect("Delete Request?", "Forget Lead", out=0)
+connect("Forget Lead", "Email: Data Deleted")
+connect("Email: Data Deleted", "Send: Data Deleted")
+connect("Send: Data Deleted", "Return: Data Deleted")
+
+# ---------------------------------------------------------------------------
 # 2. Lead upsert with lifecycle rules, inbound log, pause check
 # ---------------------------------------------------------------------------
 pg("Upsert Lead", [200, 260], """-- Idempotent per (channel, external_id). The status CASE is the lifecycle:
@@ -232,7 +307,7 @@ RETURNING id, status, ai_paused, username, name,
    replacement=("={{ [" + f"{IN}.external_id, {IN}.channel, {IN}.name || null, {CFG}.studio_id, "
                 f"{IN}.username || null, !!{IN}.profile_checked" + "] }}"),
    retryOnFail=True)
-connect("Studio Found?", "Upsert Lead", out=0)
+connect("Delete Request?", "Upsert Lead", out=1)
 
 pg("Log Inbound", [420, 260], """INSERT INTO messages (lead_id, direction, channel, body, author, created_at)
 VALUES ($1, 'inbound', $2, $3, 'lead', now());""",

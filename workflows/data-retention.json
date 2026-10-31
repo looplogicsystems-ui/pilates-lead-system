@@ -1,0 +1,94 @@
+{
+  "id": "0Qm7mxhOwgStcGN4",
+  "name": "Data Retention",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000c006",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 4
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "run-now",
+      "name": "Run Now",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "apply-retention",
+      "name": "Apply Retention",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT apply_retention(180) AS summary;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "retryOnFail": true
+    }
+  ],
+  "connections": {
+    "Schedule": {
+      "main": [
+        [
+          {
+            "node": "Apply Retention",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now": {
+      "main": [
+        [
+          {
+            "node": "Apply Retention",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}

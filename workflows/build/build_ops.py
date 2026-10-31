@@ -16,7 +16,8 @@ from ig_common import TOKEN_CRYPTO_JS, GRAPH_JS
 SEND_EMAIL_WF_ID = "PQWBdER3x291uWeU"
 
 # New workflows get their id from n8n on first push (push.py prints it).
-MONITOR_IDS = {"unanswered": "EgCJIgrxK5wyNEab", "links": "7LiRAztbJZSSzvfq", "weekly": "RMZ5c58Vo8CpDVRs"}
+MONITOR_IDS = {"unanswered": "EgCJIgrxK5wyNEab", "links": "7LiRAztbJZSSzvfq", "weekly": "RMZ5c58Vo8CpDVRs",
+               "retention": "0Qm7mxhOwgStcGN4"}
 
 CREDS = {
     "POSTGRES_CRED_ID":      "VVIxtEmT1GWsEZn9",
@@ -453,7 +454,10 @@ SELECT s.name AS studio_name,
      FROM leads l WHERE l.studio_id = s.id AND l.channel <> 'test' AND l.ai_paused) AS paused_now,
   s.link_problem,
   (SELECT count(*) FROM dead_letters WHERE resolved_at IS NULL) AS open_dead_letters,
-  (SELECT count(*) FROM dead_letters WHERE created_at > now() - interval '7 days') AS dead_letters_week
+  (SELECT count(*) FROM dead_letters WHERE created_at > now() - interval '7 days') AS dead_letters_week,
+  (SELECT count(*) FROM data_deletions WHERE kind = 'request' AND at > now() - interval '7 days') AS deletion_requests_week,
+  (SELECT count(*) FROM data_deletions WHERE kind IN ('retention', 'studio_ended') AND at > now() - interval '7 days') AS retention_deleted_week,
+  (SELECT count(*) FROM data_deletions WHERE kind = 'retention_run' AND at > now() - interval '7 days') AS retention_runs_week
   FROM studios s
  WHERE s.active
  ORDER BY s.id;
@@ -470,6 +474,7 @@ for (const r of rows) {
 }
 const r0 = rows[0];
 lines.push(`System: ${r0.dead_letters_week} errors this week, ${r0.open_dead_letters} unresolved in dead_letters.`);
+lines.push(`Privacy: ${r0.deletion_requests_week || 0} "delete my data" requests carried out, ${r0.retention_deleted_week || 0} leads deleted by the retention rule. The daily retention job ran on ${r0.retention_runs_week || 0} of 7 days${Number(r0.retention_runs_week || 0) < 6 ? ': CHECK IT' : ''}.`);
 lines.push('The 5-minute review: (1) any unresolved errors? (2) links sent → tapped → booked look sane? (3) every escalation answered? (4) anyone paused who should be resumed?');
 return [{ json: { to: 'founders', subject: `Weekly review — ${new Date().toISOString().slice(0, 10)}`,
                   heading: 'Last 7 days', lines } }];
@@ -509,6 +514,23 @@ def weekly_review():
     return _wf(MONITOR_IDS["weekly"], "Weekly Review", "00000000-0000-4000-8000-00000000c005", nodes, conns)
 
 
+# Data retention (security floor §J; migration 016). Deletes leads idle for
+# 180 days, leads of studios that ended 30+ days ago, and old system records.
+# The policy and the reasoning: vault `Company/Compliance & Privacy.md`.
+# No email (it would be daily noise): every run logs a 'retention_run' row and
+# the Weekly Review reports how many days it ran. A failure reaches the Error
+# Handler like any workflow.
+RETENTION_DAYS = 180
+
+
+def data_retention():
+    nodes = _triggers({"field": "days", "daysInterval": 1, "triggerAtHour": 4}) + [
+        _pg("Apply Retention", [-240, 0], f"SELECT apply_retention({RETENTION_DAYS}) AS summary;")]
+    conns = _chain("Schedule", "Apply Retention")
+    conns.update(_chain("Run Now", "Apply Retention"))
+    return _wf(MONITOR_IDS["retention"], "Data Retention", "00000000-0000-4000-8000-00000000c006", nodes, conns)
+
+
 def main():
     scratch = sys.argv[1]
     os.makedirs(scratch, exist_ok=True)
@@ -519,7 +541,8 @@ def main():
                          (token_refresh(), "ig-token-refresh.json"),
                          (unanswered_check(), "monitor-unanswered.json"),
                          (link_check(), "monitor-booking-links.json"),
-                         (weekly_review(), "weekly-review.json")]:
+                         (weekly_review(), "weekly-review.json"),
+                         (data_retention(), "data-retention.json")]:
         incoming = {c["node"] for outs in wf["connections"].values() for kind in outs.values()
                     for out in kind for c in out}
         orphans = [n["name"] for n in wf["nodes"] if n["name"] not in incoming

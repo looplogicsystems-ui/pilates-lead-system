@@ -185,6 +185,182 @@
       }
     },
     {
+      "id": "delete-request",
+      "name": "Delete Request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        90,
+        120
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "delete-request",
+              "leftValue": "={{ /\\b(delete|erase|remove)\\s+(all\\s+)?my\\s+(data|info|information|details|messages)\\b/i.test(String($('When Called').first().json.message || '')) }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "forget-lead",
+      "name": "Forget Lead",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        200,
+        -160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- forget_lead() deletes the lead and her messages, links, escalations, error\n-- records and legacy AI memory, and logs counts only (data_deletions).\n-- Always one row; a request from someone we hold nothing on is logged too.\nWITH f AS (\n  SELECT forget_lead(l.id, 'request', 'dm') AS r\n    FROM leads l WHERE l.channel = $1 AND l.external_id = $2\n), nothing AS (\n  INSERT INTO data_deletions (kind, studio_id, detail)\n  SELECT 'request', $3::int, jsonb_build_object('found', false, 'via', 'dm', 'channel', $1::text)\n   WHERE NOT EXISTS (SELECT 1 FROM f)\n  RETURNING id\n)\nSELECT COALESCE((SELECT r FROM f LIMIT 1), '{\"found\": false}'::jsonb) AS result,\n       (SELECT count(*) FROM nothing) AS logged_nothing_found;",
+        "options": {
+          "queryReplacement": "={{ [$('When Called').first().json.channel, $('When Called').first().json.external_id, $('Resolve Studio').first().json.studio_id] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "email-data-deleted",
+      "name": "Email: Data Deleted",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        -160
+      ],
+      "parameters": {
+        "jsCode": "// Founders only, and no identifiers: an email that named her would be a copy\n// of the very data she asked us to delete.\nconst r = $('Forget Lead').first().json.result || {};\nconst cfg = $('Resolve Studio').first().json;\nconst inb = $('When Called').first().json;\nconst n = (k) => Number(r[k] || 0);\nreturn [{ json: {\n  to: 'founders',\n  subject: `\"Delete my data\" request carried out (${cfg.studio_name || 'unknown studio'})`,\n  heading: 'A lead asked us to delete her data. It is done.',\n  lines: [\n    r.found\n      ? `Deleted: her lead record, ${n('messages')} messages, ${n('booking_links')} booking links, ${n('escalations')} escalations, ${n('dead_letters')} error records.`\n      : 'We held nothing on her. The request is logged anyway.',\n    `Channel: ${inb.channel}. Logged in data_deletions (counts only). She was sent a confirmation.`,\n    'The chat itself stays in the studio\\'s own Instagram inbox. Older snapshots and backups age out within 30 days.',\n  ] } }];"
+      }
+    },
+    {
+      "id": "send-data-deleted",
+      "name": "Send: Data Deleted",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        640,
+        -160
+      ],
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "onError": "continueRegularOutput",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "return-data-deleted",
+      "name": "Return: Data Deleted",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        860,
+        -160
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d1",
+              "name": "reply",
+              "type": "string",
+              "value": "={{ ($('Forget Lead').first().json.result || {}).found ? 'Done: your messages and details are deleted from our records. The chat itself stays in Instagram, where you can delete it on your side too.' : 'Done: we don\\'t hold any of your details. The chat itself stays in Instagram, where you can delete it on your side too.' }}"
+            },
+            {
+              "id": "d2",
+              "name": "intent",
+              "type": "string",
+              "value": "data_deleted"
+            },
+            {
+              "id": "d3",
+              "name": "send",
+              "type": "boolean",
+              "value": "={{ true }}"
+            },
+            {
+              "id": "d4",
+              "name": "lead_id",
+              "type": "number",
+              "value": "={{ 0 }}"
+            },
+            {
+              "id": "d5",
+              "name": "studio_id",
+              "type": "number",
+              "value": "={{ $('Resolve Studio').first().json.studio_id }}"
+            },
+            {
+              "id": "d6",
+              "name": "channel",
+              "type": "string",
+              "value": "={{ $('When Called').first().json.channel }}"
+            },
+            {
+              "id": "d7",
+              "name": "external_id",
+              "type": "string",
+              "value": "={{ $('When Called').first().json.external_id }}"
+            },
+            {
+              "id": "d8",
+              "name": "booking_created",
+              "type": "boolean",
+              "value": "={{ false }}"
+            },
+            {
+              "id": "d9",
+              "name": "credential_ref",
+              "type": "string",
+              "value": "={{ $('Resolve Studio').first().json.credential_ref }}"
+            },
+            {
+              "id": "d10",
+              "name": "link_sent",
+              "type": "boolean",
+              "value": "={{ false }}"
+            },
+            {
+              "id": "d11",
+              "name": "account_ref",
+              "type": "string",
+              "value": "={{ $('When Called').first().json.account_ref }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
       "id": "upsert-lead",
       "name": "Upsert Lead",
       "type": "n8n-nodes-base.postgres",
@@ -837,7 +1013,7 @@
       "main": [
         [
           {
-            "node": "Upsert Lead",
+            "node": "Delete Request?",
             "type": "main",
             "index": 0
           }
@@ -878,6 +1054,57 @@
         [
           {
             "node": "Return: Unknown Account",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Request?": {
+      "main": [
+        [
+          {
+            "node": "Forget Lead",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upsert Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forget Lead": {
+      "main": [
+        [
+          {
+            "node": "Email: Data Deleted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email: Data Deleted": {
+      "main": [
+        [
+          {
+            "node": "Send: Data Deleted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send: Data Deleted": {
+      "main": [
+        [
+          {
+            "node": "Return: Data Deleted",
             "type": "main",
             "index": 0
           }
