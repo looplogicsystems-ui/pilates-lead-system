@@ -17,7 +17,7 @@ SEND_EMAIL_WF_ID = "PQWBdER3x291uWeU"
 
 # New workflows get their id from n8n on first push (push.py prints it).
 MONITOR_IDS = {"unanswered": "EgCJIgrxK5wyNEab", "links": "7LiRAztbJZSSzvfq", "weekly": "RMZ5c58Vo8CpDVRs",
-               "retention": "0Qm7mxhOwgStcGN4"}
+               "retention": "0Qm7mxhOwgStcGN4", "backups": "6tJxAfTWLPeXpCwJ"}
 
 CREDS = {
     "POSTGRES_CRED_ID":      "VVIxtEmT1GWsEZn9",
@@ -531,6 +531,47 @@ def data_retention():
     return _wf(MONITOR_IDS["retention"], "Data Retention", "00000000-0000-4000-8000-00000000c006", nodes, conns)
 
 
+# Offsite backups (security floor §J; migration 017). bin/backup-offsite runs
+# nightly on the mini (cron, 03:15 mini time) and records every run in
+# backup_runs. This checks the next morning: no good backup in 26 hours, or a
+# failed last run, emails the founders. Silent until the backup is set up.
+BACKUP_SQL = """
+-- Always exactly one row.
+SELECT (SELECT count(*) FROM backup_runs) AS runs,
+       (SELECT max(at) FROM backup_runs WHERE ok) AS last_ok,
+       (SELECT ok    FROM backup_runs ORDER BY id DESC LIMIT 1) AS last_run_ok,
+       (SELECT at    FROM backup_runs ORDER BY id DESC LIMIT 1) AS last_run_at,
+       (SELECT error FROM backup_runs ORDER BY id DESC LIMIT 1) AS last_error;
+"""
+
+BACKUP_ALERT_JS = r"""
+const r = $input.first().json;
+if (!Number(r.runs)) return [];                       // not set up yet
+const hrs = r.last_ok ? (Date.now() - new Date(r.last_ok).getTime()) / 36e5 : Infinity;
+if (r.last_run_ok && hrs < 26) return [];               // all good
+const failed = r.last_run_ok === false;
+return [{ json: {
+  to: 'founders',
+  subject: failed ? 'Offsite backup FAILED' : 'Offsite backup MISSING',
+  heading: failed ? 'Last night\'s offsite backup failed.' : 'No offsite backup has run in over a day.',
+  lines: [
+    failed ? `Error: ${r.last_error || '(none recorded)'}` : `The nightly job didn't record a run (check the cron line on the mini).`,
+    r.last_ok ? `Last good backup: ${new Date(r.last_ok).toISOString().replace('T', ' ').slice(0, 16)} UTC (${Math.round(hrs)} hours ago).` : 'There has never been a good backup.',
+    'On the mini: tail ~/backup-offsite.log, then run ~/pilates-lead-system/bin/backup-offsite by hand.',
+  ] } }];
+"""
+
+
+def backup_check():
+    nodes = _triggers({"field": "days", "daysInterval": 1, "triggerAtHour": 10}) + [
+        _pg("Last Backup", [-240, 0], BACKUP_SQL, alwaysOutputData=True),
+        _code("Backup OK?", [-20, 0], BACKUP_ALERT_JS),
+        _send("Email Founders", [200, 0])]
+    conns = _chain("Schedule", "Last Backup", "Backup OK?", "Email Founders")
+    conns.update(_chain("Run Now", "Last Backup"))
+    return _wf(MONITOR_IDS["backups"], "Monitor: Backups", "00000000-0000-4000-8000-00000000c007", nodes, conns)
+
+
 def main():
     scratch = sys.argv[1]
     os.makedirs(scratch, exist_ok=True)
@@ -542,7 +583,8 @@ def main():
                          (unanswered_check(), "monitor-unanswered.json"),
                          (link_check(), "monitor-booking-links.json"),
                          (weekly_review(), "weekly-review.json"),
-                         (data_retention(), "data-retention.json")]:
+                         (data_retention(), "data-retention.json"),
+                         (backup_check(), "monitor-backups.json")]:
         incoming = {c["node"] for outs in wf["connections"].values() for kind in outs.values()
                     for out in kind for c in out}
         orphans = [n["name"] for n in wf["nodes"] if n["name"] not in incoming

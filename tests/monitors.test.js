@@ -58,4 +58,16 @@ module.exports = async () => {
     escalations: 0, nudges: 0, unanswered: 0, paused_now: null, link_problem: null, open_dead_letters: 0, dead_letters_week: 0,
     deletion_requests_week: 1, retention_deleted_week: 3, retention_runs_week: 7 }]);
   ok('...and counts requests, retention deletions, no warning at 7/7', r[0].lines.some((l) => /1 "delete my data" requests carried out, 3 leads deleted/.test(l) && /ran on 7 of 7 days\.$/.test(l)));
+
+  // --- Monitor: Backups (migration 017)
+  const bk = (row) => run('monitor-backups.json', 'Backup OK?', [row]);
+  const hAgo = (h) => new Date(Date.now() - h * 36e5).toISOString();
+  r = await bk({ runs: 0 });
+  ok('backups: not set up yet -> silent', r.length === 0);
+  r = await bk({ runs: 5, last_ok: hAgo(7), last_run_ok: true, last_run_at: hAgo(7) });
+  ok('backups: good run 7h ago -> silent', r.length === 0);
+  r = await bk({ runs: 5, last_ok: hAgo(31), last_run_ok: false, last_run_at: hAgo(7), last_error: 'restic backup failed: 403' });
+  ok('backups: last run failed -> FAILED email with the error', r.length === 1 && /FAILED/.test(r[0].subject) && /403/.test(r[0].lines[0]));
+  r = await bk({ runs: 5, last_ok: hAgo(30), last_run_ok: true, last_run_at: hAgo(30) });
+  ok('backups: nothing for 30h -> MISSING email', r.length === 1 && /MISSING/.test(r[0].subject) && /30 hours ago/.test(r[0].lines[1]));
 };

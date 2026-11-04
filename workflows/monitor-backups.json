@@ -1,0 +1,151 @@
+{
+  "id": "6tJxAfTWLPeXpCwJ",
+  "name": "Monitor: Backups",
+  "active": false,
+  "versionId": "00000000-0000-4000-8000-00000000c007",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 10
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "run-now",
+      "name": "Run Now",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "last-backup",
+      "name": "Last Backup",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -240,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Always exactly one row.\nSELECT (SELECT count(*) FROM backup_runs) AS runs,\n       (SELECT max(at) FROM backup_runs WHERE ok) AS last_ok,\n       (SELECT ok    FROM backup_runs ORDER BY id DESC LIMIT 1) AS last_run_ok,\n       (SELECT at    FROM backup_runs ORDER BY id DESC LIMIT 1) AS last_run_at,\n       (SELECT error FROM backup_runs ORDER BY id DESC LIMIT 1) AS last_error;",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CRED_ID",
+          "name": "Postgres account"
+        }
+      },
+      "retryOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "backup-ok",
+      "name": "Backup OK?",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nif (!Number(r.runs)) return [];                       // not set up yet\nconst hrs = r.last_ok ? (Date.now() - new Date(r.last_ok).getTime()) / 36e5 : Infinity;\nif (r.last_run_ok && hrs < 26) return [];               // all good\nconst failed = r.last_run_ok === false;\nreturn [{ json: {\n  to: 'founders',\n  subject: failed ? 'Offsite backup FAILED' : 'Offsite backup MISSING',\n  heading: failed ? 'Last night\\'s offsite backup failed.' : 'No offsite backup has run in over a day.',\n  lines: [\n    failed ? `Error: ${r.last_error || '(none recorded)'}` : `The nightly job didn't record a run (check the cron line on the mini).`,\n    r.last_ok ? `Last good backup: ${new Date(r.last_ok).toISOString().replace('T', ' ').slice(0, 16)} UTC (${Math.round(hrs)} hours ago).` : 'There has never been a good backup.',\n    'On the mini: tail ~/backup-offsite.log, then run ~/pilates-lead-system/bin/backup-offsite by hand.',\n  ] } }];"
+      }
+    },
+    {
+      "id": "email-founders",
+      "name": "Email Founders",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        200,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "PQWBdER3x291uWeU"
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule": {
+      "main": [
+        [
+          {
+            "node": "Last Backup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Last Backup": {
+      "main": [
+        [
+          {
+            "node": "Backup OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Backup OK?": {
+      "main": [
+        [
+          {
+            "node": "Email Founders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Now": {
+      "main": [
+        [
+          {
+            "node": "Last Backup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "4L4K72aSSwiBcnjX"
+  }
+}
