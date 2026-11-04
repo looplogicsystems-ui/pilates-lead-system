@@ -22,6 +22,8 @@ SCENARIOS = {
                        "booked!"],
     "nervous": ["I've never done pilates and I'm pretty unfit tbh, will I be the worst one there?"],
     "terse": ["times?"],
+    "just-hello": ["hello"],
+    "just-hey": ["hey!! 👋"],
     "price-shopper": ["how much is it"],
     "haggle": ["can you do the intro pass for $50? thats what the other place charges"],
     "pregnant": ["hi I'm 12 weeks pregnant, can I still do reformer?"],

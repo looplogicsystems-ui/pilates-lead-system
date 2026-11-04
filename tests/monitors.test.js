@@ -52,7 +52,7 @@ module.exports = async () => {
     escalations: 1, nudges: 4, unanswered: 0, paused_now: '@jess.moves (staff_reply)', link_problem: null, open_dead_letters: 0, dead_letters_week: 1 }]);
   ok('weekly review: funnel with %, paused list, review checklist', r.length === 1 && /Links sent 8 → tapped 6 \(75%\) → said booked 3 → owner confirmed 2/.test(r[0].lines[0])
      && /@jess\.moves \(staff_reply\)/.test(r[0].lines[1]) && r[0].lines.some((l) => /5-minute review/.test(l)));
-  ok('weekly review: privacy line, and a warning when the retention job didn't run',
+  ok('weekly review: privacy line, and a warning when the retention job did not run',
      r[0].lines.some((l) => /^Privacy: 0 "delete my data" requests/.test(l) && /ran on 0 of 7 days: CHECK IT/.test(l)));
   r = await run('weekly-review.json', 'Build Review', [{ studio_name: 'Reform', new_leads: 0, links_sent: 0, links_tapped: 0, said_booked: 0, owner_confirmed: 0,
     escalations: 0, nudges: 0, unanswered: 0, paused_now: null, link_problem: null, open_dead_letters: 0, dead_letters_week: 0,
