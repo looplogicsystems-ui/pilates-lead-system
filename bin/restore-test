@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Restore test (test L18, security floor §J). Runs ON THE MINI; touches nothing live.
+#
+#   ~/pilates-lead-system/bin/restore-test
+#
+# Restores the LATEST offsite backup into a throwaway Postgres (no network, deleted
+# afterwards) and checks it's usable:
+#   - the lead data and n8n's own database came back (row counts vs live)
+#   - n8n's stored credentials are byte-identical to live, so they decrypt with
+#     the same N8N_ENCRYPTION_KEY (which is NOT in the backup, but in Bitwarden)
+#   - every studio's Instagram token in the backup decrypts with IG_TOKEN_KEY
+#     (checked inside the n8n container, which holds that key; tokens never printed)
+set -euo pipefail
+ENV_FILE="${BACKUP_ENV:-$HOME/looplogic/backup.env}"
+RESTIC_IMAGE="restic/restic:0.17.3"
+[ -r "$ENV_FILE" ] || { echo "no $ENV_FILE: run bin/setup-offsite-backup first"; exit 1; }
+umask 077
+work="$(mktemp -d "$HOME/.restore-test.XXXXXX")"; chmod 755 "$work"
+name="restore-test-$$"
+trap 'docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+extra=(); [ -n "${RESTIC_REPO_DIR:-}" ] && extra=(-v "$RESTIC_REPO_DIR:/repo")
+pass=0; failn=0
+ok ()  { echo "  PASS  $1"; pass=$((pass + 1)); }
+bad () { echo "  FAIL  $1"; failn=$((failn + 1)); }
+
+echo "==> fetching the latest backup"
+docker run --rm --env-file "$ENV_FILE" -v "$work:/out" "${extra[@]}" "$RESTIC_IMAGE" --no-cache \
+    snapshots --latest 1 --compact 2>/dev/null | sed -n '3p' | sed 's/^/    /'
+docker run --rm --env-file "$ENV_FILE" -v "$work:/out" "${extra[@]}" "$RESTIC_IMAGE" --no-cache \
+    restore latest --host looplogic-mini --target /out >/dev/null
+dump="$(find "$work" -name pgdumpall.sql | head -1)"
+[ -s "$dump" ] && ok "backup downloaded and decrypted ($(( $(stat -c %s "$dump") / 1024 )) KB)" || { bad "no dump in the backup"; exit 1; }
+
+echo "==> loading it into a throwaway Postgres (no network)"
+docker run -d --name "$name" --network none -e POSTGRES_USER=n8n -e POSTGRES_PASSWORD=restoretest postgres:16 >/dev/null
+for i in $(seq 1 30); do docker exec "$name" pg_isready -U n8n -q 2>/dev/null && break; sleep 1; done
+# The dump recreates roles and databases that the fresh server already has;
+# those "already exists" errors are expected, anything else is counted.
+docker exec -i "$name" psql -U n8n -d postgres -q < "$dump" > "$work/load.log" 2>&1 || true
+other="$(grep -c 'ERROR' "$work/load.log" || true)"; exists="$(grep -c 'already exists' "$work/load.log" || true)"
+[ $((other - exists)) -le 0 ] && ok "dump loaded ($exists expected 'already exists' notices only)" \
+    || bad "dump loaded with $((other - exists)) unexpected errors (see the first: $(grep ERROR "$work/load.log" | grep -v 'already exists' | head -1 | cut -c1-150))"
+
+q ()    { docker exec -i "$name" psql -U n8n -d "$1" -At -c "$2"; }
+live () { docker exec -i postgres psql -U n8n -d "$1" -At -c "$2"; }
+for t in studios leads messages channel_accounts booking_links; do
+    r="$(q postgres "SELECT count(*) FROM $t")"; l="$(live postgres "SELECT count(*) FROM $t")"
+    [ "$r" -gt 0 ] && ok "$t: $r rows restored (live now: $l)" || bad "$t: nothing restored"
+done
+w="$(q n8n 'SELECT count(*) FROM workflow_entity')"; [ "$w" -gt 0 ] && ok "n8n workflows: $w restored" || bad "no n8n workflows restored"
+cr="$(q n8n "SELECT md5(string_agg(id || data, ',' ORDER BY id)) FROM credentials_entity")"
+cl="$(live n8n "SELECT md5(string_agg(id || data, ',' ORDER BY id)) FROM credentials_entity")"
+[ -n "$cr" ] && [ "$cr" = "$cl" ] && ok "n8n credentials identical to live, so they decrypt with N8N_ENCRYPTION_KEY" \
+    || bad "n8n credentials differ from live (changed since the backup, or not restored)"
+
+# Instagram tokens: decrypt each restored one inside the n8n container (it has
+# IG_TOKEN_KEY). Prints only whether it decrypted and its length.
+# (Postgres's base64 wraps every 76 characters; strip the newlines.)
+q postgres "SELECT account_ref || ' ' || replace(encode(access_token_enc, 'base64'), E'\n', '') FROM channel_accounts WHERE channel = 'instagram' AND access_token_enc IS NOT NULL" > "$work/tokens.txt"
+while read -r acct b64; do
+    [ -n "$acct" ] || continue
+    res="$(printf '%s' "$b64" | docker exec -i n8n node -e '
+      const c=require("crypto");let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{
+        const k=c.createHash("sha256").update(String(process.env.IG_TOKEN_KEY||""),"utf8").digest();
+        const b=Buffer.from(s.trim(),"base64"); if(b[0]!==1) throw new Error("bad format");
+        const d=c.createDecipheriv("aes-256-gcm",k,b.subarray(1,13)); d.setAuthTag(b.subarray(13,29));
+        const p=Buffer.concat([d.update(b.subarray(29)),d.final()]).toString("utf8");
+        console.log(p.length>50?"ok "+p.length:"short "+p.length);}catch(e){console.log("fail "+e.message)}})' 2>&1)"
+    case "$res" in ok*) ok "Instagram token for account $acct decrypts with IG_TOKEN_KEY";; *) bad "Instagram token for account $acct: $res";; esac
+done < "$work/tokens.txt"
+
+echo
+if [ "$failn" -eq 0 ]; then echo "RESTORE TEST PASSED ($pass checks). The throwaway database is being deleted."
+else echo "RESTORE TEST FAILED ($failn of $((pass + failn)) checks)."; exit 1; fi

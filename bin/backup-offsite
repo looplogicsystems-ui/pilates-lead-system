@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Nightly offsite backup (security floor §J). Runs ON THE MINI, from cron:
+#
+#   15 3 * * * $HOME/pilates-lead-system/bin/backup-offsite >> $HOME/backup-offsite.log 2>&1
+#
+# 1. pg_dumpall of the whole Postgres (lead data AND n8n's own database) into a
+#    private temp folder, checked complete before anything is uploaded.
+# 2. restic (in Docker, pinned) ENCRYPTS it on the mini, then uploads it to
+#    Backblaze B2. Its password is in ~/looplogic/backup.env and in Bitwarden,
+#    never stored with the backups. Lead data never leaves the mini unencrypted.
+# 3. Keeps one backup per day for 30 days and deletes older ones: the privacy
+#    page promises deleted data is gone from backups within 30 days.
+# 4. Records the run in Postgres (backup_runs). `Monitor: Backups` emails the
+#    founders if a night is missed or a run fails.
+#
+# Not in the backup, on purpose: ~/looplogic/.env (the keys that decrypt n8n's
+# credentials and studios' Instagram tokens live in Bitwarden, kept apart).
+#
+# Set up once with bin/setup-offsite-backup. Restore-test with bin/restore-test.
+set -euo pipefail
+ENV_FILE="${BACKUP_ENV:-$HOME/looplogic/backup.env}"
+RESTIC_IMAGE="restic/restic:0.17.3"
+KEEP="${KEEP_WITHIN:-30d}"
+HOST_TAG="looplogic-mini"
+[ -r "$ENV_FILE" ] || { echo "no $ENV_FILE: run bin/setup-offsite-backup first"; exit 1; }
+
+umask 077
+work="$(mktemp -d "$HOME/.backup-work.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+ts () { date -u +%FT%TZ; }
+
+record () { # ok snapshot bytes error   (error text: no quotes or $ reach SQL)
+    local err; err="$(printf '%s' "${4:-}" | tr -d "'\$\\\\" | cut -c1-300)"
+    docker exec -i postgres psql -U n8n -d postgres -q -v ON_ERROR_STOP=1 \
+        -c "INSERT INTO backup_runs (ok, snapshot, bytes, error) VALUES ($1, NULLIF('${2:-}',''), NULLIF('${3:-}','')::bigint, NULLIF('$err',''));" \
+        >/dev/null 2>&1 || echo "$(ts) (could not record the run in backup_runs)"
+}
+fail () { echo "$(ts) BACKUP FAILED: $1"; record false "" "" "$1"; exit 1; }
+
+# restic in Docker. RESTIC_REPO_DIR (tests only) mounts a local repository.
+restic () {
+    local extra=()
+    [ -n "${RESTIC_REPO_DIR:-}" ] && extra=(-v "$RESTIC_REPO_DIR:/repo")
+    docker run --rm -i --env-file "$ENV_FILE" -v "$work:/work:ro" "${extra[@]}" \
+        "$RESTIC_IMAGE" --no-cache "$@"
+}
+
+echo "$(ts) backup starting"
+# 1. dump, and refuse to upload a partial one
+docker exec postgres pg_dumpall -U n8n > "$work/pgdumpall.sql" 2> "$work/dump.err" \
+    || fail "pg_dumpall failed: $(head -c 200 "$work/dump.err")"
+tail -c 300 "$work/pgdumpall.sql" | grep -q "PostgreSQL database cluster dump complete" \
+    || fail "pg_dumpall output is incomplete (no end marker)"
+bytes="$(stat -c %s "$work/pgdumpall.sql")"
+[ "$bytes" -gt 1000000 ] || fail "dump suspiciously small ($bytes bytes)"
+rm -f "$work/dump.err"
+# The stack's config (no secrets in these two files) so a rebuild has it too.
+cp "$HOME/looplogic/docker-compose.yml" "$work/" 2>/dev/null || true
+cp "$HOME/looplogic/cloudflared/config.yml" "$work/cloudflared-config.yml" 2>/dev/null || true
+
+# 2. encrypt + upload
+out="$(restic backup --host "$HOST_TAG" --tag nightly --json /work 2>"$work/restic.err")" \
+    || fail "restic backup failed: $(tail -c 300 "$work/restic.err")"
+snap="$(printf '%s\n' "$out" | grep '"message_type":"summary"' | sed -E 's/.*"snapshot_id":"([0-9a-f]{8}).*/\1/')"
+[ -n "$snap" ] || fail "restic gave no snapshot id"
+
+# 3. 30-day retention (never removes the newest snapshot), then a quick check
+restic forget --host "$HOST_TAG" --keep-within-daily "$KEEP" --prune >/dev/null 2>"$work/restic.err" \
+    || fail "restic forget/prune failed: $(tail -c 300 "$work/restic.err")"
+restic check >/dev/null 2>"$work/restic.err" \
+    || fail "restic check failed: $(tail -c 300 "$work/restic.err")"
+
+# 4. record
+record true "$snap" "$bytes" ""
+echo "$(ts) backup OK: snapshot $snap, dump $((bytes / 1024)) KB"

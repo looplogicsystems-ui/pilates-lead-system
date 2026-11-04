@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# One-time setup of the nightly offsite backup to Backblaze B2 (security floor §J).
+# Run it ON THE MINI, in your own terminal:
+#
+#   ssh mac-server@100.64.98.51
+#   ~/pilates-lead-system/bin/setup-offsite-backup
+#
+# Asks for the bucket name and endpoint (visible) and the B2 key (hidden), makes
+# a random encryption password ON the mini, writes ~/looplogic/backup.env
+# (mode 600), creates the encrypted repository and runs the first backup.
+# Nothing secret is printed. Re-running keeps the existing encryption password.
+set -euo pipefail
+[ "$(hostname)" = "${MINI_NAME:-mac-server}" ] \
+    || { echo "Run this on the mini: ssh mac-server@100.64.98.51, then ~/pilates-lead-system/bin/setup-offsite-backup"; exit 1; }
+ENV_FILE="$HOME/looplogic/backup.env"
+RESTIC_IMAGE="restic/restic:0.17.3"
+umask 077
+
+old_pw=""
+if [ -e "$ENV_FILE" ]; then
+    read -rp "$ENV_FILE already exists. Replace the B2 details in it? (the encryption password is kept) [y/N] " a
+    [[ "$a" =~ ^[Yy] ]] || exit 1
+    old_pw="$(grep -m1 '^RESTIC_PASSWORD=' "$ENV_FILE" | cut -d= -f2- || true)"
+fi
+
+read -rp  "B2 bucket name: " BUCKET
+read -rp  "B2 endpoint (on the bucket page, e.g. s3.us-west-004.backblazeb2.com): " EP
+read -rsp "B2 keyID (hidden): " KID; echo
+read -rsp "B2 applicationKey (hidden): " KEY; echo
+BUCKET="$(printf '%s' "$BUCKET" | tr -d '[:space:]')"; EP="$(printf '%s' "$EP" | tr -d '[:space:]')"
+EP="${EP#https://}"; KID="$(printf '%s' "$KID" | tr -d '[:space:]')"; KEY="$(printf '%s' "$KEY" | tr -d '[:space:]')"
+[[ "$BUCKET" =~ ^[A-Za-z0-9-]{6,63}$ ]] || { echo "That bucket name doesn't look right. Nothing changed."; exit 1; }
+[[ "$EP" =~ ^s3\.[a-z0-9-]+\.backblazeb2\.com$ ]] || { echo "The endpoint should look like s3.us-west-004.backblazeb2.com. Nothing changed."; exit 1; }
+[ ${#KID} -ge 20 ] && [ ${#KEY} -ge 20 ] || { echo "The keyID or applicationKey looks too short. Nothing changed."; exit 1; }
+
+PW="${old_pw:-$(openssl rand -base64 48 | tr -d '\n/+=' | cut -c1-48)}"
+tmp="$(mktemp "$ENV_FILE.new.XXXXXX")"
+printf 'RESTIC_REPOSITORY=s3:%s/%s/mini\nAWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nRESTIC_PASSWORD=%s\n' \
+    "$EP" "$BUCKET" "$KID" "$KEY" "$PW" > "$tmp"
+chmod 600 "$tmp"; mv "$tmp" "$ENV_FILE"
+echo "==> wrote $ENV_FILE (mode 600)"
+
+r () { docker run --rm --env-file "$ENV_FILE" "$RESTIC_IMAGE" --no-cache "$@"; }
+if r cat config >/dev/null 2>&1; then
+    echo "==> the encrypted repository already exists in the bucket; using it"
+else
+    r init >/dev/null 2>/tmp/restic-init.err.$$ \
+        || { echo "!! could not create the repository in B2:"; tail -c 400 /tmp/restic-init.err.$$; rm -f /tmp/restic-init.err.$$; exit 1; }
+    rm -f /tmp/restic-init.err.$$
+    echo "==> created the encrypted repository in B2"
+fi
+
+echo "==> first backup"
+"$HOME/pilates-lead-system/bin/backup-offsite"
+
+cat <<'EOF'
+
+Done. Two last things:
+ 1. Save the backup's encryption password in Bitwarden. Without it, the backups
+    can't be opened. From your laptop, in the repo folder:
+        bin/copy-mini-secret RESTIC_PASSWORD
+ 2. Make it nightly. On the mini:
+        (crontab -l; echo '15 3 * * * $HOME/pilates-lead-system/bin/backup-offsite >> $HOME/backup-offsite.log 2>&1') | crontab -
+Then the restore test (L18): ~/pilates-lead-system/bin/restore-test
+EOF
