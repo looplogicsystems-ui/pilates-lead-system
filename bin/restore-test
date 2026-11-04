@@ -33,15 +33,18 @@ dump="$(find "$work" -name pgdumpall.sql | head -1)"
 
 echo "==> loading it into a throwaway Postgres (no network)"
 docker run -d --name "$name" --network none -e POSTGRES_USER=n8n -e POSTGRES_PASSWORD=restoretest postgres:16 >/dev/null
-for i in $(seq 1 30); do docker exec "$name" pg_isready -U n8n -q 2>/dev/null && break; sleep 1; done
+# Wait over TCP: during first-start setup Postgres listens on its socket only,
+# then restarts; loading into that temporary server races the restart.
+for i in $(seq 1 60); do docker exec "$name" pg_isready -h 127.0.0.1 -U n8n -q 2>/dev/null && break; sleep 1; done
+docker exec "$name" pg_isready -h 127.0.0.1 -U n8n -q || { bad "throwaway Postgres didn't start"; exit 1; }
 # The dump recreates roles and databases that the fresh server already has;
 # those "already exists" errors are expected, anything else is counted.
-docker exec -i "$name" psql -U n8n -d postgres -q < "$dump" > "$work/load.log" 2>&1 || true
+docker exec -i "$name" psql -h 127.0.0.1 -U n8n -d postgres -q < "$dump" > "$work/load.log" 2>&1 || true
 other="$(grep -c 'ERROR' "$work/load.log" || true)"; exists="$(grep -c 'already exists' "$work/load.log" || true)"
 [ $((other - exists)) -le 0 ] && ok "dump loaded ($exists expected 'already exists' notices only)" \
     || bad "dump loaded with $((other - exists)) unexpected errors (see the first: $(grep ERROR "$work/load.log" | grep -v 'already exists' | head -1 | cut -c1-150))"
 
-q ()    { docker exec -i "$name" psql -U n8n -d "$1" -At -c "$2"; }
+q ()    { docker exec -i "$name" psql -h 127.0.0.1 -U n8n -d "$1" -At -c "$2"; }
 live () { docker exec -i postgres psql -U n8n -d "$1" -At -c "$2"; }
 for t in studios leads messages channel_accounts booking_links; do
     r="$(q postgres "SELECT count(*) FROM $t")"; l="$(live postgres "SELECT count(*) FROM $t")"
