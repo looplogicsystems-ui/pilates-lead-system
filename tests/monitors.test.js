@@ -12,6 +12,13 @@ module.exports = async () => {
   ok('Postgres down (no dead letter) -> still emails, says it could not be saved', r.length === 1 && /could NOT be saved/.test(r[0].lines[1]));
   ok('Send Email failing -> never emails through itself (no loop)', (await eh({ dead_letter_id: 11, recent_same: 0 }, { ...err, workflow: { id: 'PQWBdER3x291uWeU', name: 'Send Email' } })).length === 0);
 
+  // --- Send Email: "founders" expands; an address listed twice is sent once
+  const se = (to) => run('send-email.json', 'Build Email', [{ to, subject: 's', lines: ['x'] }], { env: { FOUNDER_ALERT_EMAILS: 'a@x.com, b@x.com' } });
+  r = await se('founders');
+  ok('send email: founders -> both founder addresses', JSON.stringify(r[0].to) === '["a@x.com","b@x.com"]');
+  r = await se('A@x.com, founders');
+  ok('send email: owner who is also a founder -> listed once', r[0].to.length === 2 && r[0].to.map((a) => a.toLowerCase()).join() === 'a@x.com,b@x.com');
+
   // --- Unanswered DMs
   r = await run('monitor-unanswered.json', 'Build Alert', [{ success: true }]);
   ok('nothing unanswered -> no email', r.length === 0);

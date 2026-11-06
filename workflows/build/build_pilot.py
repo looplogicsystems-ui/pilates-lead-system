@@ -99,9 +99,10 @@ for (const item of $input.all()) {
   const j = item.json || {};
 
   // "founders" may appear on its own or in a list ("sarah@studio.com, founders").
-  const to = String(j.to || '').split(',').map((a) => a.trim()).filter(Boolean)
+  // An address listed twice (a studio owner who is also a founder) is sent once.
+  const to = [...new Map(String(j.to || '').split(',').map((a) => a.trim()).filter(Boolean)
     .flatMap((a) => a === 'founders' ? String($env.FOUNDER_ALERT_EMAILS || '').split(',') : [a])
-    .map((a) => a.trim()).filter(Boolean).join(', ');
+    .map((a) => a.trim()).filter(Boolean).map((a) => [a.toLowerCase(), a])).values()].join(', ');
   if (!to) throw new Error(`Send Email: no recipient (to="${j.to}")`);
   if (!j.subject) throw new Error('Send Email: no subject');
 
