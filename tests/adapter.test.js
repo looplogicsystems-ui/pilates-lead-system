@@ -56,4 +56,31 @@ module.exports = async () => {
   ok('refresh report: healthy -> no email', r.length === 0);
   r = await run('ig-token-refresh.json', 'Anything Wrong?', [{ id: 1, status: 'failed', token_error: 'HTTP 400', ig_username: 'talha08860', studio_name: 'Reform', token_expires_at: new Date(Date.now() + 5 * 864e5).toISOString() }]);
   ok('refresh report: failure -> one founder email', r.length === 1 && /@talha08860/.test(r[0].subject));
+
+  // --- studio owner emails (plain words; founders still get theirs)
+  const exp = (d) => new Date(Date.now() + d * 864e5 + 3600e3).toISOString();
+  const tok = (extra) => ({ id: 1, status: 'failed', token_error: 'HTTP 400', ig_username: 'studio', studio_name: 'Reform', owner_alert_email: 'owner@studio.com', token_expires_at: exp(40), ...extra });
+  const rt = (save, refresh) => run('ig-token-refresh.json', 'Anything Wrong?', [save], { nodes: { 'Refresh Tokens': [refresh] } });
+  r = await rt(tok(), { id: 1, status: 'failed', token_problem: true, old_error: '' });
+  ok('token refused for the first time -> founders + owner "no longer connected"', r.length === 2 && r[0].to === 'founders' && /owner was emailed/.test(r[0].lines[0])
+     && r[1].to === 'owner@studio.com' && /no longer connected/.test(r[1].subject) && !JSON.stringify(r[1]).includes('HTTP 400'));
+  r = await rt(tok(), { id: 1, status: 'failed', token_problem: true, old_error: 'HTTP 400' });
+  ok('token still refused the next day -> founders only (owner told once)', r.length === 1);
+  r = await rt(tok({ token_error: 'timeout' }), { id: 1, status: 'failed', token_problem: false, old_error: '' });
+  ok('one-off network failure -> founders only', r.length === 1);
+  r = await rt(tok({ status: 'not_due', token_expires_at: exp(7) }), { id: 1, status: 'not_due' });
+  ok('7 days left -> owner told it runs out', r.length === 2 && /runs out in 7 days/.test(r[1].subject));
+  r = await rt(tok({ status: 'not_due', token_expires_at: exp(5) }), { id: 1, status: 'not_due' });
+  ok('5 days left -> founders only (owner hears at 7 and 2)', r.length === 1);
+  r = await rt(tok({ owner_alert_email: 'founders' }), { id: 1, status: 'failed', token_problem: true, old_error: '' });
+  ok('studio owner = founders -> no second email', r.length === 1);
+
+  const sf = (extra) => run(F, 'Email: Send Failed', [{}], { env: ENV, nodes: { 'Send IG Reply': [{ status: 'failed', lead_id: 7, username: 'jess.moves', studio_name: 'Reform',
+    owner_alert_email: 'owner@studio.com', reply: 'Hi Jess, Tuesday 6pm works!', error: 'HTTP 400: (#100) bad', ...extra }] } });
+  r = await sf({ token_problem: true });
+  ok('reply not delivered -> founders + owner email with the unsent reply and Open chat', r.length === 2 && r[0].to === 'founders' && /owner has been emailed/.test(r[0].lines.at(-1))
+     && r[1].to === 'owner@studio.com' && /answer her yourself/.test(r[1].subject) && r[1].lines.some((l) => /Tuesday 6pm/.test(l))
+     && r[1].lines.some((l) => /new connect link/.test(l)) && !JSON.stringify(r[1]).includes('#100') && r[1].buttons[0].label === 'Open chat');
+  r = await sf({ owner_alert_email: 'founders' });
+  ok('reply not delivered, studio owner = founders -> founders email only', r.length === 1);
 };

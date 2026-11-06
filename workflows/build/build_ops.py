@@ -138,7 +138,7 @@ SELECT (SELECT id FROM ins) AS dead_letter_id,
 # instead of next week). Founders get ONE email if any refresh failed or any
 # token is within 10 days of expiring. Nobody renews tokens by hand any more.
 
-LOAD_TOKENS_SQL = """SELECT ca.id, ca.account_ref, ca.ig_username, s.name AS studio_name,
+LOAD_TOKENS_SQL = """SELECT ca.id, ca.account_ref, ca.ig_username, s.name AS studio_name, ca.token_error,
        encode(ca.access_token_enc, 'base64') AS token_enc,
        ca.token_issued_at, ca.token_expires_at,
        (ca.token_issued_at IS NULL OR ca.token_issued_at < now() - interval '7 days') AS refresh_due
@@ -154,7 +154,7 @@ for (const item of $input.all()) {
   const j = item.json;
   if (!j.id) continue;                         // a zero-row SELECT still emits {success:true}
   const base = { id: j.id, account_ref: j.account_ref, ig_username: j.ig_username, studio_name: j.studio_name,
-                 old_expires_at: j.token_expires_at };
+                 old_expires_at: j.token_expires_at, old_error: j.token_error || '' };
   if (!j.refresh_due) { out.push({ json: { ...base, status: 'not_due', token_enc: '', expires_in: 0, error: '' } }); continue; }
   try {
     const r = await graphCall(this, { what: 'token refresh', url: 'https://graph.instagram.com/refresh_access_token',
@@ -163,7 +163,10 @@ for (const item of $input.all()) {
     out.push({ json: { ...base, status: 'refreshed', token_enc: encryptToken(r.access_token),
                        expires_in: Number(r.expires_in) || 5184000, error: '' } });
   } catch (e) {
-    out.push({ json: { ...base, status: 'failed', token_enc: '', expires_in: 0, error: String(e.message).slice(0, 400) } });
+    // token_problem: Instagram refused the token itself (code 190: password change,
+    // security check, app removed), not a one-off network or server failure.
+    out.push({ json: { ...base, status: 'failed', token_enc: '', expires_in: 0, error: String(e.message).slice(0, 400),
+                       token_problem: e.metaCode === 190 } });
   }
 }
 return out;
@@ -180,25 +183,57 @@ UPDATE channel_accounts SET
                                ELSE token_error END
  WHERE id = $1::int
 RETURNING id, $2::text AS status, account_ref, ig_username, token_expires_at, token_error,
-          (SELECT name FROM studios WHERE studios.id = channel_accounts.studio_id) AS studio_name;"""
+          (SELECT name FROM studios WHERE studios.id = channel_accounts.studio_id) AS studio_name,
+          (SELECT owner_alert_email FROM studios WHERE studios.id = channel_accounts.studio_id) AS owner_alert_email;"""
 
 REPORT_JS = r"""
-// One email, only if something needs a human.
+// A founder email whenever something needs a human, plus a plain-words email to
+// the studio owner only when it needs HER: Instagram refused the token for the
+// first time (she must reconnect), or it runs out in 7 or 2 days. Never for a
+// one-off network failure, and never every day.
 const rows = $input.all().map((i) => i.json).filter((r) => r.id);
 const soon = (r) => r.token_expires_at && (new Date(r.token_expires_at) - Date.now()) < 10 * 86400e3;
 const bad = rows.filter((r) => r.status === 'failed' || soon(r));
 if (!bad.length) return [];
 const who = (r) => `${r.ig_username ? '@' + r.ig_username : r.account_ref} (${r.studio_name})`;
+const before = {};
+try { for (const i of $('Refresh Tokens').all()) before[i.json.id] = i.json; } catch (e) { /* no refresh data: founders only */ }
+const daysLeft = (r) => r.token_expires_at ? Math.floor((new Date(r.token_expires_at) - Date.now()) / 864e5) : null;
+const owners = [];
+for (const r of bad) {
+  const owner = String(r.owner_alert_email || '').trim();
+  if (!owner || owner === 'founders') continue;
+  const b = before[r.id] || {};
+  const broken = r.status === 'failed' && b.token_problem === true && !b.old_error;
+  const d = daysLeft(r);
+  if (broken) owners.push({ r, owner, json: {
+    to: owner,
+    subject: 'Action needed: your Instagram is no longer connected to Loop Logic',
+    heading: `Instagram has stopped letting Loop Logic answer ${r.studio_name}\u2019s DMs.`,
+    lines: ['Until it is reconnected, the AI can\u2019t reply to your Instagram messages, so please check them and reply yourself.',
+            'This usually happens after an Instagram password change or a security check.',
+            'We\u2019ll email you a new connect link today. Reconnecting takes about a minute.'],
+    note: 'Loop Logic has been told too.' } });
+  else if (d === 7 || d === 2) owners.push({ r, owner, json: {
+    to: owner,
+    subject: `Your Instagram connection to Loop Logic runs out in ${d} days`,
+    heading: `${r.studio_name}\u2019s Instagram connection to Loop Logic runs out on ${String(r.token_expires_at).slice(0, 10)}.`,
+    lines: ['The AI is still answering your messages for now.',
+            'We\u2019ll email you a new connect link before then. Reconnecting takes about a minute.'],
+    note: 'Loop Logic has been told too.' } });
+}
+const told = new Set(owners.map((o) => o.r.id));
 return [{ json: {
   to: 'founders',
   subject: `Instagram token problem: ${bad.map(who).join(', ')}`,
   heading: 'An Instagram token needs attention. If it expires, that studio\u2019s leads get no replies.',
   lines: [
     ...bad.map((r) => `${who(r)}: ` + (r.status === 'failed' ? `refresh FAILED (${r.token_error}). ` : '') +
-                     (r.token_expires_at ? `Expires ${String(r.token_expires_at).slice(0, 10)}.` : 'Expiry unknown.')),
+                     (r.token_expires_at ? `Expires ${String(r.token_expires_at).slice(0, 10)}.` : 'Expiry unknown.') +
+                     (told.has(r.id) ? ' The studio owner was emailed today and told a new connect link is coming.' : '')),
     'The job retries every day. If it keeps failing, send the studio a new connect link: python3 workflows/build/ig_connect_link.py <studio id>.',
   ],
-} }];
+} }, ...owners.map((o) => ({ json: o.json }))];
 """
 
 
@@ -317,13 +352,33 @@ WITH due AS (
   RETURNING messages.id, messages.lead_id, messages.body, messages.created_at
 )
 SELECT mk.id, mk.lead_id, mk.body, round(extract(epoch FROM now() - mk.created_at) / 60) AS minutes,
-       l.channel, l.username, l.name, s.name AS studio_name
+       l.channel, l.username, l.name, s.name AS studio_name, s.owner_alert_email,
+       -- her reply failed to send, and the owner was already emailed about it
+       EXISTS (SELECT 1 FROM dead_letters d WHERE d.reason = 'ig_send_failed'
+                  AND d.payload->>'lead_id' = mk.lead_id::text AND d.created_at >= mk.created_at) AS owner_told
   FROM marked mk JOIN leads l ON l.id = mk.lead_id JOIN studios s ON s.id = l.studio_id;
 """
 
 UNANSWERED_EMAIL_JS = LEAD_LABEL + r"""
 const rows = $input.all().map((i) => i.json).filter((r) => r.id);
 if (!rows.length) return [];
+// Each studio owner also gets one plain-words email for her own leads, so she
+// can answer by hand while we fix it.
+const byOwner = {};
+for (const r of rows) {
+  const owner = String(r.owner_alert_email || '').trim();
+  if (!owner || owner === 'founders' || r.owner_told) continue;
+  (byOwner[owner] = byOwner[owner] || []).push(r);
+}
+const ownerEmails = Object.entries(byOwner).map(([owner, rs]) => { const one = rs.length === 1; return { json: {
+  to: owner,
+  subject: one ? `${leadLabel(rs[0])} is waiting for a reply` : `${rs.length} people are waiting for a reply`,
+  heading: `${one ? 'This message has' : 'These messages have'} had no reply from the AI for ${Math.max(...rs.map((r) => r.minutes))}+ minutes. Something on our side is stuck.`,
+  lines: [
+    ...rs.map((r) => `${leadLabel(r)} on ${r.channel === 'instagram' ? 'Instagram' : r.channel}, ${r.minutes} min ago: "${String(r.body || '').slice(0, 200)}"`),
+    `Please reply to ${one ? 'her' : 'them'} yourself. When you reply from Instagram, the AI steps back from that conversation; you can hand it back with Resume.`,
+  ],
+  note: 'Loop Logic has been told and is fixing it.' } }; });
 return [{ json: {
   to: 'founders',
   subject: `${rows.length === 1 ? leadLabel(rows[0]) + ' has' : rows.length + ' leads have'} had NO reply for ${Math.max(...rows.map((r) => r.minutes))}+ minutes`,
@@ -331,8 +386,9 @@ return [{ json: {
   lines: [
     ...rows.map((r) => `${leadLabel(r)} (${r.studio_name}), ${r.minutes} min ago: "${String(r.body || '').slice(0, 200)}"`),
     'Likely causes: a workflow error, an Instagram token problem, or n8n down. Check the error emails and dead_letters. Reply to her by hand if it still matters.',
+    ...(ownerEmails.length ? ['The studio owner has been emailed and asked to reply herself.'] : []),
   ],
-} }];
+} }, ...ownerEmails];
 """
 
 # I2 — daily: every booking link a studio has given us.

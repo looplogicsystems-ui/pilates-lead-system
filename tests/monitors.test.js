@@ -24,6 +24,10 @@ module.exports = async () => {
   ok('nothing unanswered -> no email', r.length === 0);
   r = await run('monitor-unanswered.json', 'Build Alert', [{ id: 1, lead_id: 7, body: 'hello?', minutes: 7, channel: 'instagram', username: 'jess.moves', name: 'Jess', studio_name: 'Reform' }]);
   ok('unanswered -> one founder email naming the lead', r.length === 1 && r[0].to === 'founders' && /@jess\.moves \(Jess\) has had NO reply for 7\+ minutes/.test(r[0].subject));
+  const ur = (extra) => ({ id: 1, lead_id: 7, body: 'hello?', minutes: 7, channel: 'instagram', username: 'jess.moves', name: 'Jess', studio_name: 'Reform', owner_alert_email: 'owner@studio.com', ...extra });
+  r = await run('monitor-unanswered.json', 'Build Alert', [ur(), ur({ id: 2, lead_id: 8, username: 'amy.p', minutes: 12 }), ur({ id: 3, lead_id: 9, owner_alert_email: 'other@studio.com', owner_told: true }), ur({ id: 4, lead_id: 10, owner_alert_email: 'founders' })]);
+  ok('unanswered -> founders + one email per studio owner; not repeated if already told; none for "founders"', r.length === 2 && r[0].to === 'founders'
+     && /emailed/.test(r[0].lines.at(-1)) && r[1].to === 'owner@studio.com' && /2 people are waiting/.test(r[1].subject) && /12\+ minutes/.test(r[1].heading));
 
   // --- Booking link check
   const L = 'monitor-booking-links.json';

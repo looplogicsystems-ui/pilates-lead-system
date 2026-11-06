@@ -349,7 +349,7 @@ return out;
 SELECT $1::int AS lead_id, $2::text AS external_id, $3::text AS reply,
        NULLIF($4::text, '')::int AS outbound_message_id, $5::text AS account_ref,
        encode(ca.access_token_enc, 'base64') AS token_enc,
-       l.paused_by AS paused_by_now, l.username, l.name, s.name AS studio_name
+       l.paused_by AS paused_by_now, l.username, l.name, s.name AS studio_name, s.owner_alert_email
   FROM (SELECT 1) AS anchor
   LEFT JOIN channel_accounts ca ON ca.channel = 'instagram' AND ca.account_ref = $5 AND ca.active
   LEFT JOIN leads l ON l.id = $1::int
@@ -369,7 +369,7 @@ for (const item of $input.all()) {
   const j = item.json;
   const base = { lead_id: j.lead_id, external_id: j.external_id, outbound_message_id: j.outbound_message_id,
                  account_ref: j.account_ref, username: j.username, name: j.name, studio_name: j.studio_name,
-                 reply: j.reply };
+                 owner_alert_email: j.owner_alert_email, reply: j.reply };
   if (j.paused_by_now === 'staff_reply') { out.push({ json: { ...base, status: 'skipped' } }); continue; }
   try {
     if (!j.token_enc) throw new Error('no Instagram token stored for this account (reconnect it with a connect link)');
@@ -434,19 +434,32 @@ SELECT (SELECT id FROM dl) AS dead_letter_id;""",
     w.connect("Sent?", "Dead Letter: Send Failed", out=2)
 
     w.node("Email: Send Failed", "n8n-nodes-base.code", 2, [2620, 140], {"jsCode": LEAD_NAME_JS + r"""
-return $('Send IG Reply').all().filter((i) => i.json.status === 'failed').map((i) => {
+// Founders get the technical email; the studio owner gets a plain one so she
+// can answer the lead herself.
+return $('Send IG Reply').all().filter((i) => i.json.status === 'failed').flatMap((i) => {
   const j = i.json;
   const who = leadLabel({ channel: 'instagram', username: j.username, name: j.name });
-  return { json: {
+  const owner = String(j.owner_alert_email || '').trim();
+  const ownerEmail = (!owner || owner === 'founders') ? [] : [{ json: {
+    to: owner,
+    subject: `${who} didn\u2019t get a reply. Please answer her yourself`,
+    heading: `${who} messaged ${j.studio_name || 'you'} on Instagram, but Instagram refused the AI\u2019s reply, so she has had no answer.`,
+    lines: ['Please reply to her yourself in your Instagram messages.',
+            `What the AI was going to say, if it helps: "${String(j.reply || '').slice(0, 600)}"`,
+            ...(j.token_problem ? ['Your Instagram connection to Loop Logic seems to have stopped working, so other messages may be affected until it is reconnected. We\u2019ll email you a new connect link today.'] : [])],
+    buttons: [chatButton({ channel: 'instagram', username: j.username })].filter(Boolean),
+    note: 'Loop Logic has been told and is looking into it.',
+  } }];
+  return [{ json: {
     to: 'founders',
     subject: `Instagram reply NOT delivered: ${who} (${j.studio_name || 'unknown studio'})`,
     heading: `The AI wrote a reply to ${who}, but Instagram refused it, so she has had no answer.`,
     lines: [`Error: ${j.error}`,
             `The reply that didn't go out: "${String(j.reply || '').slice(0, 600)}"`,
             j.token_problem ? 'This looks like a token problem: send the studio a new connect link (ig_connect_link.py).' : 'Send it to her by hand from the studio’s Instagram if it still makes sense.',
-            'Saved in dead_letters.'],
+            'Saved in dead_letters.' + (ownerEmail.length ? ' The studio owner has been emailed and asked to reply herself.' : '')],
     buttons: [chatButton({ channel: 'instagram', username: j.username })].filter(Boolean),
-  } };
+  } }, ...ownerEmail];
 });
 """})
     w.connect("Dead Letter: Send Failed", "Email: Send Failed")
