@@ -19,9 +19,8 @@ adapters**, driven by per-studio configuration in Postgres:
 |---|---|---|
 | `Lead Brain` | `fvHhAUDCbVN9ELb0` | Channel-agnostic core. Resolves the studio, upserts the lead, runs the agent, books/escalates, **returns** a result. Never touches a webhook. |
 | `Channel Adapter: Instagram` | `OQMXzwDyu5YAmRTo` | GET verify + POST events on `/webhook/instagram`, HMAC signature, durable dedupe, looks up the lead's @username once, calls the brain, sends with **that studio's own encrypted token** (one send path for every studio). A reply typed by staff in the Instagram app pauses the AI for that lead. |
-| `Channel Adapter: Slack` | `px8F683kj1I8Sb9X` | Polls the lead channel, same contract, replies in-channel. |
 | `Follow-up Scheduler` | `fyk6eYsVGtUVS1dh` | Chases quiet leads with AI-written nudges on the studio's cadence. |
-| `Lead System — Error Handler` | `4L4K72aSSwiBcnjX` | Any execution error → a `dead_letters` row **and** an ops Slack alert. |
+| `Lead System — Error Handler` | `4L4K72aSSwiBcnjX` | Any execution error → a `dead_letters` row **and** a founder email (at most one per workflow per 10 min). |
 | `IG Connect` | `C5M1lM4n3FgKO0J1` | `/webhook/ig/connect`: a studio connects her Instagram from a signed, single-use link (`workflows/build/ig_connect_link.py <studio id>`). Token stored encrypted with `IG_TOKEN_KEY`. |
 | `IG Token Refresh` | `n56lLK7WRdYFesdW` | Daily: refreshes every Instagram token renewed >7 days ago; emails the founders on failure or <10 days to expiry. |
 | `Legal Pages (Privacy Policy)` | `SqkuTaitCtgEWn7O` | Serves the Meta-required privacy page. |
@@ -81,7 +80,7 @@ purpose" — the lead is paused, or the account was unknown.
   bookings to classes within ±15 minutes instead of requiring exact timestamp equality.
 - **The prompt no longer contradicts itself** about full classes, and the persona is templated from
   `studios.prompt_vars` instead of being string literals.
-- **Errors survive Slack.** The error handler persists to `dead_letters` before alerting.
+- **Errors are saved before anyone is told.** The error handler persists to `dead_letters` before emailing.
 
 ## Repo layout
 
@@ -91,8 +90,7 @@ purpose" — the lead is paused, or the account was unknown.
 - `db/migrate.sh` — applies all of them (works on a bare database).
 - `db/seed/local-ids.sql.example` — deployment-specific ids; copy to `local-ids.sql` (gitignored).
 - `workflows/*.json` — the live graphs, credential ids redacted to placeholders
-  (`POSTGRES_CRED_ID`, `OPENAI_CRED_ID`, `RESEND_CRED_ID`, `SLACK_LEAD_BOT_CRED_ID`,
-  `SLACK_OWNER_BOT_CRED_ID`, `SLACK_OPS_BOT_CRED_ID`). Instagram tokens are not n8n credentials:
+  (`POSTGRES_CRED_ID`, `OPENAI_CRED_ID`, `RESEND_CRED_ID`). Slack was removed on 2026-11-08. Instagram tokens are not n8n credentials:
   they live encrypted in `channel_accounts` (pilot build step 6).
 - `workflows/build/` — the generators that produce those JSON files, plus `deploy.sh`.
 - `workflows/legacy/` — the retired v2.0 monolith, kept as the rollback path.
@@ -116,7 +114,7 @@ nothing.
 - **Database.** The lead-system tables live in the **`postgres`** database (n8n's own tables are in
   `n8n`). `db/migrate.sh` targets `postgres` by default.
 - **Env vars** (host): `IG_VERIFY_TOKEN`, `IG_APP_SECRET`, `IG_APP_SECRET_INSTAGRAM`,
-  `OPS_SLACK_CHANNEL_ID`, plus `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` (nodes need `$env`) and
+  `IG_TOKEN_KEY`, `OWNER_LINK_SECRET`, `FOUNDER_ALERT_EMAILS`, plus `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` (nodes need `$env`) and
   `NODE_FUNCTION_ALLOW_BUILTIN=crypto` (signature check). Per-studio values are **not** env vars —
   they live in `studios` / `channel_accounts`.
 - **`N8N_ENCRYPTION_KEY` and `N8N_USER_MANAGEMENT_JWT_SECRET`.** If the JWT secret is unset, n8n
