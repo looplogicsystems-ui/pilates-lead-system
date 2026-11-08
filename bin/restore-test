@@ -51,10 +51,18 @@ for t in studios leads messages channel_accounts booking_links; do
     [ "$r" -gt 0 ] && ok "$t: $r rows restored (live now: $l)" || bad "$t: nothing restored"
 done
 w="$(q n8n 'SELECT count(*) FROM workflow_entity')"; [ "$w" -gt 0 ] && ok "n8n workflows: $w restored" || bad "no n8n workflows restored"
-cr="$(q n8n "SELECT md5(string_agg(id || data, ',' ORDER BY id)) FROM credentials_entity")"
-cl="$(live n8n "SELECT md5(string_agg(id || data, ',' ORDER BY id)) FROM credentials_entity")"
-[ -n "$cr" ] && [ "$cr" = "$cl" ] && ok "n8n credentials identical to live, so they decrypt with N8N_ENCRYPTION_KEY" \
-    || bad "n8n credentials differ from live (changed since the backup, or not restored)"
+# Compare credential by credential: one deleted or added since the backup
+# isn't a fault, but one present in both with different contents is.
+q    n8n "SELECT id || ' ' || md5(data) FROM credentials_entity" | LC_ALL=C sort > "$work/cred.restored"
+live n8n "SELECT id || ' ' || md5(data) FROM credentials_entity" | LC_ALL=C sort > "$work/cred.live"
+both="$(LC_ALL=C join "$work/cred.restored" "$work/cred.live")"
+same="$(printf '%s\n' "$both" | awk 'NF==3 && $2==$3' | wc -l)"
+changed="$(printf '%s\n' "$both" | awk 'NF==3 && $2!=$3' | wc -l)"
+gone="$(LC_ALL=C join -v1 "$work/cred.restored" "$work/cred.live" | wc -l)"
+added="$(LC_ALL=C join -v2 "$work/cred.restored" "$work/cred.live" | wc -l)"
+[ "$same" -gt 0 ] && [ "$changed" -eq 0 ] \
+    && ok "n8n credentials: $same identical to live, so they decrypt with N8N_ENCRYPTION_KEY ($gone deleted, $added added since the backup)" \
+    || bad "n8n credentials: $changed differ from live, $same identical ($gone deleted, $added added since the backup)"
 
 # Instagram tokens: decrypt each restored one inside the n8n container (it has
 # IG_TOKEN_KEY). Prints only whether it decrypted and its length.
