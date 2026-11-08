@@ -85,7 +85,7 @@ def conn(*pairs):
 #
 # CALLERS: set the Execute Workflow node to continue on error. An alert that
 # fails must never stop a lead from getting her reply; the failure still reaches
-# the Error Handler (dead letter + Slack) through this workflow's errorWorkflow.
+# the Error Handler (dead letter + founder email) through this workflow's errorWorkflow.
 
 BUILD_EMAIL_JS = r"""
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g,

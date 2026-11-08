@@ -126,7 +126,7 @@ node("When Called", "n8n-nodes-base.executeWorkflowTrigger", 1.1, [-460, 300],
      {"inputSource": "passthrough"})
 
 pg("Resolve Studio", [-240, 300], """-- Route the message to its studio. `account_ref` is the account the lead
--- messaged (IG entry.id / Slack channel id), NOT the lead's own id.
+-- messaged (IG entry.id), NOT the lead's own id.
 --
 -- LEFT JOINs from a one-row source so this ALWAYS returns exactly one row:
 -- an unmatched account comes back with studio_found = false rather than an

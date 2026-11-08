@@ -21,7 +21,6 @@ MONITOR_IDS = {"unanswered": "EgCJIgrxK5wyNEab", "links": "7LiRAztbJZSSzvfq", "w
 
 CREDS = {
     "POSTGRES_CRED_ID":      "VVIxtEmT1GWsEZn9",
-    "SLACK_OPS_BOT_CRED_ID": "jpK7Kf8K06tnadpR",
 }
 
 SETTINGS = {
@@ -35,7 +34,8 @@ SETTINGS = {
 
 ERROR_EMAIL_JS = r"""
 // H3: every workflow error emails the founders, at most once per workflow per
-// 10 minutes (an outage can fire dozens of errors). Slack still gets each one.
+// 10 minutes (an outage can fire dozens of errors). Every error is still saved
+// as a dead letter, and the weekly review counts them.
 // Never emails about Send Email's OWN failures: Send Email reports errors to
 // this workflow, so emailing through it again could loop forever.
 const e = $('On Workflow Error').first().json;
@@ -54,7 +54,7 @@ return [{ json: {
   lines: [
     `Error: ${msg.slice(0, 500)}`,
     dl.dead_letter_id ? `Saved as dead letter #${dl.dead_letter_id}.` : 'It could NOT be saved to dead_letters (is Postgres down?).',
-    'If a lead was mid-conversation, check she got a reply. More errors from this workflow in the next 10 minutes go to Slack only.',
+    'If a lead was mid-conversation, check she got a reply. More errors from this workflow in the next 10 minutes are saved as dead letters without another email.',
   ],
   buttons: (wfId && ex.id) ? [{ label: 'Open the failed run', url: `https://n8n.looplogicsystems.com/workflow/${wfId}/executions/${ex.id}` }] : [],
 } }];
@@ -67,7 +67,7 @@ def error_handler():
          "type": "n8n-nodes-base.errorTrigger", "typeVersion": 1,
          "position": [-260, 0], "parameters": {}},
 
-        # Persist first, then shout: a Slack post or email alone is no record.
+        # Persist first, then email: an email alone is no record.
         # Always returns one row; recent_same = errors from this workflow in
         # the last 10 minutes BEFORE this one (the insert isn't visible to it).
         {"id": "persist-dead-letter", "name": "Persist Dead Letter",
@@ -95,22 +95,6 @@ SELECT (SELECT id FROM ins) AS dead_letter_id,
          "credentials": {"postgres": {"id": "POSTGRES_CRED_ID", "name": "Postgres account"}},
          "onError": "continueRegularOutput", "retryOnFail": True, "alwaysOutputData": True},
 
-        {"id": "alert-owner-slack", "name": "Alert Owner (Slack)",
-         "type": "n8n-nodes-base.slack", "typeVersion": 2.3,
-         "position": [180, -100],
-         "parameters": {
-             "select": "channel",
-             "channelId": {"__rl": True, "value": "={{ $env.OPS_SLACK_CHANNEL_ID }}",
-                           "mode": "id"},
-             "text": ("=:rotating_light: *Lead system error* in \"{{ $('On Workflow Error').first().json.workflow.name }}\"\n"
-                      "Node: {{ $('On Workflow Error').first().json.execution.lastNodeExecuted }}\n"
-                      "Error: {{ $('On Workflow Error').first().json.execution.error && $('On Workflow Error').first().json.execution.error.message }}\n"
-                      "Execution: {{ $('On Workflow Error').first().json.execution.id }}\n"
-                      "_Persisted to dead_letters for replay._"),
-             "otherOptions": {}},
-         "credentials": {"slackApi": {"id": "SLACK_OPS_BOT_CRED_ID", "name": "Lead System Monitor"}},
-         "onError": "continueRegularOutput", "retryOnFail": True},
-
         {"id": "error-email", "name": "Founder Email?", "type": "n8n-nodes-base.code", "typeVersion": 2,
          "position": [180, 100], "parameters": {"jsCode": ERROR_EMAIL_JS.replace("__SEND_EMAIL_WF_ID__", SEND_EMAIL_WF_ID).strip()}},
         {"id": "error-send", "name": "Email Founders", "type": "n8n-nodes-base.executeWorkflow", "typeVersion": 1.2,
@@ -120,8 +104,7 @@ SELECT (SELECT id FROM ins) AS dead_letter_id,
     ]
     conns = {
         "On Workflow Error": {"main": [[{"node": "Persist Dead Letter", "type": "main", "index": 0}]]},
-        "Persist Dead Letter": {"main": [[{"node": "Alert Owner (Slack)", "type": "main", "index": 0},
-                                          {"node": "Founder Email?", "type": "main", "index": 0}]]},
+        "Persist Dead Letter": {"main": [[{"node": "Founder Email?", "type": "main", "index": 0}]]},
         "Founder Email?": {"main": [[{"node": "Email Founders", "type": "main", "index": 0}]]},
     }
     return {"id": "4L4K72aSSwiBcnjX", "name": "Lead System — Error Handler",

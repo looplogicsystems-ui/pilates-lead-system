@@ -2,7 +2,6 @@
 """Generate the channel adapters and the follow-up scheduler.
 
   workflows/channel-adapter-instagram.json
-  workflows/channel-adapter-slack.json
   workflows/followup-scheduler.json
 
 Each is written twice: redacted into workflows/ (committed) and with live
@@ -19,8 +18,6 @@ from ig_common import GRAPH, TOKEN_CRYPTO_JS, GRAPH_JS, LEAD_NAME_JS, SEND_IG_JS
 CREDS = {
     "POSTGRES_CRED_ID":        "VVIxtEmT1GWsEZn9",
     "OPENAI_CRED_ID":          "2dmtKOJYL68BMOyG",
-    "SLACK_LEAD_BOT_CRED_ID":  "4juRUVuQfSLuSC9y",
-    "SLACK_OWNER_BOT_CRED_ID": "AL4h8l7yMMNZHFBE",
 }
 
 # Send Email sub-workflow (build_pilot.py). Not a secret.
@@ -68,14 +65,6 @@ class WF:
         return self.node(name, "n8n-nodes-base.postgres", 2.6, pos, params,
                          credentials={"postgres": {"id": "POSTGRES_CRED_ID",
                                                    "name": "Postgres account"}}, **kw)
-
-    def slack(self, name, pos, channel_expr, text, cred, **kw):
-        return self.node(name, "n8n-nodes-base.slack", 2.3, pos, {
-            "select": "channel",
-            "channelId": {"__rl": True, "value": channel_expr, "mode": "id"},
-            "text": text, "otherOptions": {}},
-            credentials={"slackApi": {"id": cred, "name": "Slack"}},
-            onError="continueRegularOutput", retryOnFail=True, **kw)
 
     def send_email(self, name, pos):
         # An alert that fails must never stop anything else: continue on error.
@@ -551,138 +540,7 @@ return $input.all().map((i) => {
 
 
 # ===========================================================================
-# 2. Channel Adapter: Slack
-# ===========================================================================
-def slack_adapter(brain_id):
-    w = WF("Channel Adapter: Slack", "00000000-0000-4000-8000-00000000a002",
-           "px8F683kj1I8Sb9X")
-
-    w.node("Slack Poller", "n8n-nodes-base.scheduleTrigger", 1.2, [-460, 0], {
-        "rule": {"interval": [{"field": "minutes", "minutesInterval": 1}]}})
-
-    w.pg("Load Slack Accounts", [-240, 0], """-- Which Slack channels are we listening to, and for which studio.
-SELECT ca.account_ref AS channel_id, ca.studio_id
-  FROM channel_accounts ca
-  JOIN studios s ON s.id = ca.studio_id
- WHERE ca.channel = 'slack' AND ca.active AND s.active;""",
-         alwaysOutputData=True, retryOnFail=True)
-    w.connect("Slack Poller", "Load Slack Accounts")
-
-    w.node("Get Slack Messages", "n8n-nodes-base.slack", 2.3, [-20, 0], {
-        "resource": "channel", "operation": "history",
-        "channelId": {"__rl": True, "value": "={{ $json.channel_id }}", "mode": "id"},
-        "limit": 20, "filters": {}},
-        credentials={"slackApi": {"id": "SLACK_LEAD_BOT_CRED_ID",
-                                  "name": "Studio Lead Bot (Slack)"}},
-        onError="continueRegularOutput", retryOnFail=True, alwaysOutputData=True)
-    w.connect("Load Slack Accounts", "Get Slack Messages")
-
-    w.node("Filter New Lead Messages", "n8n-nodes-base.code", 2, [200, 0], {"jsCode": r"""
-// Cursor keeps the poll cheap; processed_messages (next node) is what actually
-// guarantees we never answer the same message twice across restarts.
-const sd = $getWorkflowStaticData('global');
-const items = $input.all();
-
-// First run after activation: jump the cursor to newest and skip the backlog,
-// so activating the workflow does not blast replies at old channel history.
-if (sd.slackLastTs === undefined) {
-  let mx = 0;
-  for (const it of items) { const t = parseFloat(it.json.ts); if (t > mx) mx = t; }
-  sd.slackLastTs = String(mx || (Date.now() / 1000));
-  return [];
-}
-
-const lastTs = parseFloat(sd.slackLastTs);
-let maxTs = lastTs;
-const out = [];
-for (const it of items) {
-  const m = it.json;
-  const ts = parseFloat(m.ts);
-  if (!ts || ts <= lastTs) continue;
-  if (m.bot_id || m.app_id || m.subtype) continue; // ignore bots / apps / system events
-  if (!m.user || !m.text) continue;
-  if (ts > maxTs) maxTs = ts;
-  out.push({ json: {
-    slack_user: m.user,
-    slack_ts: m.ts,
-    text: m.text,
-    account_ref: m.channel ?? $('Get Slack Messages').first().json.channel ?? '',
-  } });
-}
-sd.slackLastTs = String(maxTs);
-return out;
-"""})
-    w.connect("Get Slack Messages", "Filter New Lead Messages")
-
-    w.pg("Claim Message IDs", [420, 0], """INSERT INTO processed_messages (provider, provider_msg_id)
-VALUES ('slack', $1)
-ON CONFLICT (provider, provider_msg_id) DO NOTHING
-RETURNING provider_msg_id;""",
-         replacement="={{ [$json.slack_ts] }}",
-         alwaysOutputData=True, retryOnFail=True)
-    w.connect("Filter New Lead Messages", "Claim Message IDs")
-
-    w.node("Drop Replays", "n8n-nodes-base.code", 2, [640, 0], {"jsCode": r"""
-const claimed = new Set(
-  $input.all().map((i) => i.json.provider_msg_id).filter(Boolean)
-);
-return $('Filter New Lead Messages').all().filter((i) => claimed.has(i.json.slack_ts));
-"""})
-    w.connect("Claim Message IDs", "Drop Replays")
-
-    w.node("Build Inbound Contract", "n8n-nodes-base.code", 2, [860, 0], {
-        "mode": "runOnceForEachItem", "jsCode": r"""
-// Slack's conversations.history rows do not carry the channel id, so fall back
-// to the account we polled for this batch.
-const acct = $json.account_ref || $('Load Slack Accounts').first().json.channel_id;
-return { json: {
-  channel: 'slack',
-  account_ref: String(acct),
-  external_id: String($json.slack_user ?? 'slack-unknown'),
-  name: null,
-  message: String($json.text ?? ''),
-  provider_message_id: $json.slack_ts,
-  received_at: new Date(Number($json.slack_ts) * 1000).toISOString(),
-} };
-"""})
-    w.connect("Drop Replays", "Build Inbound Contract")
-
-    w.call_brain("Call Lead Brain", [1080, 0], brain_id)
-    w.connect("Build Inbound Contract", "Call Lead Brain")
-
-    w.node("Should Reply?", "n8n-nodes-base.if", 2.2, [1300, 0], {
-        "conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True,
-                                   "typeValidation": "loose"},
-                       "conditions": [
-                           {"id": "send-flag", "leftValue": "={{ $json.send }}",
-                            "rightValue": "true",
-                            "operator": {"type": "boolean", "operation": "true",
-                                         "singleValue": True}},
-                           {"id": "has-text", "leftValue": "={{ $json.reply }}",
-                            "rightValue": "",
-                            "operator": {"type": "string", "operation": "notEmpty",
-                                         "singleValue": True}}],
-                       "combinator": "and"}, "options": {}})
-    w.connect("Call Lead Brain", "Should Reply?")
-
-    w.pg("Load Reply Channel", [1520, -60], """SELECT slack_lead_channel_id FROM studios WHERE id = $1;""",
-         replacement="={{ [$json.studio_id] }}", retryOnFail=True)
-    w.connect("Should Reply?", "Load Reply Channel", out=0)
-
-    w.slack("Slack Reply", [1740, -60],
-            "={{ $json.slack_lead_channel_id }}",
-            "={{ $('Call Lead Brain').item.json.reply }}",
-            "SLACK_LEAD_BOT_CRED_ID")
-    w.connect("Load Reply Channel", "Slack Reply")
-
-    w.node("No Reply Sent", "n8n-nodes-base.noOp", 1, [1520, 100], {})
-    w.connect("Should Reply?", "No Reply Sent", out=1)
-
-    return w
-
-
-# ===========================================================================
-# 3. Follow-up Scheduler
+# 2. Follow-up Scheduler
 # ===========================================================================
 def followup():
     """Pilot build step 7 (§G). Every 15 minutes:
@@ -718,7 +576,7 @@ WITH last_in AS (
 ), cand AS (
   SELECT l.id AS lead_id, l.external_id, l.channel, l.status, l.username, l.name,
          s.id AS studio_id, s.name AS studio_name, s.prompt_vars, s.owner_alert_email, s.owner_name,
-         s.slack_lead_channel_id, s.max_nudges,
+         s.max_nudges,
          li.t AS last_inbound_at, li.last_id AS last_inbound_id, lm.t AS last_msg_at, COALESCE(n.n, 0) AS nudges_sent,
          bl.id AS link_id, bl.short_code,
          CASE
@@ -731,8 +589,8 @@ WITH last_in AS (
            WHEN COALESCE(n.n, 0) BETWEEN 1 AND s.max_nudges - 1
                 AND lm.t < now() - make_interval(mins => s.followup_final_after_minutes) THEN 'quiet'
          END AS kind,
-         -- Instagram's 24h window (30 min of margin); Slack has none.
-         (l.channel <> 'instagram' OR li.t > now() - interval '23 hours 30 minutes') AS window_open,
+         -- Instagram's 24h window (30 min of margin).
+         (li.t > now() - interval '23 hours 30 minutes') AS window_open,
          (EXTRACT(HOUR FROM now() AT TIME ZONE s.timezone) BETWEEN 8 AND 20) AS daytime,
          encode(ca.access_token_enc, 'base64') AS token_enc,
          (SELECT json_agg(th ORDER BY th.created_at)
@@ -750,7 +608,7 @@ WITH last_in AS (
                         WHERE c.studio_id = l.studio_id AND c.channel = 'instagram' AND c.active
                         ORDER BY c.connected_at DESC NULLS LAST LIMIT 1) ca ON l.channel = 'instagram'
    WHERE NOT l.ai_paused
-     AND l.channel IN ('instagram', 'slack')
+     AND l.channel = 'instagram'
      AND l.status IN ('engaged', 'link_sent')
      AND lm.direction = 'outbound' AND lm.author = 'ai'
      AND li.t > now() - interval '48 hours'
@@ -854,31 +712,19 @@ return { json: { ...keep, text, skip: false } };
     # nothing is logged (so nothing sent) if she was paused or wrote back.
     w.pg("Log Nudge", [860, -100], """INSERT INTO messages (lead_id, direction, channel, body, author, nudge, created_at)
 SELECT $1::int, 'outbound', $2, $3, 'ai', true, now()
- WHERE NOT $11::boolean
+ WHERE NOT $10::boolean
    AND NOT (SELECT ai_paused FROM leads WHERE id = $1::int)
    -- By id, not timestamp: n8n rounds Postgres's microseconds to milliseconds,
    -- which made her own last message look newer than itself (seen live 2026-10-30).
    AND NOT EXISTS (SELECT 1 FROM messages WHERE lead_id = $1::int AND direction = 'inbound'
                     AND id > $4::int)
 RETURNING id AS message_id, lead_id, channel, body AS text, $5::text AS external_id, $6::text AS kind,
-          $7::boolean AS is_final, NULLIF($8::text, '')::int AS link_id, $9::text AS token_enc,
-          $10::text AS slack_channel;""",
+          $7::boolean AS is_final, NULLIF($8::text, '')::int AS link_id, $9::text AS token_enc;""",
          replacement=("={{ [$json.lead_id, $json.channel, $json.text ?? '', $json.last_inbound_id, $json.external_id, "
                       "$json.kind, !!$json.is_final, $json.link_id ?? '', $json.token_enc ?? '', "
-                      "$json.slack_lead_channel_id ?? '', !!$json.skip] }}"),
+                      "!!$json.skip] }}"),
          alwaysOutputData=True, retryOnFail=True)
     w.connect("Finish Nudge", "Log Nudge")
-
-    w.node("Which Channel?", "n8n-nodes-base.switch", 3.4, [1080, -100], {
-        "rules": {"values": [
-            {"conditions": {"options": {"caseSensitive": True, "leftValue": "", "typeValidation": "strict",
-                                        "version": 3},
-                            "conditions": [{"id": f"ch-{k}", "leftValue": "={{ $json.channel }}", "rightValue": k,
-                                            "operator": {"type": "string", "operation": "equals"}}],
-                            "combinator": "and"},
-             "renameOutput": True, "outputKey": k} for k in ("instagram", "slack")]},
-        "options": {}})
-    w.connect("Log Nudge", "Which Channel?")
 
     w.node("Send IG Nudge", "n8n-nodes-base.code", 2, [1300, -200], {"jsCode": TOKEN_CRYPTO_JS + GRAPH_JS + SEND_IG_JS + r"""
 const out = [];
@@ -893,16 +739,7 @@ for (const item of $input.all()) {
 }
 return out;
 """})
-    w.connect("Which Channel?", "Send IG Nudge", out=0)
-
-    w.slack("Send Slack Nudge", [1300, 0], "={{ $json.slack_channel }}", "={{ $json.text }}",
-            "SLACK_LEAD_BOT_CRED_ID")
-    w.connect("Which Channel?", "Send Slack Nudge", out=1)
-    w.node("Slack Sent", "n8n-nodes-base.code", 2, [1520, 0], {"jsCode": r"""
-return $('Which Channel?').all(1).filter((i) => i.json.channel === 'slack' && i.json.message_id)   // output 1 = slack
-  .map((i) => ({ json: { ...i.json, status: 'sent', mid: '' } }));
-"""})
-    w.connect("Send Slack Nudge", "Slack Sent")
+    w.connect("Log Nudge", "Send IG Nudge")
 
     w.node("Nudge Sent?", "n8n-nodes-base.if", 2.2, [1520, -200], {
         "conditions": {"options": {"version": 2, "leftValue": "", "caseSensitive": True, "typeValidation": "strict"},
@@ -929,7 +766,6 @@ SELECT (SELECT id FROM m) AS message_id;""",
          replacement="={{ [$json.message_id, $json.mid ?? '', $json.link_id ?? '', $json.kind, $json.lead_id, !!$json.is_final] }}",
          onError="continueRegularOutput", retryOnFail=True)
     w.connect("Nudge Sent?", "Record Nudge", out=0)
-    w.connect("Slack Sent", "Record Nudge")
 
     w.pg("Dead Letter: Nudge Failed", [1740, -280], """-- Not delivered: take it out of the thread and keep it as a dead letter.
 WITH dl AS (
@@ -1005,7 +841,6 @@ def main():
 
     targets = [
         (instagram(brain_id), "channel-adapter-instagram.json"),
-        (slack_adapter(brain_id), "channel-adapter-slack.json"),
         (followup(), "followup-scheduler.json"),
     ]
 

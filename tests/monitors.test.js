@@ -7,7 +7,7 @@ module.exports = async () => {
   let r = await eh({ dead_letter_id: 9, recent_same: 0 });
   ok('error -> founder email naming workflow, step, error, run link', r.length === 1 && /System error in "Lead Brain"/.test(r[0].subject) && /at "AI Agent"/.test(r[0].heading)
      && /OpenAI 500/.test(r[0].lines[0]) && r[0].buttons[0].url.endsWith('/workflow/fvHhAUDCbVN9ELb0/executions/123'));
-  ok('2nd error from same workflow within 10 min -> no email (Slack only)', (await eh({ dead_letter_id: 10, recent_same: 1 })).length === 0);
+  ok('2nd error from same workflow within 10 min -> no email (dead letter only)', (await eh({ dead_letter_id: 10, recent_same: 1 })).length === 0);
   r = await eh({});
   ok('Postgres down (no dead letter) -> still emails, says it could not be saved', r.length === 1 && /could NOT be saved/.test(r[0].lines[1]));
   ok('Send Email failing -> never emails through itself (no loop)', (await eh({ dead_letter_id: 11, recent_same: 0 }, { ...err, workflow: { id: 'PQWBdER3x291uWeU', name: 'Send Email' } })).length === 0);

@@ -29,8 +29,6 @@ module.exports = async () => {
   r = await run(F, 'Send IG Nudge', [{ message_id: 99, lead_id: 7, external_id: 'L1', text: 'x', token_enc: lead.token_enc, kind: 'quiet' }],
     { env: ENV, http: async () => reply(400, { error: { message: 'outside of allowed window', code: 10, error_subcode: 2534022 } }) });
   ok('refused by Instagram -> failed with reason', r[0].status === 'failed' && /code 10\/2534022/.test(r[0].error));
-  r = await run(F, 'Slack Sent', [{}], { nodes: { 'Which Channel?': { branches: [[{ channel: 'instagram', message_id: 1 }], [{ channel: 'slack', message_id: 2 }]] } } });
-  ok('slack branch reads output 1 of the split', r.length === 1 && r[0].message_id === 2);
   r = await run(F, 'Email: Over to You', [{}], { nodes: { 'Send or Hand Over?': { branches: [[{ action: 'send' }],
     [{ action: 'hand_over', kind: 'link', channel: 'instagram', username: 'jess.moves', name: 'Jess', owner_alert_email: 'owner@studio.com' }]] } } });
   ok('hand-over email: owner, 24h rule, Open chat', r.length === 1 && r[0].to === 'owner@studio.com' && /went quiet/.test(r[0].subject) && /never opened it/.test(r[0].heading) && /24 hours/.test(r[0].lines[0]) && r[0].buttons[0].label === 'Open chat');
