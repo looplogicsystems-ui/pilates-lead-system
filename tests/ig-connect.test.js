@@ -23,7 +23,7 @@ module.exports = async () => {
   const meta = (o = {}) => async (req) => {
     calls.push(req);
     if (req.url.includes('oauth/access_token')) return o.short || reply(200, { data: [{ access_token: 'SHORT_' + 'a'.repeat(60), user_id: 9, permissions: 'instagram_business_basic,instagram_business_manage_messages' }] });
-    if (req.url.endsWith('/access_token')) return reply(200, { access_token: 'LONG_' + 'b'.repeat(60), expires_in: 5183944 });
+    if (req.url.endsWith('/access_token')) return o.long || reply(200, { access_token: 'LONG_' + 'b'.repeat(60), expires_in: 5183944 });
     if (req.url.endsWith('/me')) return o.me || reply(200, { user_id: '17841414365226685', username: 'talha08860', name: 'Talha', account_type: 'BUSINESS' });
     if (req.url.endsWith('/subscribed_apps')) return reply(200, { success: true });
   };
@@ -40,6 +40,11 @@ module.exports = async () => {
   ok('messaging permission unticked -> no_message_permission', !r.ok && r.outcome === 'no_message_permission');
   r = (await run(F, 'Connect Account', [st], { env: ENV, http: meta({ me: reply(400, { error: { message: 'bad LONG_' + 'b'.repeat(60), code: 190 } }) }) }))[0];
   ok('Meta error -> error, token scrubbed', !r.ok && r.outcome === 'error' && !JSON.stringify(r).includes('LONG_') && /code 190/.test(r.error));
+  // Fix A (2026-11-08): an account with no role on our app is refused at the token exchange
+  r = (await run(F, 'Connect Account', [st], { env: ENV, http: meta({ long: reply(400, { error: { message: 'Unsupported request - method type: get', code: 100 } }) }) }))[0];
+  ok('no app role ("Unsupported request") -> no_app_role, not a generic error', !r.ok && r.outcome === 'no_app_role' && /Unsupported request/.test(r.error));
+  r = (await run(F, 'Connect Account', [st], { env: ENV, http: meta({ long: reply(400, { error: { message: 'Invalid OAuth access token', code: 190 } }) }) }))[0];
+  ok('other token-exchange error -> still a generic error', !r.ok && r.outcome === 'error');
   r = (await run(F, 'Connect Account', [{ ...st, link_used: true }], { env: ENV, http: meta() }))[0];
   ok('used link -> refused before calling Instagram', !r.ok && r.outcome === 'link_used');
   const cn = { ok: true, studio_id: 2, studio_name: 'Reform Collective', username: 'talha08860', name: 'Talha', account_ref: '1', account_type: 'BUSINESS', expires_in: 5183944, subscribed: true };
@@ -47,4 +52,11 @@ module.exports = async () => {
   ok('"Connected ✓" page + founder email', /Connected/.test(r.html) && /Instagram connected: @talha08860/.test(r.email.subject));
   r = (await run(F, 'Result', [{ outcome: 'other_studio' }], { nodes: { 'Connect Account': [cn] } }))[0];
   ok('other studio -> refused page + FAILED email', /Already connected elsewhere/.test(r.html) && /FAILED \(other_studio\)/.test(r.email.subject));
+  const nr = { ok: false, outcome: 'no_app_role', studio_id: 5, studio_name: 'C1 Test Studio', error: 'long-lived token: HTTP 400: Unsupported request - method type: get (code 100)' };
+  r = (await run(F, 'Result', [nr], { nodes: { 'Connect Account': [nr] } }))[0];
+  ok('no app role -> page says accept the Tester invite, tap the SAME link', /One step left/.test(r.html) && /Tester invites/.test(r.html) && /same link again/.test(r.html)
+     && /FAILED \(no_app_role\)/.test(r.email.subject) && r.email.lines.some((l) => /no role on our Meta app/.test(l)));
+  r = (await run(F, 'Result', [{ outcome: 'studio_has_account', existing_username: 'old_acct' }], { nodes: { 'Connect Account': [cn] } }))[0];
+  ok('second account on one studio -> refused page + email naming the existing @account', /A different account is already connected/.test(r.html)
+     && /FAILED \(studio_has_account\)/.test(r.email.subject) && r.email.lines.some((l) => /@old_acct/.test(l) && /One account per studio/.test(l)));
 };

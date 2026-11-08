@@ -725,9 +725,19 @@ try {
   const perms = Array.isArray(s.permissions) ? s.permissions : String(s.permissions || '').split(',');
   if (!perms.map((p) => p.trim()).includes('instagram_business_manage_messages'))
     return [{ json: { ...base, ok: false, outcome: 'no_message_permission' } }];
-  // 2. short-lived -> long-lived (~60 days)
-  const long = await graphCall(this, { what: 'long-lived token', url: 'https://graph.instagram.com/access_token',
-    qs: { grant_type: 'ig_exchange_token', client_secret: secret, access_token: s.access_token }, tries: 2 });
+  // 2. short-lived -> long-lived (~60 days). An account with NO role on our
+  // Meta app gets through login and consent, then is refused right here with
+  // "Unsupported request" (found 2026-11-04). She has to accept our Instagram
+  // Tester invite first; the link isn't used up, so she taps it again after.
+  let long;
+  try {
+    long = await graphCall(this, { what: 'long-lived token', url: 'https://graph.instagram.com/access_token',
+      qs: { grant_type: 'ig_exchange_token', client_secret: secret, access_token: s.access_token }, tries: 2 });
+  } catch (e) {
+    if (/Unsupported request/i.test(String(e.message)))
+      return [{ json: { ...base, ok: false, outcome: 'no_app_role', error: String(e.message).slice(0, 400) } }];
+    throw e;
+  }
   // 3. which account is this? user_id is what webhooks carry as the account id.
   const me = await graphCall(this, { what: 'account lookup', url: '__GRAPH__/me',
     qs: { fields: 'user_id,username,name,account_type' }, token: long.access_token, tries: 3 });
@@ -753,12 +763,20 @@ SAVE_ACCOUNT_SQL = """
 -- One statement, always one row. Refuses to move an account that is already
 -- connected to a DIFFERENT studio; re-connecting to the same studio just
 -- replaces the token (that is also how a revoked token is fixed: a new link).
+-- Also refuses a SECOND active Instagram account on one studio: follow-up
+-- nudges are sent with the studio's account, so a second one would send some
+-- with the wrong token. To switch accounts, set the old row inactive first.
+-- A refused link isn't used up.
 WITH clash AS (
   SELECT 1 FROM channel_accounts
    WHERE channel = 'instagram' AND account_ref = $3 AND studio_id <> $2::int
+), other_acct AS (
+  SELECT ig_username FROM channel_accounts
+   WHERE channel = 'instagram' AND studio_id = $2::int AND account_ref <> $3 AND active
+   LIMIT 1
 ), used AS (
   INSERT INTO ig_connect_uses (nonce, studio_id, account_ref, ig_username)
-  SELECT $1, $2::int, $3, $4 WHERE NOT EXISTS (SELECT 1 FROM clash)
+  SELECT $1, $2::int, $3, $4 WHERE NOT EXISTS (SELECT 1 FROM clash) AND NOT EXISTS (SELECT 1 FROM other_acct)
   ON CONFLICT (nonce) DO NOTHING
   RETURNING nonce
 ), acct AS (
@@ -774,9 +792,11 @@ WITH clash AS (
    WHERE channel_accounts.studio_id = EXCLUDED.studio_id
   RETURNING id
 )
-SELECT CASE WHEN EXISTS (SELECT 1 FROM acct)  THEN 'connected'
-            WHEN EXISTS (SELECT 1 FROM clash) THEN 'other_studio'
-            ELSE 'link_used' END AS outcome;
+SELECT CASE WHEN EXISTS (SELECT 1 FROM acct)       THEN 'connected'
+            WHEN EXISTS (SELECT 1 FROM clash)      THEN 'other_studio'
+            WHEN EXISTS (SELECT 1 FROM other_acct) THEN 'studio_has_account'
+            ELSE 'link_used' END AS outcome,
+       (SELECT ig_username FROM other_acct) AS existing_username;
 """
 
 RESULT_JS = PAGE_JS + r"""
@@ -789,6 +809,8 @@ const P = {
   link_used:     ['This link was already used', 'Each connect link works once. If you need to connect again, ask us for a new one.'],
   no_studio:     ['This link isn’t valid', 'Ask us for a new connect link.'],
   no_message_permission: ['Almost there', 'Instagram didn’t give us permission to manage messages, which is what replies need. Tap the link again and leave every permission switched on.'],
+  no_app_role:   ['One step left', 'Your Instagram account needs our invite before it can connect. In Instagram, go to Settings → Apps and websites → Tester invites and accept it. Then tap this same link again. Nothing was changed on your account.'],
+  studio_has_account: ['A different account is already connected', `${c.studio_name || 'This studio'} already has another Instagram account connected, so we didn’t change anything. We’ve been told and will be in touch.`],
   error:         ['Something went wrong', 'We couldn’t finish connecting. Nothing was changed on your account. We’ve been told and will send you a new link.'],
 };
 const [title, msg] = P[outcome] || P.error;
@@ -797,6 +819,8 @@ const lines = [
   c.username ? `Account: @${c.username}${c.name ? ' (' + c.name + ')' : ''}, id ${c.account_ref}, type ${c.account_type || '?'}` : null,
   outcome === 'connected' ? `Token valid until about ${new Date(Date.now() + c.expires_in * 1000).toISOString().slice(0, 10)}; refreshed automatically.` : null,
   outcome === 'connected' && !c.subscribed ? `WARNING: subscribing this account to message webhooks failed (${c.subscribe_error || 'no success flag'}). Its DMs will not arrive until that is fixed.` : null,
+  outcome === 'no_app_role' ? 'Cause: this account has no role on our Meta app, so Instagram refused the token exchange. Add it as an Instagram Tester (Meta app dashboard → App roles → Roles → Add People), wait until she accepts the invite (Instagram → Settings → Apps and websites → Tester invites), then she taps the same link again. It isn’t used up.' : null,
+  outcome === 'studio_has_account' ? `Cause: this studio already has an active Instagram account${$json.existing_username ? ' (@' + $json.existing_username + ')' : ''}. One account per studio: follow-up nudges are sent with the studio's account. To switch, set the old account inactive (UPDATE channel_accounts SET active = false WHERE …), then she taps the same link again. It isn’t used up.` : null,
   c.error ? `Error: ${c.error}` : null,
 ].filter(Boolean);
 return [{ json: {

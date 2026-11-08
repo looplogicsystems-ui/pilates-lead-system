@@ -33,6 +33,18 @@ module.exports = async () => {
   ok('later replies do not', !/AI assistant/.test(d.final_reply));
   d = await decide({ reply: 'Yay, see you there!', intent: 'lead_booked' });
   ok('"booked!" -> first-visit tips added once', /grip socks/.test(d.final_reply) && d.owner_email.buttons[0].label === 'Confirm booked');
+  // Fix C (2026-11-08): the "tips already said" check uses the studio's OWN tips
+  const count = (t, re) => (t.match(re) || []).length;
+  d = await decide({ reply: 'Yay! Bring grip socks and come 10 minutes early.', intent: 'lead_booked' });
+  ok('model already wrote the tips -> not added again', count(d.final_reply, /grip socks/g) === 1);
+  const park = { ...cfg, prompt_vars: { ...cfg.prompt_vars, first_visit_tips: 'Park on Aldrich St and wear something you can move in.' } };
+  d = await decide({ reply: 'Booked! Bring grip socks.', intent: 'lead_booked' }, { c: park });
+  ok('another studio: demo wording in the reply no longer blocks HER tips', /Park on Aldrich/.test(d.final_reply));
+  d = await decide({ reply: 'Amazing! Park on Aldrich and wear comfy layers.', intent: 'lead_booked' }, { c: park });
+  ok('another studio: her tips already in the reply -> not added again', count(d.final_reply, /Aldrich/g) === 1);
+  const demoTips = { ...cfg, prompt_vars: { ...cfg.prompt_vars, first_visit_tips: 'Come about 10 minutes early for a quick waiver and a walkthrough of the springs, and bring grip socks (or grab a pair at the front desk for $18).' } };
+  d = await decide({ reply: 'See you at Reformer Flow tomorrow, come early!', intent: 'lead_booked' }, { c: demoTips });
+  ok('a normal "see you tomorrow" reply still gets the tips', /walkthrough of the springs/.test(d.final_reply));
   d = await decide('not json at all');
   ok('unparseable model output -> escalate, never sent raw', d.intent === 'escalate' && d.final_reply === cfg.prompt_vars.escalation_line);
   d = await decide({ reply: 'x', intent: 'escalate', escalate_reason: 'injury' }, { up: { id: 42, username: 'jess.moves', name: 'Jess Carter' } });

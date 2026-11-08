@@ -590,6 +590,24 @@ if (intent === 'send_booking_link') {
   }
 }
 
+// Did the model already pass on this studio's first-visit tips? Checked against
+// HER tips, not fixed words (the old check only knew the demo studio's wording):
+// a reply sentence counts as a tip when at least 2 of its distinctive words, and
+// more than half of them, also appear in her tips.
+function tipsAlreadySaid(text, tips) {
+  const STOP = new Set(('about after again also been before bring come could does each every first from have here into just like '
+    + 'make more most need only other over please really some sure than that their them then there these they this those time '
+    + 'very want were what when where which while will with would your youre minutes class classes see you there great amazing').split(' '));
+  const words = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9\s]+/g, ' ').split(/\s+/)
+    .filter((w) => w.length >= 4 && !STOP.has(w));
+  const tipWords = new Set(words(tips));
+  return String(text || '').split(/[.!?\n]+/).some((sentence) => {
+    const ws = words(sentence);
+    const hits = ws.filter((w) => tipWords.has(w)).length;
+    return hits >= 2 && hits / ws.length > 0.5;
+  });
+}
+
 // --- compose the final message --------------------------------------------
 // The lead gets a tracked short link (Link Redirect records the click, then
 // sends her to `link`). The owner email shows the real destination.
@@ -598,8 +616,8 @@ const trackedLink = shortCode ? `__LINK_BASE__${shortCode}` : null;
 let final;
 if (intent === 'send_booking_link')                     final = `${reply}\n${trackedLink}`;
 else if (intent === 'lead_booked' && v.first_visit_tips)
-  // Once only: skip if the model already wrote tips despite being told not to.
-  final = /grip socks|minutes early|waiver/i.test(reply) ? reply : `${reply}\n\n${v.first_visit_tips}`;
+  // Once only: skip if the model already wrote this studio's tips itself.
+  final = tipsAlreadySaid(reply, v.first_visit_tips) ? reply : `${reply}\n\n${v.first_visit_tips}`;
 else if (intent === 'escalate')                         final = linkProblem ? reply : holding;   // never let the model answer what it must hand over
 else                                                    final = reply;
 if (ctx.first_message && v.ai_disclosure) final = `${final}\n\n${v.ai_disclosure}`;
