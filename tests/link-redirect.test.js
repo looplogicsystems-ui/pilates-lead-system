@@ -9,7 +9,7 @@ module.exports = async () => {
   ok("Meta scanner posing as Android Chrome, from Meta's network (AS32934) -> not counted",
      (await visit(ANDROID, { 'x-client-asn': '32934', 'x-client-org': 'Facebook, Inc.' })).crawler);
   ok('same scanner, network named only -> not counted', (await visit(ANDROID, { 'x-client-org': 'Meta Platforms, Inc.' })).crawler);
-  ok('real lead tapping in Instagram, on her phone network -> COUNTED', !(await visit(IG_INAPP, { 'x-client-asn': '21928', 'x-client-org': 'T-Mobile USA, Inc.' })).crawler);
+  ok('real lead tapping in Instagram, on their phone network -> COUNTED', !(await visit(IG_INAPP, { 'x-client-asn': '21928', 'x-client-org': 'T-Mobile USA, Inc.' })).crawler);
   ok('real Android Chrome tap from an ISP -> COUNTED', !(await visit(ANDROID, { 'x-client-asn': '7922', 'x-client-org': 'Comcast Cable' })).crawler);
   ok('no user agent -> not counted', (await visit('')).crawler);
   const v = await visit(ANDROID, { 'x-client-asn': '32934', 'x-client-org': 'Facebook, Inc.' });

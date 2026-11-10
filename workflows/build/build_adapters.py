@@ -261,7 +261,7 @@ return $('Extract IG Events').all().filter((i) => claimed.has(i.json.ig_mid));
         "options": {}})
     w.connect("Drop Replays", "Inbound or Echo?")
 
-    # --- inbound: who is she? (looked up once), then the brain -------------
+    # --- inbound: who is it? (looked up once), then the brain -------------
     w.pg("Load Account & Lead", [860, 60], """-- Always exactly one row per message. Carries the message fields through
 -- (a Postgres node outputs only its query result) plus this account's
 -- ENCRYPTED token and whether this lead's profile still needs looking up.
@@ -279,8 +279,8 @@ SELECT $1::text AS account_ref, $2::text AS ig_sender, $3::text AS ig_mid,
 
     w.node("Look Up Profile", "n8n-nodes-base.code", 2, [1080, 60], {"jsCode": TOKEN_CRYPTO_JS + GRAPH_JS + r"""
 // Instagram's webhook gives only a numeric id. Once per lead (retried at most
-// weekly if it fails) we ask Instagram for her @username and name, so owner
-// emails can say who she is. Builds the channel-agnostic contract the Lead
+// weekly if it fails) we ask Instagram for their @username and name, so owner
+// emails can say who they are. Builds the channel-agnostic contract the Lead
 // Brain accepts — no studio_id: the brain resolves that from account_ref.
 // Never outputs the token.
 const out = [];
@@ -294,7 +294,7 @@ for (const item of $input.all()) {
         qs: { fields: 'name,username' }, token: decryptToken(j.token_enc), tries: 2 });
       username = p.username || null;
       name = p.name || null;
-    } catch (e) { /* she still gets her reply; the lookup is retried next week */ }
+    } catch (e) { /* the lead still gets their reply; the lookup is retried next week */ }
   }
   out.push({ json: {
     channel: 'instagram',
@@ -423,17 +423,17 @@ SELECT (SELECT id FROM dl) AS dead_letter_id;""",
     w.connect("Sent?", "Dead Letter: Send Failed", out=2)
 
     w.node("Email: Send Failed", "n8n-nodes-base.code", 2, [2620, 140], {"jsCode": LEAD_NAME_JS + r"""
-// Founders get the technical email; the studio owner gets a plain one so she
-// can answer the lead herself.
+// Founders get the technical email; the studio owner gets a plain one so they
+// can answer the lead themselves.
 return $('Send IG Reply').all().filter((i) => i.json.status === 'failed').flatMap((i) => {
   const j = i.json;
   const who = leadLabel({ channel: 'instagram', username: j.username, name: j.name });
   const owner = String(j.owner_alert_email || '').trim();
   const ownerEmail = (!owner || owner === 'founders') ? [] : [{ json: {
     to: owner,
-    subject: `${who} didn\u2019t get a reply. Please answer her yourself`,
-    heading: `${who} messaged ${j.studio_name || 'you'} on Instagram, but Instagram refused the AI\u2019s reply, so she has had no answer.`,
-    lines: ['Please reply to her yourself in your Instagram messages.',
+    subject: `${who} didn\u2019t get a reply. Please answer them yourself`,
+    heading: `${who} messaged ${j.studio_name || 'you'} on Instagram, but Instagram refused the AI\u2019s reply, so they have had no answer.`,
+    lines: ['Please reply to them yourself in your Instagram messages.',
             `What the AI was going to say, if it helps: "${String(j.reply || '').slice(0, 600)}"`,
             ...(j.token_problem ? ['Your Instagram connection to Loop Logic seems to have stopped working, so other messages may be affected until it is reconnected. We\u2019ll email you a new connect link today.'] : [])],
     buttons: [chatButton({ channel: 'instagram', username: j.username })].filter(Boolean),
@@ -442,11 +442,11 @@ return $('Send IG Reply').all().filter((i) => i.json.status === 'failed').flatMa
   return [{ json: {
     to: 'founders',
     subject: `Instagram reply NOT delivered: ${who} (${j.studio_name || 'unknown studio'})`,
-    heading: `The AI wrote a reply to ${who}, but Instagram refused it, so she has had no answer.`,
+    heading: `The AI wrote a reply to ${who}, but Instagram refused it, so they have had no answer.`,
     lines: [`Error: ${j.error}`,
             `The reply that didn't go out: "${String(j.reply || '').slice(0, 600)}"`,
-            j.token_problem ? 'This looks like a token problem: send the studio a new connect link (ig_connect_link.py).' : 'Send it to her by hand from the studio’s Instagram if it still makes sense.',
-            'Saved in dead_letters.' + (ownerEmail.length ? ' The studio owner has been emailed and asked to reply herself.' : '')],
+            j.token_problem ? 'This looks like a token problem: send the studio a new connect link (ig_connect_link.py).' : 'Send it to them by hand from the studio’s Instagram if it still makes sense.',
+            'Saved in dead_letters.' + (ownerEmail.length ? ' The studio owner has been emailed and asked to reply themselves.' : '')],
     buttons: [chatButton({ channel: 'instagram', username: j.username })].filter(Boolean),
   } }, ...ownerEmail];
 });
@@ -523,9 +523,9 @@ return $input.all().map((i) => {
   return { json: {
     to: j.owner_alert_email || 'founders',
     subject: `You replied to ${who}, so the AI has stepped back`,
-    heading: `You (or your team) replied to ${who} in Instagram, so the AI has stopped answering her.`,
+    heading: `You (or your team) replied to ${who} in Instagram, so the AI has stopped answering them.`,
     lines: [`Your message: "${String(j.staff_body || '').slice(0, 400)}"`,
-            'The AI won’t message her again until you tap Resume. Every other lead is still answered as normal.',
+            'The AI won’t message them again until you tap Resume. Every other lead is still answered as normal.',
             'When you’re done chatting, tap Resume and the AI picks up from where you left off. It reads what you said.'],
     buttons: [t ? { label: 'Resume AI', url: `https://n8n.looplogicsystems.com/webhook/owner?a=resume&l=${j.lead_id}&t=${t}` } : null,
               chatButton({ channel: 'instagram', username: j.username })].filter(Boolean),
@@ -560,7 +560,7 @@ def followup():
 
     w.pg("Claim Due Leads", [-240, 0], """-- Who is due a nudge or a hand-over RIGHT NOW, claimed in the same statement
 -- so an overlapping run can't nudge them too. Leads the AI didn't speak to last
--- (she replied, or staff did) are never nudged. Only conversations from the
+-- (the lead replied, or staff did) are never nudged. Only conversations from the
 -- last 48h are considered, so old history is never acted on.
 WITH last_in AS (
   SELECT lead_id, max(created_at) AS t, max(id) AS last_id
@@ -652,10 +652,10 @@ const thread = Array.isArray(j.thread) ? j.thread : [];
 const who = (m) => m.direction === 'inbound' ? 'Lead' : (m.author === 'human' ? 'Studio staff' : 'You');
 const history = thread.map((m) => `${who(m)}: ${String(m.body || '').replace(/\s+/g, ' ').slice(0, 500)}`).join('\n');
 const task = j.kind === 'link'
-  ? `About 3 hours ago you sent her the booking link and she hasn't opened it yet. Write a light check-in: did she get a chance to grab a spot? The system attaches the same link under your message, so don't write a link and don't say "here's the link again" in a robotic way.`
+  ? `About 3 hours ago you sent them the booking link and they haven't opened it yet. Write a light check-in: did they get a chance to grab a spot? The system attaches the same link under your message, so don't write a link and don't say "here's the link again" in a robotic way.`
   : (j.is_final
-      ? `She went quiet after your last message, and you already followed up once. This is the LAST follow-up: extra gentle, no pressure, leave the door open for whenever she's ready.`
-      : `She went quiet after your last message. Write a light, friendly check-in that picks up where you left off.`);
+      ? `The lead went quiet after your last message, and you already followed up once. This is the LAST follow-up: extra gentle, no pressure, leave the door open for whenever they're ready.`
+      : `The lead went quiet after your last message. Write a light, friendly check-in that picks up where you left off.`);
 const systemMessage = [
 `You are ${persona}, the AI assistant for ${studio}${v.type ? ', a ' + v.type : ''}${v.city ? ' in ' + v.city : ''}. You text leads on Instagram in the owner's (${owner}'s) voice: warm, casual, specific, like a real person texting.`,
 ``,
@@ -664,8 +664,8 @@ task,
 `Rules:`,
 `- One or two short sentences. No greeting like "Hey!" or "Hi again!", no sign-off.`,
 `- Never pushy: no guilt, no fake urgency, no "just following up", "circling back", "touching base" or "I wanted to reach out".`,
-`- Use the conversation: refer to the class or question she was actually considering. Don't repeat what was already said.`,
-`- Never say she is booked and never claim a spot is free. Don't quote prices unless she asked about price.`,
+`- Use the conversation: refer to the class or question they were actually considering. Don't repeat what was already said.`,
+`- Never say they are booked and never claim a spot is free. Don't quote prices unless they asked about price.`,
 `- Write times like "5:30pm". No em dashes. No URLs. At most one emoji, usually none.`,
 `- At most one easy question.`,
 ``,
@@ -708,14 +708,14 @@ return { json: { ...keep, text, skip: false } };
 
     # Logged BEFORE sending, as the AI's own message: when Instagram echoes the
     # nudge back, Handle Echo must recognise it as ours (or it would look like
-    # a staff reply and pause her). The INSERT is also the last-moment guard:
-    # nothing is logged (so nothing sent) if she was paused or wrote back.
+    # a staff reply and pause the lead). The INSERT is also the last-moment guard:
+    # nothing is logged (so nothing sent) if the lead was paused or wrote back.
     w.pg("Log Nudge", [860, -100], """INSERT INTO messages (lead_id, direction, channel, body, author, nudge, created_at)
 SELECT $1::int, 'outbound', $2, $3, 'ai', true, now()
  WHERE NOT $10::boolean
    AND NOT (SELECT ai_paused FROM leads WHERE id = $1::int)
    -- By id, not timestamp: n8n rounds Postgres's microseconds to milliseconds,
-   -- which made her own last message look newer than itself (seen live 2026-10-30).
+   -- which made their own last message look newer than itself (seen live 2026-10-30).
    AND NOT EXISTS (SELECT 1 FROM messages WHERE lead_id = $1::int AND direction = 'inbound'
                     AND id > $4::int)
 RETURNING id AS message_id, lead_id, channel, body AS text, $5::text AS external_id, $6::text AS kind,
@@ -749,14 +749,14 @@ return out;
     w.connect("Send IG Nudge", "Nudge Sent?")
 
     w.pg("Record Nudge", [1740, -120], """-- Instagram's id (so the echo is recognised as ours), the link nudge spent,
--- and the lead marked cold after her final nudge.
+-- and the lead marked cold after the final nudge.
 WITH m AS (
   UPDATE messages SET provider_message_id = NULLIF($2, '') WHERE id = $1::int RETURNING id
 ), b AS (
   UPDATE booking_links SET nudged_at = now() WHERE id = NULLIF($3::text, '')::int AND $4 = 'link' RETURNING id
 ), l AS (
   -- Release the claim now the nudge is out (the nudge itself now prevents a
-  -- repeat); mark her cold after the final one.
+  -- repeat); mark the lead cold after the final one.
   UPDATE leads SET nudge_claimed_at = NULL,
                    status = CASE WHEN $6::boolean AND status = 'engaged' THEN 'cold' ELSE status END,
                    updated_at = now()
@@ -819,7 +819,7 @@ return $('Send or Hand Over?').all(1).filter((i) => i.json.action === 'hand_over
     subject: `${who} went quiet — over to you if you want to follow up`,
     heading: `${who} ${what}.`,
     lines: ['Instagram only lets a business message someone within 24 hours of THEIR last message, and that window has closed, so the AI can’t follow up.',
-            'If you know her or want to try once more, message her yourself. If she writes back, the AI picks the conversation up again.'],
+            'If you know them or want to try once more, message them yourself. If they write back, the AI picks the conversation up again.'],
     buttons: [chatButton(j)].filter(Boolean),
   } };
 });

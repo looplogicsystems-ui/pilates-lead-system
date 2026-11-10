@@ -3,12 +3,12 @@
 --
 -- 1. Copy to db/seed/studios/<slug>.sql. That path is GIT-IGNORED: a real
 --    studio's details never go in this public repo.
--- 2. Fill every placeholder (CAPITALS in angle brackets) from her intake form. Keep the SQL quoting:
+-- 2. Fill every placeholder (CAPITALS in angle brackets) from their intake form. Keep the SQL quoting:
 --    a ' inside text is written ''.
 -- 3. Apply:   db/seed/apply_studio.sh db/seed/studios/<slug>.sql
 --    (refuses while any placeholder is left; snapshots first; refuses a
 --    studio name that already exists)
--- 4. It prints the new studio id. Send her the connect link:
+-- 4. It prints the new studio id. Send them the connect link:
 --    python3 workflows/build/ig_connect_link.py <id>
 -- Afterwards, edit timetable / prices in Beekeeper as studio_editor.
 -- ===========================================================================
@@ -41,16 +41,16 @@ SELECT '<STUDIO_NAME>', '<NEIGHBOURHOOD, CITY, ST>', 'Pilates', '<TIMEZONE e.g. 
          'faq',              jsonb_build_object('parking', '<PARKING>', 'what_to_bring', '<WHAT TO BRING>',
                                                 'cancellation', '<CANCELLATION POLICY>'),
          'voice',            jsonb_build_object(
-                               'register', '<HOW SHE TEXTS, from her past DMs: e.g. warm, direct, short sentences>',
+                               'register', '<HOW THEY TEXT, from their past DMs: e.g. warm, direct, short sentences>',
                                'greeting', '<e.g. Hey [first name]!>',
                                'emoji',    '<e.g. sparingly, never more than one per message>',
-                               'examples', jsonb_build_array('<REAL LINE FROM HER PAST DMs>', '<ANOTHER>', '<ANOTHER>'),
+                               'examples', jsonb_build_array('<REAL LINE FROM THEIR PAST DMs>', '<ANOTHER>', '<ANOTHER>'),
                                'never_say', jsonb_build_array('reach out', 'circle back', 'at your earliest convenience')))
  WHERE NOT EXISTS (SELECT 1 FROM studios WHERE name = '<STUDIO_NAME>')
 RETURNING id AS studio_id \gset
 
 -- Weekly timetable. weekday: 1 = Monday ... 7 = Sunday. Times are the studio's
--- local wall-clock time. booking_url only if her software has a STABLE per-class link.
+-- local wall-clock time. booking_url only if their software has a STABLE per-class link.
 INSERT INTO studio_classes (studio_id, name, weekday, start_local, duration_minutes, level, booking_url)
 SELECT :studio_id, c.name, c.weekday, c.t::time, c.mins, c.level, c.url
   FROM (VALUES

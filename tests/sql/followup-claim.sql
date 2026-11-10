@@ -10,7 +10,7 @@ INSERT INTO scen VALUES ('A quiet 2h ago -> nudge 1','tA','engaged',false,'insta
  ('D link 4h, tapped -> nothing','tD','link_sent',false,'instagram'),
  ('E quiet 25h -> hand over','tE','engaged',false,'instagram'),
  ('F paused -> nothing','tF','engaged',true,'instagram'),
- ('G she wrote last -> nothing','tG','engaged',false,'instagram'),
+ ('G lead wrote last -> nothing','tG','engaged',false,'instagram'),
  ('H nudged 21h ago -> final nudge','tH','engaged',false,'instagram'),
  ('I voice-lab -> nothing','tI','engaged',false,'test');
 INSERT INTO leads (external_id, channel, studio_id, status, ai_paused, created_at, updated_at)

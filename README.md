@@ -21,7 +21,7 @@ adapters**, driven by per-studio configuration in Postgres:
 | `Channel Adapter: Instagram` | `OQMXzwDyu5YAmRTo` | GET verify + POST events on `/webhook/instagram`, HMAC signature, durable dedupe, looks up the lead's @username once, calls the brain, sends with **that studio's own encrypted token** (one send path for every studio). A reply typed by staff in the Instagram app pauses the AI for that lead. |
 | `Follow-up Scheduler` | `fyk6eYsVGtUVS1dh` | Chases quiet leads with AI-written nudges on the studio's cadence. |
 | `Lead System — Error Handler` | `4L4K72aSSwiBcnjX` | Any execution error → a `dead_letters` row **and** a founder email (at most one per workflow per 10 min). |
-| `IG Connect` | `C5M1lM4n3FgKO0J1` | `/webhook/ig/connect`: a studio connects her Instagram from a signed, single-use link (`workflows/build/ig_connect_link.py <studio id>`). Token stored encrypted with `IG_TOKEN_KEY`. |
+| `IG Connect` | `C5M1lM4n3FgKO0J1` | `/webhook/ig/connect`: a studio connects its Instagram from a signed, single-use link (`workflows/build/ig_connect_link.py <studio id>`). Token stored encrypted with `IG_TOKEN_KEY`. |
 | `IG Token Refresh` | `n56lLK7WRdYFesdW` | Daily: refreshes every Instagram token renewed >7 days ago; emails the founders on failure or <10 days to expiry. |
 | `Legal Pages (Privacy Policy)` | `SqkuTaitCtgEWn7O` | Serves the Meta-required privacy page. |
 

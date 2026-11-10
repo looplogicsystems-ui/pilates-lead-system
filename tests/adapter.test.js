@@ -79,7 +79,7 @@ module.exports = async () => {
     owner_alert_email: 'owner@studio.com', reply: 'Hi Jess, Tuesday 6pm works!', error: 'HTTP 400: (#100) bad', ...extra }] } });
   r = await sf({ token_problem: true });
   ok('reply not delivered -> founders + owner email with the unsent reply and Open chat', r.length === 2 && r[0].to === 'founders' && /owner has been emailed/.test(r[0].lines.at(-1))
-     && r[1].to === 'owner@studio.com' && /answer her yourself/.test(r[1].subject) && r[1].lines.some((l) => /Tuesday 6pm/.test(l))
+     && r[1].to === 'owner@studio.com' && /answer them yourself/.test(r[1].subject) && r[1].lines.some((l) => /Tuesday 6pm/.test(l))
      && r[1].lines.some((l) => /new connect link/.test(l)) && !JSON.stringify(r[1]).includes('#100') && r[1].buttons[0].label === 'Open chat');
   r = await sf({ owner_alert_email: 'founders' });
   ok('reply not delivered, studio owner = founders -> founders email only', r.length === 1);

@@ -39,9 +39,9 @@ module.exports = async () => {
   ok('model already wrote the tips -> not added again', count(d.final_reply, /grip socks/g) === 1);
   const park = { ...cfg, prompt_vars: { ...cfg.prompt_vars, first_visit_tips: 'Park on Aldrich St and wear something you can move in.' } };
   d = await decide({ reply: 'Booked! Bring grip socks.', intent: 'lead_booked' }, { c: park });
-  ok('another studio: demo wording in the reply no longer blocks HER tips', /Park on Aldrich/.test(d.final_reply));
+  ok('another studio: demo wording in the reply no longer blocks ITS tips', /Park on Aldrich/.test(d.final_reply));
   d = await decide({ reply: 'Amazing! Park on Aldrich and wear comfy layers.', intent: 'lead_booked' }, { c: park });
-  ok('another studio: her tips already in the reply -> not added again', count(d.final_reply, /Aldrich/g) === 1);
+  ok('another studio: its tips already in the reply -> not added again', count(d.final_reply, /Aldrich/g) === 1);
   const demoTips = { ...cfg, prompt_vars: { ...cfg.prompt_vars, first_visit_tips: 'Come about 10 minutes early for a quick waiver and a walkthrough of the springs, and bring grip socks (or grab a pair at the front desk for $18).' } };
   d = await decide({ reply: 'See you at Reformer Flow tomorrow, come early!', intent: 'lead_booked' }, { c: demoTips });
   ok('a normal "see you tomorrow" reply still gets the tips', /walkthrough of the springs/.test(d.final_reply));
@@ -67,5 +67,5 @@ module.exports = async () => {
   ok('founders told it was done, with counts', mail.to === 'founders' && /7 messages/.test(mail.lines[0]));
   ok('...and the email names nobody', !/jess|17840000000000099/i.test(JSON.stringify(mail)));
   const ret = W.nodes.find((n) => n.name === 'Return: Data Deleted').parameters.assignments.assignments;
-  ok('she gets a confirmation; lead_id 0 so the adapter can still send it', ret.find((a) => a.name === 'send').value === '={{ true }}' && ret.find((a) => a.name === 'lead_id').value === '={{ 0 }}');
+  ok('the lead gets a confirmation; lead_id 0 so the adapter can still send it', ret.find((a) => a.name === 'send').value === '={{ true }}' && ret.find((a) => a.name === 'lead_id').value === '={{ 0 }}');
 };

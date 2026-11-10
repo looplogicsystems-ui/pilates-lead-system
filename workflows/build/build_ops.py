@@ -54,7 +54,7 @@ return [{ json: {
   lines: [
     `Error: ${msg.slice(0, 500)}`,
     dl.dead_letter_id ? `Saved as dead letter #${dl.dead_letter_id}.` : 'It could NOT be saved to dead_letters (is Postgres down?).',
-    'If a lead was mid-conversation, check she got a reply. More errors from this workflow in the next 10 minutes are saved as dead letters without another email.',
+    'If a lead was mid-conversation, check they got a reply. More errors from this workflow in the next 10 minutes are saved as dead letters without another email.',
   ],
   buttons: (wfId && ex.id) ? [{ label: 'Open the failed run', url: `https://n8n.looplogicsystems.com/workflow/${wfId}/executions/${ex.id}` }] : [],
 } }];
@@ -171,8 +171,8 @@ RETURNING id, $2::text AS status, account_ref, ig_username, token_expires_at, to
 
 REPORT_JS = r"""
 // A founder email whenever something needs a human, plus a plain-words email to
-// the studio owner only when it needs HER: Instagram refused the token for the
-// first time (she must reconnect), or it runs out in 7 or 2 days. Never for a
+// the studio owner only when it needs THEM: Instagram refused the token for the
+// first time (they must reconnect), or it runs out in 7 or 2 days. Never for a
 // one-off network failure, and never every day.
 const rows = $input.all().map((i) => i.json).filter((r) => r.id);
 const soon = (r) => r.token_expires_at && (new Date(r.token_expires_at) - Date.now()) < 10 * 86400e3;
@@ -315,7 +315,7 @@ const leadLabel = (l) => l.username ? `@${l.username}${l.name ? ' (' + l.name + 
 # I1 — every 15 minutes: a lead's message with no reply for 5 minutes.
 UNANSWERED_SQL = """
 -- Marks what it reports in the same statement, so each message alerts ONCE.
--- Only her LATEST message counts, only from the last 24h, never paused or
+-- Only the lead's LATEST message counts, only from the last 24h, never paused or
 -- escalated leads (a human has those) and never the voice lab.
 WITH due AS (
   SELECT m.id
@@ -336,7 +336,7 @@ WITH due AS (
 )
 SELECT mk.id, mk.lead_id, mk.body, round(extract(epoch FROM now() - mk.created_at) / 60) AS minutes,
        l.channel, l.username, l.name, s.name AS studio_name, s.owner_alert_email,
-       -- her reply failed to send, and the owner was already emailed about it
+       -- the reply failed to send, and the owner was already emailed about it
        EXISTS (SELECT 1 FROM dead_letters d WHERE d.reason = 'ig_send_failed'
                   AND d.payload->>'lead_id' = mk.lead_id::text AND d.created_at >= mk.created_at) AS owner_told
   FROM marked mk JOIN leads l ON l.id = mk.lead_id JOIN studios s ON s.id = l.studio_id;
@@ -345,7 +345,7 @@ SELECT mk.id, mk.lead_id, mk.body, round(extract(epoch FROM now() - mk.created_a
 UNANSWERED_EMAIL_JS = LEAD_LABEL + r"""
 const rows = $input.all().map((i) => i.json).filter((r) => r.id);
 if (!rows.length) return [];
-// Each studio owner also gets one plain-words email for her own leads, so she
+// Each studio owner also gets one plain-words email for their own leads, so they
 // can answer by hand while we fix it.
 const byOwner = {};
 for (const r of rows) {
@@ -359,7 +359,7 @@ const ownerEmails = Object.entries(byOwner).map(([owner, rs]) => { const one = r
   heading: `${one ? 'This message has' : 'These messages have'} had no reply from the AI for ${Math.max(...rs.map((r) => r.minutes))}+ minutes. Something on our side is stuck.`,
   lines: [
     ...rs.map((r) => `${leadLabel(r)} on ${r.channel === 'instagram' ? 'Instagram' : r.channel}, ${r.minutes} min ago: "${String(r.body || '').slice(0, 200)}"`),
-    `Please reply to ${one ? 'her' : 'them'} yourself. When you reply from Instagram, the AI steps back from that conversation; you can hand it back with Resume.`,
+    `Please reply to them yourself. When you reply from Instagram, the AI steps back from that conversation; you can hand it back with Resume.`,
   ],
   note: 'Loop Logic has been told and is fixing it.' } }; });
 return [{ json: {
@@ -368,8 +368,8 @@ return [{ json: {
   heading: 'The AI promised a reply within a minute, and these messages got none.',
   lines: [
     ...rows.map((r) => `${leadLabel(r)} (${r.studio_name}), ${r.minutes} min ago: "${String(r.body || '').slice(0, 200)}"`),
-    'Likely causes: a workflow error, an Instagram token problem, or n8n down. Check the error emails and dead_letters. Reply to her by hand if it still matters.',
-    ...(ownerEmails.length ? ['The studio owner has been emailed and asked to reply herself.'] : []),
+    'Likely causes: a workflow error, an Instagram token problem, or n8n down. Check the error emails and dead_letters. Reply by hand if it still matters.',
+    ...(ownerEmails.length ? ['The studio owner has been emailed and asked to reply themselves.'] : []),
   ],
 } }, ...ownerEmails];
 """

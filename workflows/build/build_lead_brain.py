@@ -12,7 +12,7 @@ software. Google Calendar is gone — no schedule read, no calendar write, no
 booking-failure branch. The AI recommends ONE real class from the studio's
 timetable (studio_classes), quotes ONLY its prices (studio_offers), and when the
 lead wants to book, the CODE attaches the right booking link. The AI never says
-"you're booked": her booking software is the truth and shows live spots.
+"you're booked": the studio's booking software is the truth and shows live spots.
 
 The model picks a class by SLOT ID ("S3") from the list it is shown. Decide
 checks the id exists, so an invented class or time cannot reach a lead. The
@@ -93,7 +93,7 @@ def if_true(name, pos, expr, cid):
 
 
 # A readable name for a lead in an owner email. Instagram gives no name, only an
-# id the owner can't use — so point her at the conversation instead.
+# id the owner can't use — so point them at the conversation instead.
 LEAD_LABEL_JS = LEAD_NAME_JS + r"""
 // The lead as stored (the adapter looks an Instagram profile up only once, so
 // this message alone may not carry the @username).
@@ -113,7 +113,7 @@ const ownerButton = (label, action, leadId) => {
 """
 
 # Where the lead's booking link points. The tracked redirect (Link Redirect
-# workflow) records the click, then sends her on to the studio's real page.
+# workflow) records the click, then sends them on to the studio's real page.
 # go.looplogicsystems.com is a Cloudflare Worker ("go") that forwards
 # /<code> to /webhook/go?c=<code>, passing the user agent through so preview
 # robots are still recognised. The long n8n URL keeps working as a fallback.
@@ -199,15 +199,15 @@ connect("Send: Unknown Account", "Return: Unknown Account")
 
 # ---------------------------------------------------------------------------
 # 1b. "Delete my data" (privacy page promise; migration 016). Checked BEFORE
-#     the lead is stored, so the request itself isn't saved. Deletes her lead
+#     the lead is stored, so the request itself isn't saved. Deletes their lead
 #     row and everything tied to it, tells the founders (counts, no identifiers)
-#     and confirms to her. The AI never sees the message.
+#     and confirms to them. The AI never sees the message.
 # ---------------------------------------------------------------------------
 DELETE_RE = r"/\b(delete|erase|remove)\s+(all\s+)?my\s+(data|info|information|details|messages)\b/i"
 if_true("Delete Request?", [90, 120],
         "={{ " + DELETE_RE + ".test(String(" + IN + ".message || '')) }}", "delete-request")
 
-pg("Forget Lead", [200, -160], """-- forget_lead() deletes the lead and her messages, links, escalations, error
+pg("Forget Lead", [200, -160], """-- forget_lead() deletes the lead and its messages, links, escalations, error
 -- records and legacy AI memory, and logs counts only (data_deletions).
 -- Always one row; a request from someone we hold nothing on is logged too.
 WITH f AS (
@@ -225,8 +225,8 @@ SELECT COALESCE((SELECT r FROM f LIMIT 1), '{"found": false}'::jsonb) AS result,
    alwaysOutputData=True)
 
 code("Email: Data Deleted", [420, -160], r"""
-// Founders only, and no identifiers: an email that named her would be a copy
-// of the very data she asked us to delete.
+// Founders only, and no identifiers: an email that named them would be a copy
+// of the very data they asked us to delete.
 const r = $('Forget Lead').first().json.result || {};
 const cfg = $('Resolve Studio').first().json;
 const inb = $('When Called').first().json;
@@ -234,12 +234,12 @@ const n = (k) => Number(r[k] || 0);
 return [{ json: {
   to: 'founders',
   subject: `"Delete my data" request carried out (${cfg.studio_name || 'unknown studio'})`,
-  heading: 'A lead asked us to delete her data. It is done.',
+  heading: 'A lead asked us to delete their data. It is done.',
   lines: [
     r.found
-      ? `Deleted: her lead record, ${n('messages')} messages, ${n('booking_links')} booking links, ${n('escalations')} escalations, ${n('dead_letters')} error records.`
-      : 'We held nothing on her. The request is logged anyway.',
-    `Channel: ${inb.channel}. Logged in data_deletions (counts only). She was sent a confirmation.`,
+      ? `Deleted: their lead record, ${n('messages')} messages, ${n('booking_links')} booking links, ${n('escalations')} escalations, ${n('dead_letters')} error records.`
+      : 'We held nothing on them. The request is logged anyway.',
+    `Channel: ${inb.channel}. Logged in data_deletions (counts only). They were sent a confirmation.`,
     'The chat itself stays in the studio\'s own Instagram inbox. Older snapshots and backups age out within 30 days.',
   ] } }];
 """)
@@ -294,7 +294,7 @@ ON CONFLICT (channel, external_id) DO UPDATE SET
                    WHEN leads.status IN ('cold','new') THEN 'engaged'
                    ELSE leads.status
                  END,
-    -- While paused, the owner hears "she wrote again" at most once per 12h
+    -- While paused, the owner hears "they wrote again" at most once per 12h
     -- (the takeover / escalation email itself sets this too).
     pause_alerted_at = CASE
                    WHEN leads.ai_paused AND (leads.pause_alerted_at IS NULL
@@ -326,10 +326,10 @@ const leadId = $('Upsert Lead').first().json.id;
 const p = person();
 return [{ json: {
   to: inb.channel === 'test' ? 'delivered@resend.dev' : (cfg.owner_alert_email || 'founders'),
-  subject: `${leadLabel(p)} wrote again — the AI is paused for her`,
+  subject: `${leadLabel(p)} wrote again — the AI is paused for this chat`,
   heading: `${leadLabel(p)} sent a new message. The AI did not answer, because this conversation is with you.`,
-  lines: [`Her message: "${String(inb.message || '').slice(0, 500)}"`,
-          `Reply to her in your ${inb.channel === 'instagram' ? 'Instagram DMs' : inb.channel}, or tap Resume to hand her back to the AI.`,
+  lines: [`Their message: "${String(inb.message || '').slice(0, 500)}"`,
+          `Reply to them in your ${inb.channel === 'instagram' ? 'Instagram DMs' : inb.channel}, or tap Resume to hand the chat back to the AI.`,
           'You get at most one of these emails every 12 hours per lead.'],
   buttons: [ownerButton('Resume AI', 'resume', leadId), chatButton(p)].filter(Boolean),
 } }];
@@ -434,20 +434,20 @@ const studio = v.how_we_refer || v.studio_name || cfg.studio_name;
 const systemMessage = [
 `You are ${v.persona_name || 'the studio host'}, and you answer Instagram DMs for ${v.studio_name || cfg.studio_name}${v.type ? ', a ' + v.type : ''}${v.city ? ' in ' + v.city : ''}. ${owner} owns the studio.`,
 ``,
-`YOUR VOICE: you write the way ${owner} texts a new client. It must read like a person typed it on her phone between classes, never like a company or an assistant.`,
+`YOUR VOICE: you write the way ${owner} texts a new client. It must read like a person typed it on their phone between classes, never like a company or an assistant.`,
 `- ${owner}'s register: ${voice.register || 'warm, direct, short sentences, contractions'}.`,
 Number(data.outbound_count || 0) === 0
-  ? `- This is your FIRST reply to her${voice.greeting ? ', so open the way ' + owner + ' does: ' + voice.greeting + ' (use her first name only if you actually know it)' : ''}.`
+  ? `- This is your FIRST reply to this person${voice.greeting ? ', so open the way ' + owner + ' does: ' + voice.greeting + ' (use their first name only if you actually know it)' : ''}.`
   : `- You are mid-conversation: NO greeting, no "Hey", no "Hi". Just carry on, like the next text in a thread.`,
-`- If she has only said hi/hello and asked nothing yet, a greeting alone is NOT a reply: greet her and ask ONE short, easy question that gets her talking, e.g. whether she's tried Pilates before or what she's looking for.`,
+`- If they have only said hi/hello and asked nothing yet, a greeting alone is NOT a reply: greet them and ask ONE short, easy question that gets them talking, e.g. whether they've tried Pilates before or what they're looking for.`,
 `- Write times the way people text: "5:30pm", "9am", "Sat 9:15am". Never "5:30 PM" or "17:30".`,
-`- Emoji: ${voice.emoji || 'rarely, and only if she used one first'}.`,
-`- Mirror her: if she writes one line, you write one or two. Match her energy; never be more excited than she is.`,
-`- Answer what she actually asked, first. If you recommend a class, give ONE concrete reason tied to what SHE said (new to Pilates, after work, nervous, wants something gentle), not a generic one.`,
-`- Respect what she asked for. If she names a class type (reformer, mat), a day or a time of day, your recommendation MUST match it. Only suggest something else if nothing on the list matches, and say so.`,
-`- Be specific: "Monday 5:30, Reformer Flow" beats "a great evening option". A real detail from the facts below beats any adjective. Never call a class "a solid fit", "a good spot" or "the best starting point": say WHY it suits her.`,
+`- Emoji: ${voice.emoji || 'rarely, and only if they used one first'}.`,
+`- Mirror them: if they write one line, you write one or two. Match their energy; never be more excited than they are.`,
+`- Answer what they actually asked, first. If you recommend a class, give ONE concrete reason tied to what THEY said (new to Pilates, after work, nervous, wants something gentle), not a generic one.`,
+`- Respect what they asked for. If they name a class type (reformer, mat), a day or a time of day, your recommendation MUST match it. Only suggest something else if nothing on the list matches, and say so.`,
+`- Be specific: "Monday 5:30, Reformer Flow" beats "a great evening option". A real detail from the facts below beats any adjective. Never call a class "a solid fit", "a good spot" or "the best starting point": say WHY it suits them.`,
 `- Punctuation like texting: periods, commas, the odd question mark. NO em dashes or en dashes. No semicolons. Never two exclamation marks.`,
-`- Vary how you start. Don't open with "Yes", "Yep", "Great question", "Absolutely", "So" or by repeating her question back.`,
+`- Vary how you start. Don't open with "Yes", "Yep", "Great question", "Absolutely", "So" or by repeating their question back.`,
 `- Never sound like a template or a salesperson. Banned: "great question", "I'd be happy to", "feel free", "don't hesitate", "reach out", "circle back", "perfect for you", "option", "journey", "let me know if you have any other questions"${list(voice.never_say).length ? ', ' + list(voice.never_say).map((s) => '"' + s + '"').join(', ') : ''}.`,
 list(voice.examples).length ? `How ${owner} actually writes. Match this STYLE (length, rhythm, warmth), but never copy their prices, times or class names; those only come from the lists below:\n${list(voice.examples).map((e) => '  > ' + (typeof e === 'object' && e ? ((e.lead ? 'Lead: ' + e.lead + '\n    ' + owner + ': ' : '') + (e.reply || '')) : e)).join('\n')}` : '',
 ``,
@@ -464,20 +464,20 @@ v.beginner_policy ? `- Beginners: ${v.beginner_policy}` : '',
 ...(slots.length ? slots.map((s) => `- ${s.id}: ${s.label}${s.level ? ' (' + s.level + ')' : ''}`) : ['- (none — do not recommend any time; say ' + owner + ' will help)']),
 ``,
 `HOW BOOKING WORKS — you never book anything:`,
-`- Recommend ONE specific class from the list that fits what she said, by day, time and name.`,
-`- You do NOT know live availability; the booking page shows the live spots. NEVER say she is booked, in, confirmed, reserved or that a spot is held.`,
-`- Use intent "send_booking_link" ONLY once she has already said yes to a class or asked how/where to book. Then the system adds the booking link to your message itself: NEVER type a link, URL or web address.`,
-`- If you are suggesting a class, asking which one suits her, or offering to send the link, that is intent "continue" and nothing gets attached. When you suggest a class, end by asking whether that TIME works for her ("does Monday 5:30 work for you?"), not whether she wants a link. Once she says yes, the link follows.`,
-v.booking_steps ? `- In that message, tell her the next step in one short line: ${v.booking_steps}` : '',
-`- If she says she has booked, bought the pass or signed up, use intent "lead_booked" and keep your reply to a short, warm line. Do NOT write arrival times, what to bring or other first-visit tips: the system adds those itself.`,
+`- Recommend ONE specific class from the list that fits what they said, by day, time and name.`,
+`- You do NOT know live availability; the booking page shows the live spots. NEVER say they are booked, in, confirmed, reserved or that a spot is held.`,
+`- Use intent "send_booking_link" ONLY once they have already said yes to a class or asked how/where to book. Then the system adds the booking link to your message itself: NEVER type a link, URL or web address.`,
+`- If you are suggesting a class, asking which one suits them, or offering to send the link, that is intent "continue" and nothing gets attached. When you suggest a class, end by asking whether that TIME works for them ("does Monday 5:30 work for you?"), not whether they want a link. Once they say yes, the link follows.`,
+v.booking_steps ? `- In that message, tell them the next step in one short line: ${v.booking_steps}` : '',
+`- If they say they have booked, bought the pass or signed up, use intent "lead_booked" and keep your reply to a short, warm line. Do NOT write arrival times, what to bring or other first-visit tips: the system adds those itself.`,
 ``,
 `HAND TO ${owner.toUpperCase()} (intent "escalate", do NOT answer it yourself) for: ${list(v.escalate_on).length ? list(v.escalate_on).join(', ').replace(/_/g, ' ') : 'medical questions, injuries, pregnancy, price negotiation, refunds, complaints'}.`,
 ``,
-`STYLE: at most ONE question per message, and only if it moves her toward a class. Don't repeat anything already said in the conversation, and never summarise what she just told you.`,
-`If she asks directly whether you are a person or a bot, say honestly that you are the studio's AI assistant and offer to get ${owner}.`,
+`STYLE: at most ONE question per message, and only if it moves them toward a class. Don't repeat anything already said in the conversation, and never summarise what they just told you.`,
+`If they ask directly whether you are a person or a bot, say honestly that you are the studio's AI assistant and offer to get ${owner}.`,
 ``,
 `Respond with ONLY this JSON — no prose, no code fences:`,
-`{"reply": "<your message>", "intent": "continue" | "send_booking_link" | "lead_booked" | "escalate", "slot": "<slot id like S3, or null>", "returning_client": <true only if she says she has been before or has a membership>, "escalate_reason": "<short reason, or null>"}`,
+`{"reply": "<your message>", "intent": "continue" | "send_booking_link" | "lead_booked" | "escalate", "slot": "<slot id like S3, or null>", "returning_client": <true only if they say they have been before or have a membership>, "escalate_reason": "<short reason, or null>"}`,
 ].filter((l) => l !== '').join('\n');
 
 const who = (m) => m.direction === 'inbound' ? 'Lead' : (m.author === 'human' ? 'Studio staff' : 'You');
@@ -491,7 +491,7 @@ const userMessage = [
 ``,
 history.length ? `Conversation so far:\n${history.join('\n')}` : 'This is the first message from this lead.',
 ``,
-`Her latest message: ${inb.message}`,
+`The lead's latest message: ${inb.message}`,
 ].join('\n');
 
 return [{ json: {
@@ -546,7 +546,7 @@ const stripUrls = (s) => String(s || '').replace(/\bhttps?:\/\/\S+/gi, '').repla
 let reply = stripUrls(ai ? ai.reply : '');
 // Em/en dashes are the strongest "an AI wrote this" tell. The prompt forbids
 // them; any that slip through become ordinary texting punctuation. Only the
-// model's text: the owner's own escalation line and the disclosure are hers.
+// model's text: the owner's own escalation line and the disclosure are theirs.
 reply = reply
   .replace(/^\s*(yes|yep|yeah|ok|okay)\s*[—–]\s*/i, (m, w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() + ', ')
   .replace(/\s*[—–]\s*/g, ', ')
@@ -591,9 +591,9 @@ if (intent === 'send_booking_link') {
 }
 
 // Did the model already pass on this studio's first-visit tips? Checked against
-// HER tips, not fixed words (the old check only knew the demo studio's wording):
+// THIS studio's tips, not fixed words (the old check only knew the demo studio's wording):
 // a reply sentence counts as a tip when at least 2 of its distinctive words, and
-// more than half of them, also appear in her tips.
+// more than half of them, also appear in the studio's tips.
 function tipsAlreadySaid(text, tips) {
   const STOP = new Set(('about after again also been before bring come could does each every first from have here into just like '
     + 'make more most need only other over please really some sure than that their them then there these they this those time '
@@ -610,7 +610,7 @@ function tipsAlreadySaid(text, tips) {
 
 // --- compose the final message --------------------------------------------
 // The lead gets a tracked short link (Link Redirect records the click, then
-// sends her to `link`). The owner email shows the real destination.
+// sends them to `link`). The owner email shows the real destination.
 const shortCode = link ? crypto.randomBytes(6).toString('base64url') : null;
 const trackedLink = shortCode ? `__LINK_BASE__${shortCode}` : null;
 let final;
@@ -626,7 +626,7 @@ if (ctx.first_message && v.ai_disclosure) final = `${final}\n\n${v.ai_disclosure
 const p = person();
 const who = leadLabel(p);
 const where = inb.channel === 'instagram' ? 'your Instagram DMs' : inb.channel;
-const theirMsg = `Her message: "${String(inb.message || '').slice(0, 500)}"`;
+const theirMsg = `Their message: "${String(inb.message || '').slice(0, 500)}"`;
 const leadId = $('Upsert Lead').first().json.id;
 const btn = (label, action) => ownerButton(label, action, leadId);
 const chat = chatButton(p);
@@ -636,18 +636,18 @@ if (intent === 'send_booking_link') owner_email = {
   heading: `${who} wants to book, and was sent your booking link.`,
   lines: [slot ? `Recommended class: ${slot.label}` : 'No specific class was picked yet.',
           `Link sent: ${link}`, theirMsg,
-          'She books herself on your booking page. When she shows up in your booking system, tap Mark booked.'],
-  buttons: [btn('Mark booked', 'booked'), btn('Pause AI for her', 'pause'), chat].filter(Boolean) };
+          'They book on your booking page themselves. When they show up in your booking system, tap Mark booked.'],
+  buttons: [btn('Mark booked', 'booked'), btn('Pause AI for this lead', 'pause'), chat].filter(Boolean) };
 if (intent === 'lead_booked') owner_email = {
-  subject: `${who} says she's booked`,
-  heading: `${who} says she has booked or bought the pass.`,
-  lines: [theirMsg, 'Please check she shows up in your booking system, then tap Confirm booked.'],
-  buttons: [btn('Confirm booked', 'booked'), btn('Pause AI for her', 'pause'), chat].filter(Boolean) };
+  subject: `${who} says they've booked`,
+  heading: `${who} says they have booked or bought the pass.`,
+  lines: [theirMsg, 'Please check they show up in your booking system, then tap Confirm booked.'],
+  buttons: [btn('Confirm booked', 'booked'), btn('Pause AI for this lead', 'pause'), chat].filter(Boolean) };
 if (intent === 'escalate') owner_email = {
   subject: `${who} needs you — ${reason || 'a question for you'}`,
   heading: `${who} asked something the AI handed to you.`,
   lines: [`Why: ${reason || 'not specified'}`, theirMsg,
-          `The AI sent her a holding reply and is now PAUSED for this lead, so it won't answer her again. Reply to her in ${where}. When you're done, tap Resume to hand her back to the AI.`],
+          `The AI sent them a holding reply and is now PAUSED for this lead, so it won't answer them again. Reply to them in ${where}. When you're done, tap Resume to hand the chat back to the AI.`],
   buttons: [btn('Resume AI', 'resume'), chat].filter(Boolean) };
 if (owner_email) owner_email.to = (reason && reason.startsWith('studio setup incomplete'))
   ? `${cfg.owner_alert_email || 'founders'}, founders` : (cfg.owner_alert_email || 'founders');
@@ -692,7 +692,7 @@ RETURNING (SELECT id FROM link) AS booking_link_id;""",
    retryOnFail=True)
 connect("Route by Intent", "Record Link Sent", out=0)
 
-# --- lead_booked: she says she booked (self-reported; the owner confirms) ---
+# --- lead_booked: the lead says they booked (self-reported; the owner confirms) ---
 pg("Record Lead Booked", [1960, 160], """-- One statement (a parameterised query can't hold two): mark the latest
 -- link as booked-by-the-lead, then the lead.
 WITH latest AS (

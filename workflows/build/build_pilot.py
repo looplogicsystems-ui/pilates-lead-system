@@ -84,7 +84,7 @@ def conn(*pairs):
 #   note     optional small grey line at the bottom
 #
 # CALLERS: set the Execute Workflow node to continue on error. An alert that
-# fails must never stop a lead from getting her reply; the failure still reaches
+# fails must never stop a lead from getting their reply; the failure still reaches
 # the Error Handler (dead letter + founder email) through this workflow's errorWorkflow.
 
 BUILD_EMAIL_JS = r"""
@@ -107,7 +107,7 @@ for (const item of $input.all()) {
   if (!j.subject) throw new Error('Send Email: no subject');
 
   const lines = Array.isArray(j.lines) ? j.lines : (j.lines ? [j.lines] : []);
-  // https only: a button is a link a studio owner will tap on her phone.
+  // https only: a button is a link a studio owner will tap on their phone.
   const buttons = (Array.isArray(j.buttons) ? j.buttons : [])
     .filter((b) => b && b.label && /^https:\/\//.test(String(b.url || '')));
 
@@ -470,7 +470,7 @@ const LABELS = {
             done: 'Paused. The AI won’t reply to this lead until you tap Resume in one of its emails.' },
   resume: { ask: 'Hand this lead back to the AI?', go: 'Yes, resume',
             done: 'Resumed. The AI will answer this lead’s next message.' },
-  booked: { ask: 'Mark this lead as booked?', go: 'Yes, she’s booked',
+  booked: { ask: 'Mark this lead as booked?', go: 'Yes, they’re booked',
             done: 'Marked as booked. It will count in your day-30 report.' },
 };
 const sign = (act, lead) => crypto.createHmac('sha256', secret).update(`${act}:${lead}`).digest('hex').slice(0, 32);
@@ -507,7 +507,7 @@ return [{ json: { route, html, a, l } }];
 OWNER_APPLY_SQL = """
 -- One statement. Exactly one branch matches $1, so no row is updated twice.
 WITH p AS (
-  -- pause_alerted_at NULL: her next message still emails the owner once.
+  -- pause_alerted_at NULL: their next message still emails the owner once.
   UPDATE leads SET ai_paused = true, paused_by = 'owner', paused_at = now(),
                    pause_alerted_at = NULL, updated_at = now()
    WHERE id = $2::int AND $1 = 'pause' RETURNING id
@@ -518,7 +518,7 @@ WITH p AS (
                    updated_at = now()
    WHERE id = $2::int AND $1 = 'resume' RETURNING id
 ), ra AS (
-  -- What she wrote while paused was the owner's to answer: don't let the
+  -- What they wrote while paused was the owner's to answer: don't let the
   -- unanswered-DM alarm fire about it after Resume.
   UPDATE messages SET unanswered_alerted_at = COALESCE(unanswered_alerted_at, now())
    WHERE lead_id = $2::int AND $1 = 'resume' AND direction = 'inbound' RETURNING id
@@ -653,11 +653,11 @@ def link_redirect():
 
 
 # ---------------------------------------------------------------------------
-# IG Connect — GET /webhook/ig/connect   (Meta redirects here after she approves)
+# IG Connect — GET /webhook/ig/connect   (Meta redirects here after the owner approves)
 #
-# A studio connects her Instagram from her own phone: we send her a connect link
-# (workflows/build/ig_connect_link.py <studio id>), she logs in on Instagram's
-# own screen and taps Allow, and Instagram sends her browser back here with a
+# A studio owner connects their Instagram from their own phone: we send them a connect link
+# (workflows/build/ig_connect_link.py <studio id>), they log in on Instagram's
+# own screen and tap Allow, and Instagram sends their browser back here with a
 # one-time `code` and our signed `state`. No password is shared and nothing is
 # edited in n8n: the account becomes a channel_accounts row.
 #
@@ -680,7 +680,7 @@ const crypto = require('crypto');
 const q = $input.first().json.query || {};
 const stop = (title, msg) => [{ json: { route: 'stop', html: page(title, `<h1>${esc(title)}</h1><p>${esc(msg)}</p>`) } }];
 
-// She tapped "Cancel" / "Not now" on Instagram's screen.
+// They tapped "Cancel" / "Not now" on Instagram's screen.
 if (q.error) return stop('Not connected', 'Instagram wasn’t connected. If that was a mistake, just tap the link again.');
 
 const secret = String($env.OWNER_LINK_SECRET || '');
@@ -727,8 +727,8 @@ try {
     return [{ json: { ...base, ok: false, outcome: 'no_message_permission' } }];
   // 2. short-lived -> long-lived (~60 days). An account with NO role on our
   // Meta app gets through login and consent, then is refused right here with
-  // "Unsupported request" (found 2026-11-04). She has to accept our Instagram
-  // Tester invite first; the link isn't used up, so she taps it again after.
+  // "Unsupported request" (found 2026-11-04). The owner has to accept our Instagram
+  // Tester invite first; the link isn't used up, so they tap it again after.
   let long;
   try {
     long = await graphCall(this, { what: 'long-lived token', url: 'https://graph.instagram.com/access_token',
@@ -819,8 +819,8 @@ const lines = [
   c.username ? `Account: @${c.username}${c.name ? ' (' + c.name + ')' : ''}, id ${c.account_ref}, type ${c.account_type || '?'}` : null,
   outcome === 'connected' ? `Token valid until about ${new Date(Date.now() + c.expires_in * 1000).toISOString().slice(0, 10)}; refreshed automatically.` : null,
   outcome === 'connected' && !c.subscribed ? `WARNING: subscribing this account to message webhooks failed (${c.subscribe_error || 'no success flag'}). Its DMs will not arrive until that is fixed.` : null,
-  outcome === 'no_app_role' ? 'Cause: this account has no role on our Meta app, so Instagram refused the token exchange. Add it as an Instagram Tester (Meta app dashboard → App roles → Roles → Add People), wait until she accepts the invite (Instagram → Settings → Apps and websites → Tester invites), then she taps the same link again. It isn’t used up.' : null,
-  outcome === 'studio_has_account' ? `Cause: this studio already has an active Instagram account${$json.existing_username ? ' (@' + $json.existing_username + ')' : ''}. One account per studio: follow-up nudges are sent with the studio's account. To switch, set the old account inactive (UPDATE channel_accounts SET active = false WHERE …), then she taps the same link again. It isn’t used up.` : null,
+  outcome === 'no_app_role' ? 'Cause: this account has no role on our Meta app, so Instagram refused the token exchange. Add it as an Instagram Tester (Meta app dashboard → App roles → Roles → Add People), wait until the owner accepts the invite (Instagram → Settings → Apps and websites → Tester invites), then they tap the same link again. It isn’t used up.' : null,
+  outcome === 'studio_has_account' ? `Cause: this studio already has an active Instagram account${$json.existing_username ? ' (@' + $json.existing_username + ')' : ''}. One account per studio: follow-up nudges are sent with the studio's account. To switch, set the old account inactive (UPDATE channel_accounts SET active = false WHERE …), then the owner taps the same link again. It isn’t used up.` : null,
   c.error ? `Error: ${c.error}` : null,
 ].filter(Boolean);
 return [{ json: {

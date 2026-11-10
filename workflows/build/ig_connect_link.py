@@ -3,8 +3,8 @@
 
     python3 workflows/build/ig_connect_link.py <studio id> [--days 7]
 
-Send the printed link to the studio owner. She opens it on her phone, logs in
-on Instagram's own screen with the studio's account, and taps Allow; the IG
+Send the printed link to the studio owner. They open it on their phone, log in
+on Instagram's own screen with the studio's account, and tap Allow; the IG
 Connect workflow stores the account and its encrypted token. The link works
 once and expires after --days.
 
