@@ -17,7 +17,7 @@ Mock studio: **Reform Collective Pilates** (Lahore, PKT). Agent persona: "Mia", 
    studio's Instagram Business account**, e.g. *"Hi! What times do you have for beginner reformer
    this week?"*
 2. Within seconds, **Mia replies in the Instagram inbox** with the studio's real open slots.
-3. Reply to pick a time, e.g. *"Book me Saturday 10am."* — she confirms it.
+3. Reply to pick a time, e.g. *"Book me Saturday 10am."* — Mia confirms it.
 4. **Show the payoff:**
    - Google Calendar: a new event **`Trial: Beginner Reformer`** at the correct date/time in
      **Pakistan Standard Time (UTC+5)**.
