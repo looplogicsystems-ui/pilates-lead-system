@@ -632,9 +632,11 @@ const btn = (label, action) => ownerButton(label, action, leadId);
 const chat = chatButton(p);
 let owner_email = null;
 if (intent === 'send_booking_link') owner_email = {
-  subject: `${who} is heading to book${slot ? ' — ' + slot.label : ''}`,
+  // The class is only what the AI suggested: the lead picks on the studio's own
+  // page, which we can't see. Say so, or an owner reads it as the class booked.
+  subject: `${who} is heading to book${slot ? ' (suggested: ' + slot.label + ')' : ''}`,
   heading: `${who} wants to book, and was sent your booking link.`,
-  lines: [slot ? `Recommended class: ${slot.label}` : 'No specific class was picked yet.',
+  lines: [slot ? `Suggested in the chat: ${slot.label}. They may pick a different class on your booking page.` : 'No specific class was suggested yet.',
           `Link sent: ${link}`, theirMsg,
           'They book on your booking page themselves. When they show up in your booking system, tap Mark booked.'],
   buttons: [btn('Mark booked', 'booked'), btn('Pause AI for this lead', 'pause'), chat].filter(Boolean) };

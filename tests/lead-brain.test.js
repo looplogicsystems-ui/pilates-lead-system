@@ -17,6 +17,8 @@ module.exports = async () => {
   ok('new lead -> intro link, sent as OUR tracked link', d.link === 'https://studio.example/intro' && d.final_reply === `Tap the link, grab the intro pass.\nhttps://go.looplogicsystems.com/${d.short_code}`);
   ok('owner email: real link + Mark booked/Pause buttons, signed', d.owner_email.lines.join(' ').includes('https://studio.example/intro')
      && d.owner_email.buttons[0].url.endsWith(`a=booked&l=42&t=${crypto.createHmac('sha256', ENV.OWNER_LINK_SECRET).update('booked:42').digest('hex').slice(0, 32)}`));
+  ok('owner email: the class is labelled as suggested, not booked', /is heading to book \(suggested: /.test(d.owner_email.subject)
+     && /^Suggested in the chat: .+\. They may pick a different class on your booking page\.$/.test(d.owner_email.lines[0]) && !/Recommended/.test(JSON.stringify(d.owner_email)));
   d = await decide({ reply: 'Tap the link, grab the intro pass.', intent: 'send_booking_link', slot: 'S1' }, { c: { ...cfg, links_ok: false } });
   ok('L12: link marked broken -> NO link, escalated', d.intent === 'escalate' && !d.link && !/https?:/.test(d.final_reply));
   ok('L12: the model\'s "tap the link" text is replaced by one honest line', d.final_reply === 'Perfect, Jenna will send you the booking link for Sat 31 Oct, 9:15am Mat Basics shortly.');
