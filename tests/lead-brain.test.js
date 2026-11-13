@@ -128,7 +128,7 @@ module.exports = async () => {
     ok('prompt: a straight "can I book?" gets the class named and a question, not the link', /don't send the link\. Name the ONE class and ask/.test(b.systemMessage));
     ok('prompt: the link is sent once per class', /Send the link ONCE per class/.test(b.systemMessage) && /it's the link in your earlier message/.test(b.systemMessage));
     ok('prompt: the link message names the class, no question; steps name the agreed class',
-       /names the class they agreed to and has NO question in it/.test(b.systemMessage)
+       /names the class they agreed to exactly ONCE \(in the next-step line when there is one; don't also open with it\) and has NO question in it/.test(b.systemMessage)
        && /with the agreed class named in it instead of "your class": Tap the link, buy the 2-week intro pass/.test(b.systemMessage));
     const none = (await run(F, 'Build Context', [{}], { DateTime,
       nodes: { 'Resolve Studio': [studio], 'When Called': [{ message: 'hi' }], 'Load Studio Data': [{ ...data, classes: [] }] } }))[0];
