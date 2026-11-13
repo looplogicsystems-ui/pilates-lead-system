@@ -122,6 +122,14 @@ module.exports = async () => {
     ok('prompt: a day with no classes is said plainly', /there are no classes that day \(not "not this week"\)/.test(b.systemMessage));
     ok('prompt: returning clients never get the intro offer', /RETURNING clients .* never get the intro offer/.test(b.systemMessage) && /not even "if it still applies"/.test(b.systemMessage));
     ok('prompt: no "Yep" straight after the greeting either', /"Hey! Yep, …" still opens with Yep/.test(b.systemMessage));
+    // 2026-11-14: confirm the class first, then send the link once
+    ok('prompt: link only after a yes to ONE class the AI named', /only goes out once they have agreed to ONE specific class that YOU named/.test(b.systemMessage)
+       && !/or asked how\/where to book/.test(b.systemMessage));
+    ok('prompt: a straight "can I book?" gets the class named and a question, not the link', /don't send the link\. Name the ONE class and ask/.test(b.systemMessage));
+    ok('prompt: the link is sent once per class', /Send the link ONCE per class/.test(b.systemMessage) && /it's the link in your earlier message/.test(b.systemMessage));
+    ok('prompt: the link message names the class, no question; steps name the agreed class',
+       /names the class they agreed to and has NO question in it/.test(b.systemMessage)
+       && /with the agreed class named in it instead of "your class": Tap the link, buy the 2-week intro pass/.test(b.systemMessage));
     const none = (await run(F, 'Build Context', [{}], { DateTime,
       nodes: { 'Resolve Studio': [studio], 'When Called': [{ message: 'hi' }], 'Load Studio Data': [{ ...data, classes: [] }] } }))[0];
     ok('no timetable: no glance section, studio not ready (escalates)', !/WEEK AT A GLANCE/.test(none.systemMessage) && none.ready === false);
