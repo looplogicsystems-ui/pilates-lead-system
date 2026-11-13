@@ -95,6 +95,24 @@ purpose" — the lead is paused, or the account was unknown.
 - `workflows/build/` — the generators that produce those JSON files, plus `deploy.sh`.
 - `workflows/legacy/` — the retired v2.0 monolith, kept as the rollback path.
 - `DEMO.md` — demonstration script.
+- `tests/` — checks for the JavaScript inside the generated workflows (see Tests below).
+
+### Tests
+
+Regenerate first (the tests read `workflows/*.json`), then:
+
+```bash
+node tests/run.js                 # every tests/*.test.js; exits non-zero on any FAIL
+python3 tests/sql/run.py          # SQL scenarios on the mini's Postgres, always rolled back
+```
+
+A few Lead Brain checks run the whole `Build Context` step, which needs Luxon
+(n8n provides it as `DateTime`). Where Luxon isn't installed they print `SKIP`.
+To run everything, use the n8n image, which has Node and Luxon, with no network:
+
+```bash
+docker run --rm --network none --entrypoint node -v "$PWD":/repo:ro n8nio/n8n /repo/tests/run.js
+```
 
 ### Why the workflows are generated
 

@@ -54,8 +54,8 @@ if [ -f "$DIR/seed/local-ids.sql" ]; then
     run_sql "$DIR/seed/local-ids.sql"
     echo "ok"
 else
-    echo "  (no db/seed/local-ids.sql — deployment IDs not applied;"
-    echo "   copy db/seed/local-ids.sql.example and fill it in)"
+    echo "  (no db/seed/local-ids.sql — normally not needed since the pilot build;"
+    echo "   see db/seed/local-ids.sql.example)"
 fi
 
 echo "Done."

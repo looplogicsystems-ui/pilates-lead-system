@@ -70,4 +70,60 @@ module.exports = async () => {
   ok('...and the email names nobody', !/jess|17840000000000099/i.test(JSON.stringify(mail)));
   const ret = W.nodes.find((n) => n.name === 'Return: Data Deleted').parameters.assignments.assignments;
   ok('the lead gets a confirmation; lead_id 0 so the adapter can still send it', ret.find((a) => a.name === 'send').value === '={{ true }}' && ret.find((a) => a.name === 'lead_id').value === '={{ 0 }}');
+
+  // --- voice slips from the 2026-11-11 real-DM tests ---------------------------
+  // 1. "Hey! Yep, Tuesday 6pm…": the greeting put in front of a banned "Yep"
+  d = await decide({ reply: 'Hey! Yep, Tuesday 6pm Reformer Foundations is on the schedule.', intent: 'continue' });
+  ok('"Hey! Yep, Tuesday…" -> "Hey! Tuesday…"', d.final_reply === 'Hey! Tuesday 6pm Reformer Foundations is on the schedule.');
+  d = await decide({ reply: 'Hey Sam! Yeah, we do mat on Saturdays.', intent: 'continue' });
+  ok('"Hey Sam! Yeah, we do…" -> "Hey Sam! We do…"', d.final_reply === 'Hey Sam! We do mat on Saturdays.');
+  d = await decide({ reply: 'Hey there, yes we have a 6pm on Thursday.', intent: 'continue' });
+  ok('after "Hey there," the next word stays lowercase', d.final_reply === 'Hey there, we have a 6pm on Thursday.');
+  d = await decide({ reply: 'Yep, Thursday 6pm we have Reformer Foundations.', intent: 'continue' });
+  ok('a plain "Yep," (answering "still there?") is left alone', d.final_reply === 'Yep, Thursday 6pm we have Reformer Foundations.');
+  d = await decide({ reply: 'Hey! Yesterday was packed, but Tuesday has room.', intent: 'continue' });
+  ok('"Yesterday" is not "Yes"', d.final_reply === 'Hey! Yesterday was packed, but Tuesday has room.');
+  d = await decide({ reply: 'Hey! Yep, Tue 6pm works. Tap the link, buy a single class, then pick it.', intent: 'send_booking_link', slot: 'S1', returning_client: true });
+  ok('...also on the booking-link reply (returning client keeps the main link)', d.final_reply.startsWith('Hey! Tue 6pm works.') && d.link === cfg.booking_url);
+
+  // 2. "the latest on the schedule is Tue 6pm" when Wed 7pm exists: the week at a glance
+  const bcCode = W.nodes.find((n) => n.name === 'Build Context').parameters.jsCode;
+  const glanceSrc = bcCode.slice(bcCode.indexOf('// <weekAtAGlance>'), bcCode.indexOf('// </weekAtAGlance>'));
+  const weekAtAGlance = new Function(glanceSrc + '\nreturn weekAtAGlance;')();
+  const dryRun = [{ weekday: 1, time: '07:00', name: 'All Levels Flow' }, { weekday: 2, time: '18:00', name: 'Reformer Foundations' },
+    { weekday: 3, time: '19:00', name: 'All Levels Flow' }, { weekday: 4, time: '18:00', name: 'Reformer Foundations' },
+    { weekday: 6, time: '09:00', name: 'Saturday Foundations' }];
+  const g = weekAtAGlance(dryRun).join('\n');
+  ok('glance: days with classes, and days with none', /Classes on: Mon, Tue, Wed, Thu, Sat\. NO classes at all on: Fri, Sun\./.test(g));
+  ok('glance: latest start is Wed 7pm (not Tue 6pm), earliest Mon 7am', /Earliest start of the week: 7am \(Mon All Levels Flow\)\. Latest start of the week: 7pm \(Wed All Levels Flow\)\./.test(g));
+  ok('glance: evening classes, in order', /Evening classes \(5pm or later\): Tue 6pm Reformer Foundations, Wed 7pm All Levels Flow, Thu 6pm Reformer Foundations\./.test(g));
+  ok('glance: ties all named, times written the texting way', /Latest start of the week: 5:30pm \(Mon A, Wed B\)/.test(weekAtAGlance([{ weekday: 3, time: '17:30', name: 'B' }, { weekday: 1, time: '17:30', name: 'A' }, { weekday: 1, time: '09:15', name: 'C' }]).join(' ')));
+  ok('glance: classes every day -> no "NO classes" line', !/NO classes/.test(weekAtAGlance([1, 2, 3, 4, 5, 6, 7].map((w) => ({ weekday: w, time: '12:00', name: 'X' }))).join(' ')));
+  ok('glance: no timetable -> nothing', weekAtAGlance([]).length === 0 && weekAtAGlance(null).length === 0);
+
+  // 3. The whole Build Context, with Luxon like n8n (skipped where Luxon isn't installed)
+  let DateTime = null;
+  for (const p of ['luxon', '/usr/local/lib/node_modules/n8n/node_modules/luxon']) { try { ({ DateTime } = require(p)); break; } catch (e) { /* try the next */ } }
+  if (!DateTime) {
+    console.log('SKIP Build Context prompt checks: Luxon not found. Run the tests inside the n8n image to include them (README → Tests).');
+  } else {
+    const studio = { studio_id: 4, studio_name: 'Dry Run Pilates', owner_name: 'Sam', timezone: 'America/Chicago', booking_url: 'https://studio.example/schedule',
+      prompt_vars: { persona_name: 'Ava', studio_name: 'Dry Run Pilates', voice: { greeting: 'Hey [first name]!' },
+                     booking_steps: 'Tap the link, buy the 2-week intro pass, then pick your class on the schedule.' } };
+    const data = { classes: dryRun.map((c, i) => ({ id: i + 1, minutes: 50, level: '', url: null, ...c })),
+      offers: [{ id: 1, kind: 'intro', name: '2-week intro pass', price: 49, currency: 'USD', url: 'https://studio.example/intro', for_new_clients: true },
+               { id: 2, kind: 'drop_in', name: 'Single class', price: 30, currency: 'USD', url: null, for_new_clients: false }],
+      thread: [], outbound_count: 0 };
+    const b = (await run(F, 'Build Context', [{}], { DateTime,
+      nodes: { 'Resolve Studio': [studio], 'When Called': [{ message: 'do you have a class at 10pm on Sunday?' }], 'Load Studio Data': [data] } }))[0];
+    ok('Build Context runs: ready, real slots', b.ready === true && b.slots.length >= 4);
+    ok('prompt has the week at a glance, with the real latest class', /WEEK AT A GLANCE/.test(b.systemMessage)
+       && /Latest start of the week: 7pm \(Wed All Levels Flow\)/.test(b.systemMessage) && /NO classes at all on: Fri, Sun\./.test(b.systemMessage));
+    ok('prompt: a day with no classes is said plainly', /there are no classes that day \(not "not this week"\)/.test(b.systemMessage));
+    ok('prompt: returning clients never get the intro offer', /RETURNING clients .* never get the intro offer/.test(b.systemMessage) && /not even "if it still applies"/.test(b.systemMessage));
+    ok('prompt: no "Yep" straight after the greeting either', /"Hey! Yep, …" still opens with Yep/.test(b.systemMessage));
+    const none = (await run(F, 'Build Context', [{}], { DateTime,
+      nodes: { 'Resolve Studio': [studio], 'When Called': [{ message: 'hi' }], 'Load Studio Data': [{ ...data, classes: [] }] } }))[0];
+    ok('no timetable: no glance section, studio not ready (escalates)', !/WEEK AT A GLANCE/.test(none.systemMessage) && none.ready === false);
+  }
 };

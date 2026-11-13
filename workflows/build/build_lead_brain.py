@@ -412,6 +412,35 @@ for (let d = 0; d < 7; d++) {
   }
 }
 
+// --- (1b) the week at a glance ---------------------------------------------
+// Whole-schedule facts, computed here so the model reads them instead of working
+// them out. On 2026-11-11 it told a lead "the latest on the schedule is Tue 6pm"
+// when Wed 7pm exists. From the weekly timetable, so it's the same every day.
+// <weekAtAGlance>  (tests/lead-brain.test.js runs this function on its own)
+function weekAtAGlance(classes) {
+  const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const rows = (Array.isArray(classes) ? classes : [])
+    .map((c) => { const [h, m] = String(c.time || '').split(':').map(Number);
+                  return { day: Number(c.weekday), mins: h * 60 + m, name: String(c.name || '') }; })
+    .filter((r) => r.day >= 1 && r.day <= 7 && Number.isFinite(r.mins))
+    .sort((a, b) => a.day - b.day || a.mins - b.mins);
+  if (!rows.length) return [];
+  const t = (mins) => { const h = Math.floor(mins / 60), m = mins % 60;
+    return `${h % 12 || 12}${m ? ':' + String(m).padStart(2, '0') : ''}${h < 12 ? 'am' : 'pm'}`; };
+  const on  = DAYS.filter((d, i) => rows.some((r) => r.day === i + 1));
+  const off = DAYS.filter((d, i) => !rows.some((r) => r.day === i + 1));
+  const at  = (mins) => rows.filter((r) => r.mins === mins).map((r) => `${DAYS[r.day - 1]} ${r.name}`).join(', ');
+  const first = Math.min(...rows.map((r) => r.mins)), last = Math.max(...rows.map((r) => r.mins));
+  const evenings = rows.filter((r) => r.mins >= 17 * 60);
+  return [
+    `- Classes on: ${on.join(', ')}.${off.length ? ' NO classes at all on: ' + off.join(', ') + '.' : ''}`,
+    `- Earliest start of the week: ${t(first)} (${at(first)}). Latest start of the week: ${t(last)} (${at(last)}).`,
+    `- Evening classes (5pm or later): ${evenings.length ? evenings.map((r) => `${DAYS[r.day - 1]} ${t(r.mins)} ${r.name}`).join(', ') : 'none'}.`,
+  ];
+}
+// </weekAtAGlance>
+const glance = weekAtAGlance(classes);
+
 // --- (2) the only prices the AI may quote ----------------------------------
 const money = (o) => o.price == null ? 'price on request (ask the studio)'
   : `${o.currency === 'USD' || !o.currency ? '$' : o.currency + ' '}${Number(o.price) % 1 ? Number(o.price).toFixed(2) : Number(o.price).toFixed(0)}`;
@@ -447,7 +476,7 @@ Number(data.outbound_count || 0) === 0
 `- Respect what they asked for. If they name a class type (reformer, mat), a day or a time of day, your recommendation MUST match it. Only suggest something else if nothing on the list matches, and say so.`,
 `- Be specific: "Monday 5:30, Reformer Flow" beats "a great evening option". A real detail from the facts below beats any adjective. Never call a class "a solid fit", "a good spot" or "the best starting point": say WHY it suits them.`,
 `- Punctuation like texting: periods, commas, the odd question mark. NO em dashes or en dashes. No semicolons. Never two exclamation marks.`,
-`- Vary how you start. Don't open with "Yes", "Yep", "Great question", "Absolutely", "So" or by repeating their question back.`,
+`- Vary how you start. Don't open with "Yes", "Yep", "Great question", "Absolutely", "So" or by repeating their question back. That includes straight after your greeting: "Hey! Yep, …" still opens with Yep.`,
 `- Never sound like a template or a salesperson. Banned: "great question", "I'd be happy to", "feel free", "don't hesitate", "reach out", "circle back", "perfect for you", "option", "journey", "let me know if you have any other questions"${list(voice.never_say).length ? ', ' + list(voice.never_say).map((s) => '"' + s + '"').join(', ') : ''}.`,
 list(voice.examples).length ? `How ${owner} actually writes. Match this STYLE (length, rhythm, warmth), but never copy their prices, times or class names; those only come from the lists below:\n${list(voice.examples).map((e) => '  > ' + (typeof e === 'object' && e ? ((e.lead ? 'Lead: ' + e.lead + '\n    ' + owner + ': ' : '') + (e.reply || '')) : e)).join('\n')}` : '',
 ``,
@@ -459,10 +488,16 @@ v.beginner_policy ? `- Beginners: ${v.beginner_policy}` : '',
 ``,
 `PRICES — the ONLY prices you may ever quote. If something is not on this list, say ${owner} will confirm rather than guessing:`,
 ...(offers.length ? offers.map((o) => `- ${o.name}: ${money(o)}${o.details ? ' (' + o.details + ')' : ''}${o.kind === 'intro' ? '  ← the starting point for anyone new' : ''}`) : ['- (none listed — do not quote any price)']),
+`- RETURNING clients (they say they've been before or have a membership) never get the intro offer or any new-client deal: don't mention it to them, not even "if it still applies". If the next-step line further down mentions the intro offer, swap it for the right option above (a single class, a pack or their membership).`,
 ``,
 `UPCOMING CLASSES (next 7 days, ${ZONE}) — the ONLY classes you may recommend, each with its slot id:`,
 ...(slots.length ? slots.map((s) => `- ${s.id}: ${s.label}${s.level ? ' (' + s.level + ')' : ''}`) : ['- (none — do not recommend any time; say ' + owner + ' will help)']),
 ``,
+...(glance.length ? [
+`WEEK AT A GLANCE (the regular weekly timetable). Any claim about the whole schedule ("latest", "earliest", "only", "no classes on <day>", "anything in the evening") must come from these lines. Never work those out yourself:`,
+...glance,
+`- If they ask about a day with no classes, say plainly there are no classes that day (not "not this week") and offer the nearest real class from the list above.`,
+``] : []),
 `HOW BOOKING WORKS — you never book anything:`,
 `- Recommend ONE specific class from the list that fits what they said, by day, time and name.`,
 `- You do NOT know live availability; the booking page shows the live spots. NEVER say they are booked, in, confirmed, reserved or that a spot is held.`,
@@ -552,6 +587,12 @@ reply = reply
   .replace(/\s*[—–]\s*/g, ', ')
   .replace(/,\s*([,.!?])/g, '$1')
   .trim();
+// "Hey! Yep, Tuesday…" -> "Hey! Tuesday…". The prompt bans opening with Yes/Yep,
+// but on a first reply the model puts the owner's greeting in front of it, which
+// reads just as scripted (2 of 3 first replies on 2026-11-11). Only a yes/yep
+// straight after a greeting goes: a plain "Yep, …" answering "still there?" stays.
+reply = reply.replace(/^((?:hey|hi|hello|hiya)\b[^.!?,\n]{0,24}?[!.,]\s*)(?:yes|yep|yeah|yup)\b[!.,]?\s+(\S)/i,
+  (m, greet, c) => greet + (/[!.]\s*$/.test(greet) ? c.toUpperCase() : c));
 
 // Unparseable or empty output: don't send the model's raw text to a lead.
 if (!ai || !reply) { intent = 'escalate'; reason = reason || 'the AI produced no usable reply'; }

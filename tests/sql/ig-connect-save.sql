@@ -17,4 +17,10 @@ UPDATE channel_accounts SET active = false WHERE studio_id = 2 AND channel = 'in
 EXECUTE save('sqltest-n5', 2, 'sqltest-new2', 'new_acct2', 'AQID', 5184000);
 \echo 6) a link already used, same account again -> link_used:
 EXECUTE save('sqltest-n5', 2, 'sqltest-new2', 'new_acct2', 'AQID', 5184000);
+\echo 7) a hand-written second active Instagram row on studio 2 -> refused by the database itself (migration 018):
+DO $$ BEGIN
+  INSERT INTO channel_accounts (studio_id, channel, account_ref, active) VALUES (2, 'instagram', 'sqltest-hand', true);
+  RAISE NOTICE 'NOT refused: is migration 018 applied?';
+EXCEPTION WHEN unique_violation THEN RAISE NOTICE 'refused (one active Instagram account per studio)';
+END $$;
 ROLLBACK;

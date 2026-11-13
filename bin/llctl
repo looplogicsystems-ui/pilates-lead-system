@@ -26,7 +26,7 @@ PG="${PG_CONTAINER:-postgres}"
 
 # Every workflow deploy.sh manages. Legal Pages is active but not generated,
 # so it is snapshotted and reported but never overwritten.
-MANAGED="Lead Brain|Channel Adapter: Instagram|Channel Adapter: Slack|Follow-up Scheduler|Lead System — Error Handler|IG Token Expiry Monitor"
+MANAGED="Channel Adapter: Instagram|Data Retention|Demo Booking Page|Follow-up Scheduler|IG Connect|IG Token Refresh|Lead Brain|Lead System — Error Handler|Link Redirect|Monitor: Backups|Monitor: Booking Links|Monitor: Unanswered DMs|Ops: Test Email|Ops: Voice Lab|Owner Actions|Send Email|Weekly Review"
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }

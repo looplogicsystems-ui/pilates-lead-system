@@ -25,7 +25,8 @@ function codeOf(file, node) {
 
 // nodes: { 'Node Name': [items...] }  or  { 'Node Name': { branches: [[...], [...]] } }
 // item:  { 'Node Name': json }  for $('Node').item in per-item mode
-async function run(file, node, items, { nodes = {}, item = {}, http, env = {}, perItem = false } = {}) {
+// DateTime: pass Luxon's DateTime for nodes that use it (n8n provides it as a global).
+async function run(file, node, items, { nodes = {}, item = {}, http, env = {}, perItem = false, DateTime } = {}) {
   const $input = { first: () => ({ json: items[0] }), all: () => items.map((j) => ({ json: j })), item: { json: items[0] } };
   const $ = (n) => {
     const v = nodes[n];
@@ -33,8 +34,8 @@ async function run(file, node, items, { nodes = {}, item = {}, http, env = {}, p
     return { first: () => ({ json: branch(0)[0] }), all: (b = 0) => branch(b).map((j) => ({ json: j })), item: { json: item[n] } };
   };
   const ctx = { helpers: { httpRequest: http || (async () => { throw new Error('unexpected HTTP call in test'); }) } };
-  const f = new AsyncFn('$input', '$', '$env', '$json', 'require', ...SANDBOX_MISSING, codeOf(file, node));
-  const out = await f.call(ctx, $input, $, env, items[0], require);
+  const f = new AsyncFn('$input', '$', '$env', '$json', 'require', 'DateTime', ...SANDBOX_MISSING, codeOf(file, node));
+  const out = await f.call(ctx, $input, $, env, items[0], require, DateTime);
   if (Array.isArray(out)) return out.map((i) => i.json);
   return out && out.json ? [out.json] : [];
 }
