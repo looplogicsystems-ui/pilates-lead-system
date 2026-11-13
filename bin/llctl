@@ -2,7 +2,7 @@
 # llctl — deploy, inspect, snapshot and roll back the Loop Logic lead system.
 #
 # Runs the same way from either founder's machine: if you are not on the mini it
-# re-invokes itself there over SSH, so `llctl deploy demo` means the same thing
+# re-invokes itself there over SSH, so `llctl deploy master` means the same thing
 # everywhere. deploy.sh itself uses `docker exec` and can only run on the mini.
 #
 #   llctl status              what is the mini actually running right now
@@ -14,7 +14,8 @@
 #                             workflow exports are kept. Runs nightly from cron (privacy:
 #                             deleted lead data must not live on in old dumps)
 #
-# Branch shorthands: `demo` = demo/computed-availability, `master` = master.
+# The live branch is `master` (`main` is accepted for it). Retired branches are
+# refused: demo, demo/computed-availability, pilot.
 set -euo pipefail
 
 MINI_HOST="${MINI_HOST:-mac-server@100.64.98.51}"
@@ -61,11 +62,17 @@ confirm () {
 
 resolve_branch () {
     case "$1" in
-        demo)   echo "demo/computed-availability" ;;
         master|main) echo "master" ;;
         *)      echo "$1" ;;
     esac
 }
+
+# Retired branches (2026-11-14). Both predate today's system: demo/computed-
+# availability books into a Google Calendar that no longer exists, and pilot was
+# merged into master on 2026-10-25 and frozen. Deploying either would replace the
+# live system, so they are refused by name (the old `demo` shorthand too).
+RETIRED_BRANCHES="demo demo/computed-availability pilot"
+is_retired () { case " $RETIRED_BRANCHES " in *" $1 "*) return 0 ;; esac; return 1; }
 
 health () { curl -s -o /dev/null -w '%{http_code}' -m 5 http://localhost:5678/healthz 2>/dev/null || echo "000"; }
 
@@ -187,6 +194,9 @@ wait_healthy () {
 cmd_deploy () {
     local want; want="$(resolve_branch "${1:-}")"
     [ -n "$want" ] || die "usage: llctl deploy <branch>"
+    if is_retired "$want"; then
+        die "'$want' is a retired branch from before the pilot build; deploying it would replace the live system. The live branch is master: llctl deploy master"
+    fi
 
     git fetch -q origin
     git rev-parse --verify -q "origin/$want" >/dev/null \
@@ -291,6 +301,6 @@ case "${1:-status}" in
     rollback)  shift; cmd_rollback "$@" ;;
     prune)     shift; cmd_prune "$@" ;;
     -h|--help|help)
-        sed -n '2,20p' "$0" | sed 's/^# \?//' ;;
+        awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0" ;;
     *) die "unknown command '$1' (try: llctl help)" ;;
 esac
